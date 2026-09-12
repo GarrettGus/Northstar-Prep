@@ -3,6 +3,7 @@ const text = z.string().max(500);
 const number = z.coerce.number().finite().nonnegative().max(1e9).default(0);
 export const idSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,150}$/);
 const date = z.union([z.literal(''), z.iso.date()]).default('');
+export const fuelTypes = ['', 'Propane', 'Gasoline', 'Diesel', 'Wood', 'Kerosene', 'Battery', 'Other'];
 export const itemSchema = z.object({
   id: idSchema, name: z.string().trim().min(1).max(200), quantity: number,
   unit: z.string().max(80).default('units'),
@@ -11,6 +12,7 @@ export const itemSchema = z.object({
   gallonsPerUnit: number, target: number, store: text.default(''), emoji: z.string().max(30).default(''),
   image: z.string().max(180000).regex(/^(?:|data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+)$/).default(''),
   macroTag: z.enum(['', 'Carbs', 'Protein', 'Fat', 'Balanced']).default(''),
+  fuelType: z.enum(fuelTypes).default(''),
   purchaseDate: date, expiryDate: date,
 });
 export const applianceSchema = z.object({ id: idSchema, name: z.string().trim().min(1).max(200), watts: number, hours: z.coerce.number().finite().min(0).max(24), active: z.boolean().default(true) });
@@ -20,8 +22,19 @@ export const planSchema = z.object({
   contacts: z.array(z.object({name: text, phone: z.string().max(80), type: text.default('')})).max(50).default([]),
   meetingPoints: z.object({primary: text.default(''), secondary: text.default('')}).default({primary:'',secondary:''}),
 });
-export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable() });
-export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], plan:null});
+const fraction = z.coerce.number().finite().min(0).max(1);
+export const settingsSchema = z.object({
+  householdSize: z.coerce.number().int().min(1).max(50).default(4),
+  caloriesPerPersonPerDay: z.coerce.number().finite().min(0).max(10000).default(2000),
+  waterGallonsPerPersonPerDay: z.coerce.number().finite().min(0).max(20).default(1),
+  survivalGoalDays: z.coerce.number().int().min(1).max(365).default(14),
+  heatGoalHours: z.coerce.number().finite().min(0).max(10000).default(36),
+  powerGoalKwh: z.coerce.number().finite().min(0).max(10000).default(20),
+  batteryUsableFraction: fraction.default(0.9),
+  inverterEfficiency: fraction.default(0.9),
+});
+export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable(), settings: settingsSchema.default(() => settingsSchema.parse({})) });
+export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], plan:null, settings: settingsSchema.parse({})});
 export const collectionKey = {inventory:'inventory', shopping_list:'shoppingList', appliances:'appliances'};
 export function normalizeBackup(input, makeId) {
   if (Array.isArray(input)) input = {inventory:input};
@@ -47,6 +60,7 @@ export function applyAction(state, action) {
     }
     if (backup.plan !== null) next.plan = backup.plan;
   } else if (action.type === 'plan') next.plan = planSchema.parse(action.plan);
+  else if (action.type === 'settings') next.settings = settingsSchema.parse(action.settings);
   else if (action.type === 'buy') {
     const id = idSchema.parse(action.id);
     const item = next.shoppingList.find(row => row.id === id);

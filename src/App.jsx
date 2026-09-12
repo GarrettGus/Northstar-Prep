@@ -8,19 +8,11 @@ import {
   Siren, SearchCheck, Power, Tag, Calendar, ArrowUpDown
 } from 'lucide-react';
 import { request } from './api.js';
-import { waterGallons, isExpired } from '../shared/readiness.js';
-import { normalizeBackup } from '../shared/schema.js';
+import { computeReadiness, isExpired } from '../shared/readiness.js';
+import { normalizeBackup, settingsSchema, fuelTypes } from '../shared/schema.js';
 
 // --- Constants ---
 const SYSTEM_ID = 'Household';
-const HOUSEHOLD_SIZE = 4;
-const CALORIES_PER_PERSON_DAY = 2000;
-const WATER_PER_PERSON_DAY = 1;
-const TOTAL_DAILY_CALORIE_NEED = HOUSEHOLD_SIZE * CALORIES_PER_PERSON_DAY;
-const TOTAL_DAILY_WATER_NEED = HOUSEHOLD_SIZE * WATER_PER_PERSON_DAY;
-const SURVIVAL_GOAL_DAYS = 14;
-const HEAT_GOAL_HOURS = 36;
-const POWER_GOAL_KWH = 20;
 
 // AI remains unavailable until an authenticated server endpoint is configured.
 async function callGemini() {
@@ -47,6 +39,7 @@ export default function App() {
   const [shoppingList, setShoppingList] = useState([]);
   const [appliances, setAppliances] = useState([]);
   const [plan, setPlan] = useState(null);
+  const [settings, setSettings] = useState(settingsSchema.parse({}));
   const [loading, setLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
   const [showSyncModal, setShowSyncModal] = useState(false);
@@ -61,7 +54,7 @@ export default function App() {
     if (version < revision.current) return;
     revision.current = version;
     setInventory(data.inventory); setShoppingList(data.shoppingList);
-    setAppliances(data.appliances); setPlan(data.plan);
+    setAppliances(data.appliances); setPlan(data.plan); setSettings(data.settings);
   };
   useEffect(() => {
     request('session').then(value => { setUser(value.authenticated); setConfigured(value.configured); })
@@ -96,7 +89,7 @@ export default function App() {
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
-    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,plan},null,2)],{type:'application/json'});
+    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,plan,settings},null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob);const link=document.createElement('a');
     link.href=url;link.download=`northstar-backup-${new Date().toISOString().slice(0,10)}.json`;link.click();
     setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -111,57 +104,8 @@ export default function App() {
   };
 
   // --- Logic Helpers ---
-  const stats = useMemo(() => {
-    let waterQty = 0, totalCals = 0, fuelHours = 0, powerKwh = 0, lowStock = 0, expired = 0, totalValue = 0;
-    const buckets = { Water: 0, Pasta: 0, Rice: 0, Beans: 0, 'Energy Bars': 0 };
-
-    inventory.forEach(item => {
-      const qty = Number(item.quantity) || 0;
-      const cals = Number(item.caloriesPerUnit) || 0;
-      const hours = Number(item.hoursPerUnit) || 0;
-      const kwh = Number(item.capacityPerUnit) || 0;
-      const price = Number(item.price) || 0;
-
-      if (item.category === 'Water' && !isExpired(item.expiryDate)) waterQty += waterGallons(item);
-      if (item.category === 'Food' && !isExpired(item.expiryDate)) totalCals += (qty * cals);
-      if (item.category === 'Fuel') fuelHours += (qty * hours);
-      if (item.category === 'Power') powerKwh += (qty * kwh);
-
-      totalValue += (qty * price);
-
-      if (qty < (item.target || 1) * 0.25) lowStock++;
-      if (isExpired(item.expiryDate)) expired++;
-
-      const nameLower = item.name?.toLowerCase() || '';
-      for (const key in buckets) {
-        if (!isExpired(item.expiryDate) && nameLower.includes(key.toLowerCase())) buckets[key] += (key === 'Water' && item.category === 'Water' ? waterGallons(item) : item.category === 'Food' ? qty * cals : 0);
-      }
-    });
-
-    const waterDays = waterQty / TOTAL_DAILY_WATER_NEED;
-    const foodDays = totalCals / TOTAL_DAILY_CALORIE_NEED;
-
-    const coreStatus = Object.keys(buckets).map(name => {
-      const val = buckets[name];
-      const dailyNeed = name === 'Water' ? TOTAL_DAILY_WATER_NEED : TOTAL_DAILY_CALORIE_NEED;
-      const days = val / dailyNeed;
-      return { name, found: val > 0, days, percentage: Math.min(Math.round((days / SURVIVAL_GOAL_DAYS) * 100), 100) };
-    });
-
-    const dailyLoadKwh = appliances.reduce((acc, curr) => {
-        if (curr.active === false) return acc;
-        return acc + (((Number(curr.watts) || 0) * (Number(curr.hours) || 0)) / 1000);
-    }, 0);
-
-    const powerDays = dailyLoadKwh > 0 ? (powerKwh / dailyLoadKwh) : 0;
-
-    return {
-        waterDays, foodDays, totalFuelHours: fuelHours,
-        totalPowerKwh: powerKwh, totalCalories: totalCals, totalValue,
-        lowStock, expired, coreStatus,
-        dailyLoadKwh, powerDays
-    };
-  }, [inventory, appliances]);
+  const stats = useMemo(() => computeReadiness({ inventory, appliances }, settings), [inventory, appliances, settings]);
+  const handleUpdateSettings = (next) => mutate({ type: 'settings', settings: next });
 
   const generateMealPlan = async () => {
     setIsAiLoading(true);
@@ -219,12 +163,13 @@ export default function App() {
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
-        {activeTab === 'dashboard' && <Dashboard stats={stats} onGeneratePlan={generateMealPlan} onAnalyzeGaps={analyzeInventory} isAiLoading={isAiLoading} />}
+        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} onGeneratePlan={generateMealPlan} onAnalyzeGaps={analyzeInventory} isAiLoading={isAiLoading} />}
         {activeTab === 'inventory' && (
           <InventoryManager
             title="Supply Hub"
             items={inventory}
             stats={stats}
+            settings={settings}
             onAdd={(i) => handleAdd('inventory', i)}
             onUpdate={(id, i) => handleUpdate('inventory', id, i)}
             onDelete={(id) => handleDelete('inventory', id)}
@@ -237,6 +182,7 @@ export default function App() {
             title="Shopping List"
             items={shoppingList}
             stats={stats}
+            settings={settings}
             isShoppingMode={true}
             onAdd={(i) => handleAdd('shopping_list', i)}
             onUpdate={(id, i) => handleUpdate('shopping_list', id, i)}
@@ -250,6 +196,7 @@ export default function App() {
           <ApplianceManager
             appliances={appliances}
             stats={stats}
+            settings={settings}
             onAdd={(i) => handleAdd('appliances', i)}
             onUpdate={(id, i) => handleUpdate('appliances', id, i)}
             onDelete={(id) => handleDelete('appliances', id)}
@@ -262,14 +209,16 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => setShowSyncModal(false)} onImport={handleFileUpload} onLogout={logout} />}
+      {showSyncModal && <SyncModal onClose={() => setShowSyncModal(false)} onImport={handleFileUpload} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} />}
       {aiContent && <AiModal content={aiContent} onClose={() => setAiContent(null)} />}
     </div>
   );
 }
 
 // --- Dashboard ---
-function Dashboard({ stats, onGeneratePlan, onAnalyzeGaps, isAiLoading }) {
+const POWER_RUNTIME_GOAL_DAYS = 2;
+
+function Dashboard({ stats, settings, onGeneratePlan, onAnalyzeGaps, isAiLoading }) {
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       <div className="grid grid-cols-2 gap-4">
@@ -284,11 +233,18 @@ function Dashboard({ stats, onGeneratePlan, onAnalyzeGaps, isAiLoading }) {
           <h2 className="text-xl font-black mb-1">Readiness Score</h2>
           <p className="text-slate-400 text-xs font-bold uppercase tracking-widest">Household Readiness</p>
           <div className="mt-6 space-y-4">
-            <ProgressBar label="Food (14 Days)" percent={(stats.foodDays / SURVIVAL_GOAL_DAYS) * 100} color="bg-emerald-500" />
-            <ProgressBar label="Water (14 Days)" percent={(stats.waterDays / SURVIVAL_GOAL_DAYS) * 100} color="bg-blue-500" />
-            <ProgressBar label={`Heat (${HEAT_GOAL_HOURS}h)`} percent={(stats.totalFuelHours / HEAT_GOAL_HOURS) * 100} color="bg-amber-500" />
-            <ProgressBar label={`Power (Duration: ${stats.powerDays.toFixed(1)} Days)`} percent={(stats.powerDays / 2) * 100} color="bg-violet-500" />
+            <ProgressBar label={`Food (${settings.survivalGoalDays} Days)`} percent={(stats.foodDays / settings.survivalGoalDays) * 100} color="bg-emerald-500" />
+            <ProgressBar label={`Water (${settings.survivalGoalDays} Days)`} percent={(stats.waterDays / settings.survivalGoalDays) * 100} color="bg-blue-500" />
+            <ProgressBar label={`Heat (${settings.heatGoalHours}h)`} percent={(stats.totalFuelHours / settings.heatGoalHours) * 100} color="bg-amber-500" />
+            <ProgressBar label={`Power (Duration: ${stats.powerDays.toFixed(1)} Days)`} percent={(stats.powerDays / POWER_RUNTIME_GOAL_DAYS) * 100} color="bg-violet-500" />
           </div>
+          <p className="mt-5 text-[10px] leading-relaxed text-slate-500">
+            Assumes {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} needing {settings.caloriesPerPersonPerDay.toLocaleString()} kcal
+            and {settings.waterGallonsPerPersonPerDay} gal water per person/day ({stats.dailyCalorieNeed.toLocaleString()} kcal
+            and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household). Stored power counts {Math.round(settings.batteryUsableFraction * 100)}%
+            usable capacity after a {Math.round(settings.inverterEfficiency * 100)}% efficient inverter conversion.
+            Edit these in Household settings.
+          </p>
         </div>
       </div>
 
@@ -411,7 +367,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
 }
 
 // --- Inventory Manager (Reused for Shop) ---
-function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBuy, onSmartSuggest, isAiLoading, isShoppingMode }) {
+function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDelete, onBuy, onSmartSuggest, isAiLoading, isShoppingMode }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
   const [smartText, setSmartText] = useState('');
@@ -419,11 +375,11 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
   const [sortBy, setSortBy] = useState(''); // 'expiry', 'calories', 'date'
 
   const [form, setForm] = useState({
-    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', purchaseDate: '', expiryDate: ''
+    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: ''
   });
 
   const reset = () => {
-    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', purchaseDate: '', expiryDate: '' });
+    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '' });
     setEditingItem(null);
     setShowAdd(false);
   };
@@ -484,8 +440,8 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
     return groups;
   }, [sortedItems, isShoppingMode]);
 
-  const waterPct = Math.min(Math.round((stats.waterDays / SURVIVAL_GOAL_DAYS) * 100), 100);
-  const foodPct = Math.min(Math.round((stats.foodDays / SURVIVAL_GOAL_DAYS) * 100), 100);
+  const waterPct = Math.min(Math.round((stats.waterDays / settings.survivalGoalDays) * 100), 100);
+  const foodPct = Math.min(Math.round((stats.foodDays / settings.survivalGoalDays) * 100), 100);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
@@ -546,7 +502,12 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
                 </>
               )}
               {form.category === 'Water' && <div className="col-span-2"><Label>Gallons per unit (for bottles or cases)</Label><Input val={form.gallonsPerUnit} set={v => setForm({...form, gallonsPerUnit:v})} type="number" placeholder="e.g. 0.132 for a 500 mL bottle" /><p className="text-xs text-slate-500 mt-2">Leave zero when your unit is gallons, liters, mL or fl oz. Other units need this value to count toward readiness.</p></div>}
-              {form.category === 'Fuel' && <div className="col-span-2"><Label>Hours/Unit (Heat)</Label><Input val={form.hoursPerUnit} set={v => setForm({...form, hoursPerUnit: v})} type="number" /></div>}
+              {form.category === 'Fuel' && (
+                <>
+                  <div><Label>Fuel Type</Label><Select val={form.fuelType} set={v => setForm({...form, fuelType: v})} opts={fuelTypes} /></div>
+                  <div><Label>Hours/Unit (Heat)</Label><Input val={form.hoursPerUnit} set={v => setForm({...form, hoursPerUnit: v})} type="number" /></div>
+                </>
+              )}
               {form.category === 'Power' && <div className="col-span-2"><Label>Capacity (kWh)</Label><Input val={form.capacityPerUnit} set={v => setForm({...form, capacityPerUnit: v})} type="number" placeholder="e.g. 1.5"/></div>}
             </div>
             <button type="submit" className="w-full bg-blue-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl active:bg-blue-700 transition-colors mt-2">
@@ -560,8 +521,15 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
         <div className="grid grid-cols-2 gap-4 px-1">
           <SummaryCard icon={<Droplets size={16}/>} color="blue" label="Water" value={stats.waterDays} unit="Days" pct={waterPct} />
           <SummaryCard icon={<Utensils size={16}/>} color="emerald" label="Total Food" value={stats.foodDays} unit="Days" pct={foodPct} />
-          <SummaryCard icon={<Flame size={16}/>} color="amber" label="Total Heat" value={stats.totalFuelHours} unit="Hours" pct={(stats.totalFuelHours / HEAT_GOAL_HOURS) * 100} />
-          <SummaryCard icon={<Zap size={16}/>} color="violet" label="Backup Power" value={stats.totalPowerKwh} unit="kWh" pct={(stats.totalPowerKwh / POWER_GOAL_KWH) * 100} />
+          <SummaryCard icon={<Flame size={16}/>} color="amber" label="Total Heat" value={stats.totalFuelHours} unit="Hours" pct={(stats.totalFuelHours / settings.heatGoalHours) * 100} />
+          <SummaryCard icon={<Zap size={16}/>} color="violet" label="Backup Power" value={stats.totalPowerKwh} unit="kWh" pct={(stats.totalPowerKwh / settings.powerGoalKwh) * 100} />
+          {Object.keys(stats.fuelByType).length > 0 && (
+            <div className="col-span-2 bg-amber-50 border border-amber-100 rounded-[2rem] p-4 text-[11px] font-bold text-amber-700 flex flex-wrap gap-x-4 gap-y-1">
+              {Object.entries(stats.fuelByType).map(([type, hours]) => (
+                <span key={type}>{type || 'Unspecified'}: {hours.toFixed(0)}h</span>
+              ))}
+            </div>
+          )}
           <div className="col-span-2 bg-slate-900 rounded-[2.5rem] p-5 shadow-lg flex justify-between items-center text-white">
             <div className="flex items-center gap-3">
                <div className="p-2 bg-slate-800 rounded-full"><DollarSign size={20}/></div>
@@ -857,12 +825,60 @@ function getCategoryIcon(cat) {
 }
 
 // --- Modals ---
-function SyncModal({onClose,onImport,onLogout}) {
+function SettingsForm({ settings, onSave }) {
+  const [form, setForm] = useState({
+    householdSize: settings.householdSize,
+    caloriesPerPersonPerDay: settings.caloriesPerPersonPerDay,
+    waterGallonsPerPersonPerDay: settings.waterGallonsPerPersonPerDay,
+    survivalGoalDays: settings.survivalGoalDays,
+    heatGoalHours: settings.heatGoalHours,
+    powerGoalKwh: settings.powerGoalKwh,
+    batteryUsableFraction: Math.round(settings.batteryUsableFraction * 100),
+    inverterEfficiency: Math.round(settings.inverterEfficiency * 100),
+  });
+  const [error, setError] = useState(null);
+  const [saved, setSaved] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(null); setSaved(false);
+    try {
+      const parsed = settingsSchema.parse({
+        ...form,
+        batteryUsableFraction: Number(form.batteryUsableFraction) / 100,
+        inverterEfficiency: Number(form.inverterEfficiency) / 100,
+      });
+      if (await onSave(parsed)) setSaved(true); else setError('Save failed. Please retry.');
+    } catch { setError('Please check the values above.'); }
+  };
+
+  return (
+    <form onSubmit={submit} className="space-y-3 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-400 tracking-widest">Readiness assumptions</h3>
+      <div className="grid grid-cols-2 gap-3">
+        <div><Label>Household size</Label><Input val={form.householdSize} set={v => setForm({...form, householdSize: v})} type="number" /></div>
+        <div><Label>Goal (days)</Label><Input val={form.survivalGoalDays} set={v => setForm({...form, survivalGoalDays: v})} type="number" /></div>
+        <div><Label>Calories/person/day</Label><Input val={form.caloriesPerPersonPerDay} set={v => setForm({...form, caloriesPerPersonPerDay: v})} type="number" /></div>
+        <div><Label>Water gal/person/day</Label><Input val={form.waterGallonsPerPersonPerDay} set={v => setForm({...form, waterGallonsPerPersonPerDay: v})} type="number" /></div>
+        <div><Label>Heat goal (hours)</Label><Input val={form.heatGoalHours} set={v => setForm({...form, heatGoalHours: v})} type="number" /></div>
+        <div><Label>Power goal (kWh)</Label><Input val={form.powerGoalKwh} set={v => setForm({...form, powerGoalKwh: v})} type="number" /></div>
+        <div><Label>Battery usable %</Label><Input val={form.batteryUsableFraction} set={v => setForm({...form, batteryUsableFraction: v})} type="number" /></div>
+        <div><Label>Inverter efficiency %</Label><Input val={form.inverterEfficiency} set={v => setForm({...form, inverterEfficiency: v})} type="number" /></div>
+      </div>
+      <p className="text-xs text-slate-500">Battery usable % and inverter efficiency % account for depth-of-discharge limits and DC-to-AC conversion loss when estimating runtime from stored power.</p>
+      {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}
+      {saved && <p className="text-xs font-bold text-emerald-600">Saved.</p>}
+      <button type="submit" className="w-full rounded-xl p-3 bg-blue-600 text-white font-bold text-sm">Save assumptions</button>
+    </form>
+  );
+}
+function SyncModal({onClose,onImport,onLogout,settings,onUpdateSettings}) {
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
-    <section role="dialog" aria-modal="true" aria-labelledby="settings-title" className="bg-white w-full max-w-sm rounded-3xl p-8 space-y-5">
+    <section role="dialog" aria-modal="true" aria-labelledby="settings-title" className="bg-white w-full max-w-sm rounded-3xl p-8 space-y-5 max-h-[85vh] overflow-y-auto">
       <h2 id="settings-title" className="text-xl font-black">Household settings</h2>
       <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances and your family plan.</p>
       <label className="block text-sm font-bold">Import JSON backup<input type="file" accept=".json,application/json" onChange={onImport} className="block mt-2 w-full text-xs" /></label>
+      <SettingsForm settings={settings} onSave={onUpdateSettings} />
       <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>
       <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>
     </section>

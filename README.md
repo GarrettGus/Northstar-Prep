@@ -1,35 +1,42 @@
 # NorthStar Prep
 
-React household preparedness tracker, prepared for Vercel with Vite and Tailwind CSS.
+A household preparedness tracker built with React, Vite and Tailwind, backed by Neon Postgres and Vercel Functions.
 
-## Local development
+## Architecture
 
-1. Run `npm install`.
-2. Copy `.env.example` to `.env.local` and populate the Firebase web configuration and hub ID.
-3. Enable Firebase Anonymous Authentication and Firestore in your existing project.
-4. Review `firestore.rules` before applying it to your existing database. These rules require a membership document at `artifacts/HUB_ID/members/FIREBASE_AUTH_UID`, provisioned by an administrator. Hub IDs do not grant access.
-5. Run `npm run dev`; run `npm run build` to check production output.
+The browser calls same-origin `/api/session` and `/api/hub` endpoints. Only server code connects to Postgres. A shared household passphrase creates a signed, HttpOnly, SameSite=Strict session cookie (Secure in production). All household data requires a valid session. Sessions last seven days; rotating either secret invalidates existing sessions. Login attempts are rate-limited in Postgres.
 
-Anonymous authentication is retained from the original app. Membership must be provisioned separately for each browser UID; clearing browser storage can lose that identity. Persistent sign-in and household invitations remain production follow-up work. Do not open database rules to all anonymous users.
+This is a **single-household application**. Anyone with the household password can read and modify that household. There is no anonymous access, client database SDK, or public hub-ID access. Do not use this shared-login design for unrelated households.
 
-## GitHub and Vercel
+Database updates use compare-and-swap revisions and bounded retries. Shopping purchases move the current stored record atomically; backups merge by ID. Devices refresh every 15 seconds and on window focus.
 
-The workspace already contains an empty Git repository. Use a private repository because the source includes household-specific text.
+## Setup
 
-After authenticating GitHub CLI:
+1. Create a Neon Postgres database through Vercel's marketplace, using its free plan if suitable. Connect it to this Vercel project. Accept any marketplace terms in your own account.
+2. Set server-only environment variables:
+   - `DATABASE_URL`: Neon connection string.
+   - `HOUSEHOLD_PASSWORD`: a random password of at least 20 characters, shared only with household members.
+   - `SESSION_SECRET`: an independent random value of at least 32 characters.
+3. Copy `.env.example` to `.env.local` for local development, or pull the project's development variables using Vercel CLI. Never commit credentials. No `VITE_` variables are needed.
+4. Run `npm ci` and `npm run db:migrate`. The migration creates the tables and an empty household without overwriting existing records.
+5. Run `npm run dev` for the frontend and API at `http://127.0.0.1:5173`.
+6. Run `npm test` and `npm run build`.
 
-```sh
-git add .
-git commit -m "Prepare NorthStar Prep for Vercel"
-gh repo create northstar-prep --private --source=. --remote=origin --push
-```
+## Deploy
 
-Import that repository in Vercel, choose Vite, build with `npm run build`, and publish `dist`. Add `VITE_FIREBASE_CONFIG` and `VITE_HUB_ID` in the appropriate Vercel environment before building. Add the deployment domain in Firebase Authentication's authorized domains. No Gemini key belongs in a VITE variable; these values are bundled into the browser.
+Target repository: [GarrettGus/Northstar-Prep](https://github.com/GarrettGus/Northstar-Prep).
+Target Vercel project: `garrettgus-projects/northstar-prep`.
 
-AI functionality is explicitly unavailable until an authenticated, rate-limited backend is implemented. No production deployment or database rule changes have been performed.
+Use the Vite preset, `npm run build`, output directory `dist`, and Node 22 or newer. Vercel discovers the two `/api` functions automatically. Run the database migration before the first login. Keep preview databases and credentials separate from production. Without configuration the app shows a setup message and denies data access.
 
-## Backups
+`npm run preview` previews the compiled frontend only; use `npm run dev` or a Vercel deployment to exercise API functionality.
 
-Exports include supplies, shopping, appliances and the family plan. Imports merge records by exported ID and restore the plan; they do not delete existing records. Legacy records without IDs receive new IDs and repeat imports can duplicate those legacy records. Imports are limited to 5 MB and 450 records for a single atomic batch.
+## Backups and migration
 
-See `docs/REVIEW.md` for findings and remaining limitations.
+Export JSON from the old app and import it in **Household settings** after signing in. Supplies, shopping, appliances and the plan are retained. Existing records merge by ID. Legacy records without IDs get new ones; repeated imports of such legacy files can duplicate those records. Imports never delete records absent from the backup, and an absent/null plan preserves the current plan. File limit: 2 MB; collection limits: 2,000 supplies, 2,000 shopping items, 200 appliances.
+
+No data is retrieved automatically from the previous provider. Its cloud database is not altered or deleted. Keep the original backup until you have verified the import.
+
+Water units convert from US gallons, liters, mL or fluid ounces. Bottles/cases require a gallons-per-unit value; unknown units otherwise count as zero. Expired food and water do not count toward readiness. Power and food estimates still use simplified household assumptions.
+
+AI features remain unavailable until a protected backend is added. See [review notes](docs/REVIEW.md) for remaining limitations.

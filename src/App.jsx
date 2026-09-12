@@ -1,36 +1,24 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { 
-  Shield, Package, Map, Link as LinkIcon, AlertTriangle, CheckCircle, Plus, Trash2, Home, 
-  Droplets, Thermometer, Wind, Phone, Navigation, RefreshCw, Settings, Link2, ChevronRight, 
-  ClipboardList, Sparkles, Zap, BookOpen, X, Flame, Edit2, Save, History, Utensils, 
+import {
+  Shield, Package, Map, Link as LinkIcon, AlertTriangle, CheckCircle, Plus, Trash2, Home,
+  Droplets, Thermometer, Wind, Phone, Navigation, RefreshCw, Settings, Link2, ChevronRight,
+  ClipboardList, Sparkles, Zap, BookOpen, X, Flame, Edit2, Save, History, Utensils,
   Database, UploadCloud, Battery, AlertOctagon, Smartphone, FileJson, Download, Upload,
   Plug, DollarSign, ShoppingCart, Store, ArrowRight, Image as ImageIcon, Layers,
   Siren, SearchCheck, Power, Tag, Calendar, ArrowUpDown
 } from 'lucide-react';
-import { initializeApp } from 'firebase/app';
-import { getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
-import { 
-  getFirestore, collection, doc, onSnapshot, addDoc, updateDoc, deleteDoc, setDoc, getDocs, writeBatch 
-} from 'firebase/firestore';
-
-// --- Configuration ---
-let auth, db, configurationError;
-try {
-  const config = JSON.parse(import.meta.env.VITE_FIREBASE_CONFIG || '{}');
-  if (!config.apiKey || !config.projectId || !config.appId) throw new Error('Configure VITE_FIREBASE_CONFIG to connect your Firebase project.');
-  const app = initializeApp(config);
-  auth = getAuth(app);
-  db = getFirestore(app);
-} catch (error) { configurationError = error.message; }
+import { request } from './api.js';
+import { waterGallons, isExpired } from '../shared/readiness.js';
+import { normalizeBackup } from '../shared/schema.js';
 
 // --- Constants ---
-const SYSTEM_ID = import.meta.env.VITE_HUB_ID || 'northstar-household';
-const HOUSEHOLD_SIZE = 4; 
+const SYSTEM_ID = 'Household';
+const HOUSEHOLD_SIZE = 4;
 const CALORIES_PER_PERSON_DAY = 2000;
-const WATER_PER_PERSON_DAY = 1; 
-const TOTAL_DAILY_CALORIE_NEED = HOUSEHOLD_SIZE * CALORIES_PER_PERSON_DAY; 
-const TOTAL_DAILY_WATER_NEED = HOUSEHOLD_SIZE * WATER_PER_PERSON_DAY; 
-const SURVIVAL_GOAL_DAYS = 14; 
+const WATER_PER_PERSON_DAY = 1;
+const TOTAL_DAILY_CALORIE_NEED = HOUSEHOLD_SIZE * CALORIES_PER_PERSON_DAY;
+const TOTAL_DAILY_WATER_NEED = HOUSEHOLD_SIZE * WATER_PER_PERSON_DAY;
+const SURVIVAL_GOAL_DAYS = 14;
 const HEAT_GOAL_HOURS = 36;
 const POWER_GOAL_KWH = 20;
 
@@ -51,143 +39,81 @@ const resizeBase64 = async (value) => `data:image/png;base64,${value}`;
 
 // --- Main App Component ---
 export default function App() {
-  const [user, setUser] = useState(null);
+  const [user, setUser] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [configured, setConfigured] = useState(true);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [inventory, setInventory] = useState([]);
-  const [shoppingList, setShoppingList] = useState([]); 
-  const [appliances, setAppliances] = useState([]); 
+  const [shoppingList, setShoppingList] = useState([]);
+  const [appliances, setAppliances] = useState([]);
   const [plan, setPlan] = useState(null);
   const [loading, setLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
-  
-  const [hubId, setHubId] = useState(() => {
-    try {
-      const saved = localStorage.getItem('northstar_hub_id');
-      return saved || SYSTEM_ID;
-    } catch { return SYSTEM_ID; }
-  });
-
   const [showSyncModal, setShowSyncModal] = useState(false);
   const [aiContent, setAiContent] = useState(null);
   const [isAiLoading, setIsAiLoading] = useState(false);
-  const [globalError, setGlobalError] = useState(configurationError || null);
-
-  // --- Auth & Init ---
+  const [globalError, setGlobalError] = useState(null);
+  const revision = useRef(-1);
+  const busy = useRef(false);
+  const epoch = useRef(0);
+  const hubId = SYSTEM_ID;
+  const accept = ({data,version}) => {
+    if (version < revision.current) return;
+    revision.current = version;
+    setInventory(data.inventory); setShoppingList(data.shoppingList);
+    setAppliances(data.appliances); setPlan(data.plan);
+  };
   useEffect(() => {
-    if (!auth) { setLoading(false); return; }
-    const init = async () => {
-      try {
-        await signInAnonymously(auth);
-      } catch (e) { setGlobalError(`Authentication failed: ${e.message}`); setLoading(false); }
-    };
-    init();
-    return onAuthStateChanged(auth, setUser);
+    request('session').then(value => { setUser(value.authenticated); setConfigured(value.configured); })
+      .catch(error=>setGlobalError(error.message)).finally(()=>setAuthReady(true));
   }, []);
-
-  useEffect(() => { try { if (hubId) localStorage.setItem('northstar_hub_id', hubId); } catch {} }, [hubId]);
-
-  // --- Data Sync ---
   useEffect(() => {
     if (!user) return;
-    setInventory([]); setShoppingList([]); setAppliances([]); setPlan(null);
-    if (!/^[a-zA-Z0-9_-]{1,100}$/.test(hubId)) { setGlobalError('Use a hub ID with letters, numbers, underscores or hyphens.'); setLoading(false); return; }
-    setLoading(true);
-    setIsSyncing(true);
-    const syncError = (error) => { setGlobalError(`Sync failed: ${error.message}`); setLoading(false); setIsSyncing(false); };
-    
-    const invRef = collection(db, 'artifacts', hubId, 'public', 'data', 'inventory');
-    const shopRef = collection(db, 'artifacts', hubId, 'public', 'data', 'shopping_list');
-    const appRef = collection(db, 'artifacts', hubId, 'public', 'data', 'appliances');
-    const planRef = doc(db, 'artifacts', hubId, 'public', 'data', 'plan', 'current');
-
-    const unsubInv = onSnapshot(invRef, (snap) => {
-      const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
-      setInventory(data);
-      setLoading(false);
-      setIsSyncing(false);
-      setGlobalError(null);
-    }, (err) => {
-      console.error(err);
-      setGlobalError(`Access Denied to "${hubId}". Try switching IDs.`);
-      setIsSyncing(false);
-      setLoading(false);
-    });
-
-    const unsubShop = onSnapshot(shopRef, (snap) => {
-      const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
-      setShoppingList(data);
-    }, syncError);
-
-    const unsubApp = onSnapshot(appRef, (snap) => {
-      const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
-      setAppliances(data);
-    }, syncError);
-
-    const unsubPlan = onSnapshot(planRef, (snap) => {
-      if (snap.exists()) setPlan(snap.data());
-      else setPlan(null);
-    }, syncError);
-
-    return () => { unsubInv(); unsubShop(); unsubApp(); unsubPlan(); };
-  }, [user, hubId]);
-
-  // --- File Backup System ---
-  const downloadBackup = () => {
-    const backupData = { inventory, shoppingList, appliances, plan };
-    const data = JSON.stringify(backupData, null, 2);
-    const blob = new Blob([data], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `northstar_full_backup_${new Date().toISOString().slice(0,10)}.json`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
-
-  const handleFileUpload = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    e.target.value = "";
-    if (file.size > 5_000_000) { alert("Backup must be smaller than 5 MB."); return; }
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      try {
-        const json = JSON.parse(event.target.result);
-        const items = Array.isArray(json) ? json : (json.inventory || []);
-        const shop = json.shoppingList || [];
-        const apps = json.appliances || [];
-        
-        if (![items, shop, apps].every(Array.isArray)) throw new Error('Backup collections must be arrays.');
-        if (items.length + shop.length + apps.length + (json.plan ? 1 : 0) > 450) throw new Error('Import supports at most 450 records at once.');
-        for (const item of [...items, ...shop, ...apps]) {
-          if (!item || typeof item !== 'object' || typeof item.name !== 'string' || !item.name.trim()) throw new Error('Each record needs a name.');
-          if (item.id && !/^[a-zA-Z0-9_-]{1,150}$/.test(item.id)) throw new Error('Invalid record ID.');
-        }
-        setIsSyncing(true);
-        const batch = writeBatch(db);
-        const invTarget = collection(db, 'artifacts', hubId, 'public', 'data', 'inventory');
-        const shopTarget = collection(db, 'artifacts', hubId, 'public', 'data', 'shopping_list');
-        const appTarget = collection(db, 'artifacts', hubId, 'public', 'data', 'appliances');
-        
-        items.forEach(item => { const { id, ...data } = item; batch.set(id ? doc(invTarget, id) : doc(invTarget), data); });
-        shop.forEach(item => { const { id, ...data } = item; batch.set(id ? doc(shopTarget, id) : doc(shopTarget), data); });
-        apps.forEach(item => { const { id, ...data } = item; batch.set(id ? doc(appTarget, id) : doc(appTarget), data); });
-        
-        if (json.plan) batch.set(doc(db, 'artifacts', hubId, 'public', 'data', 'plan', 'current'), json.plan);
-        await batch.commit();
-        alert(`Imported ${items.length} supplies, ${shop.length} shopping items, and ${apps.length} appliances!`);
-      } catch (err) {
-        alert(`Import failed: ${err.message}`);
-      }
-      setIsSyncing(false);
+    let cancelled = false;
+    let running = false;
+    const refresh = async () => {
+      if (running || busy.current) return;
+      running = true;
+      try { const state = await request('hub'); if (!cancelled) {accept(state); setGlobalError(null);} }
+      catch(error) { if (!cancelled) {setGlobalError(error.message); if(error.status===401) setUser(false);} }
+      finally {running=false;if(!cancelled) setLoading(false);}
     };
-    reader.readAsText(file);
+    refresh();
+    const timer = setInterval(refresh,15000);
+    window.addEventListener('focus',refresh);
+    return () => {cancelled=true;clearInterval(timer);window.removeEventListener('focus',refresh);};
+  }, [user]);
+  const mutate = async action => {
+    if (busy.current) return false;
+    busy.current=true; setIsSyncing(true);
+    const started = epoch.current;
+    try { const result=await request('hub',action); if(started===epoch.current){accept(result);setGlobalError(null);} return true; }
+    catch(error) {if(started===epoch.current){setGlobalError(error.message);if(error.status===401)setUser(false);} return false;}
+    finally {busy.current=false;setIsSyncing(false);}
+  };
+  const logout = async () => {
+    try {await request('session',{},'DELETE');epoch.current++;setUser(false);setInventory([]);setShoppingList([]);setAppliances([]);setPlan(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    catch(error){setGlobalError(error.message);}
+  };
+  const downloadBackup = () => {
+    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,plan},null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);const link=document.createElement('a');
+    link.href=url;link.download=`northstar-backup-${new Date().toISOString().slice(0,10)}.json`;link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  };
+  const handleFileUpload = async event => {
+    const file=event.target.files[0];event.target.value='';if(!file)return;
+    try {
+      if(file.size>2_000_000)throw new Error('Backup must be smaller than 2 MB.');
+      const backup=normalizeBackup(JSON.parse(await file.text()),()=>crypto.randomUUID());
+      if(await mutate({type:'import',backup})) {setShowSyncModal(false);alert('Backup imported. Existing records were merged by ID.');}
+    } catch(error){setGlobalError(`Import failed: ${error.message}`);}
   };
 
   // --- Logic Helpers ---
   const stats = useMemo(() => {
     let waterQty = 0, totalCals = 0, fuelHours = 0, powerKwh = 0, lowStock = 0, expired = 0, totalValue = 0;
-    const buckets = { Water: 0, Pasta: 0, Rice: 0, Beans: 0, 'Energy Bars': 0 }; 
+    const buckets = { Water: 0, Pasta: 0, Rice: 0, Beans: 0, 'Energy Bars': 0 };
 
     inventory.forEach(item => {
       const qty = Number(item.quantity) || 0;
@@ -195,20 +121,20 @@ export default function App() {
       const hours = Number(item.hoursPerUnit) || 0;
       const kwh = Number(item.capacityPerUnit) || 0;
       const price = Number(item.price) || 0;
-      
-      if (item.category === 'Water') waterQty += qty;
-      if (item.category === 'Food') totalCals += (qty * cals);
+
+      if (item.category === 'Water' && !isExpired(item.expiryDate)) waterQty += waterGallons(item);
+      if (item.category === 'Food' && !isExpired(item.expiryDate)) totalCals += (qty * cals);
       if (item.category === 'Fuel') fuelHours += (qty * hours);
       if (item.category === 'Power') powerKwh += (qty * kwh);
 
       totalValue += (qty * price);
 
       if (qty < (item.target || 1) * 0.25) lowStock++;
-      if (item.expiryDate && new Date(item.expiryDate) < new Date()) expired++;
+      if (isExpired(item.expiryDate)) expired++;
 
       const nameLower = item.name?.toLowerCase() || '';
       for (const key in buckets) {
-        if (nameLower.includes(key.toLowerCase())) buckets[key] += (key === 'Water' ? qty : (qty * cals));
+        if (!isExpired(item.expiryDate) && nameLower.includes(key.toLowerCase())) buckets[key] += (key === 'Water' && item.category === 'Water' ? waterGallons(item) : item.category === 'Food' ? qty * cals : 0);
       }
     });
 
@@ -229,23 +155,23 @@ export default function App() {
 
     const powerDays = dailyLoadKwh > 0 ? (powerKwh / dailyLoadKwh) : 0;
 
-    return { 
-        waterDays, foodDays, totalFuelHours: fuelHours, 
+    return {
+        waterDays, foodDays, totalFuelHours: fuelHours,
         totalPowerKwh: powerKwh, totalCalories: totalCals, totalValue,
         lowStock, expired, coreStatus,
-        dailyLoadKwh, powerDays 
+        dailyLoadKwh, powerDays
     };
   }, [inventory, appliances]);
 
   const generateMealPlan = async () => {
     setIsAiLoading(true);
     const inventoryText = inventory.map(i => `${i.name}: ${i.quantity} ${i.unit}`).join(', ');
-    const prompt = `Based on this survival inventory: ${inventoryText}, create a 3-day meal plan for a family of 4 (Adults Garrett and Abby, kids Brynn and Rory) in a power outage. Daily calorie target 8,000. Provide concise daily summaries.`;
+    const prompt = `Based on this survival inventory: ${inventoryText}, create a 3-day meal plan for a family of 4 in a power outage. Daily calorie target 8,000. Provide concise daily summaries.`;
     try {
       const result = await callGemini(prompt);
       setAiContent({ title: "AI Survival Meal Plan ✨", text: result });
     } catch (e) {
-      setAiContent({ title: "Error", text: "Could not generate plan." });
+      setAiContent({ title: "Error", text: e.message });
     }
     setIsAiLoading(false);
   };
@@ -253,12 +179,12 @@ export default function App() {
   const analyzeInventory = async () => {
     setIsAiLoading(true);
     const inventoryText = inventory.map(i => `${i.name}: ${i.quantity} ${i.unit} (${i.category})`).join(', ');
-    const prompt = `Analyze this survival inventory list for a family of 4 in St. Anthony, MN (Winter climate): ${inventoryText}. Identify 3 critical gaps or missing categories to reach 14 days self-sufficiency. Be specific and concise.`;
+    const prompt = `Analyze this survival inventory list for a family of 4 in a winter climate: ${inventoryText}. Identify 3 critical gaps or missing categories to reach 14 days self-sufficiency. Be specific and concise.`;
     try {
       const result = await callGemini(prompt);
       setAiContent({ title: "AI Gap Analysis ✨", text: result });
     } catch (e) {
-      setAiContent({ title: "Error", text: "Analysis failed." });
+      setAiContent({ title: "Error", text: e.message });
     }
     setIsAiLoading(false);
   };
@@ -267,91 +193,62 @@ export default function App() {
     setIsAiLoading(true);
     const familyNames = plan?.family?.map(f => f.name).join(', ') || "the family";
     const shelter = plan?.shelterSpot || "basement";
-    const prompt = `Create a realistic 10-minute emergency drill scenario for a family in suburban Minnesota (Winter). Family: ${familyNames}. Safe spot: ${shelter}. Scenario: Severe blizzard with power loss or tornado siren. Give 3 immediate action steps for Garrett and Abby to practice with Brynn (4) and Rory (3).`;
+    const prompt = `Create a realistic 10-minute emergency drill scenario for a family in suburban Minnesota (Winter). Family: ${familyNames}. Safe spot: ${shelter}. Scenario: Severe blizzard with power loss or tornado siren. Give 3 immediate action steps for the household to practice.`;
     try {
       const result = await callGemini(prompt);
       setAiContent({ title: "🚨 AI Emergency Drill", text: result });
     } catch (e) {
-      setAiContent({ title: "Error", text: "Drill generation failed." });
+      setAiContent({ title: "Error", text: e.message });
     }
     setIsAiLoading(false);
   };
 
-  const handleAdd = async (coll, item) => {
-    try { await addDoc(collection(db, 'artifacts', hubId, 'public', 'data', coll), item); return true; } 
-    catch (e) { alert("Failed to add. Check ID permissions."); return false; }
-  };
-  const handleUpdate = async (coll, id, item) => updateDoc(doc(db, 'artifacts', hubId, 'public', 'data', coll, id), item);
-  const handleDelete = async (coll, id) => deleteDoc(doc(db, 'artifacts', hubId, 'public', 'data', coll, id));
-  
-  const handleBuyItem = async (item) => {
-    try {
-      const { id, ...data } = item;
-      const batch = writeBatch(db);
-      batch.set(doc(db, 'artifacts', hubId, 'public', 'data', 'inventory', id), data);
-      batch.delete(doc(db, 'artifacts', hubId, 'public', 'data', 'shopping_list', id));
-      await batch.commit();
-    } catch (e) {
-      alert("Failed to move item to inventory.");
-    }
-  };
+  const handleAdd = (collection,item) => mutate({type:'add',collection,id:crypto.randomUUID(),item});
+  const handleUpdate = (collection,id,item) => mutate({type:'update',collection,id,item});
+  const handleDelete = (collection,id) => mutate({type:'delete',collection,id});
+  const handleBuyItem = item => mutate({type:'buy',id:item.id});
 
+  if (!authReady) return <LoadingScreen />;
+  if (!user) return <Login configured={configured} error={globalError} onLogin={() => {epoch.current++;revision.current=-1;setLoading(true);setUser(true);setGlobalError(null);}} />;
   if (loading && !inventory.length && !globalError) return <LoadingScreen />;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans select-none">
       {globalError && <div role="alert" className="bg-red-100 text-red-900 p-4">{globalError}</div>}
       <Header hubId={hubId} isSyncing={isSyncing} onSyncClick={() => setShowSyncModal(true)} error={globalError} onDownload={downloadBackup} />
-      
-      {inventory.length === 0 && !loading && (
-        <div className="mx-4 mt-4 animate-in slide-in-from-top-4 duration-500">
-          <div className="bg-white border-2 border-orange-100 rounded-[2rem] p-6 shadow-xl text-center">
-            <div className="bg-orange-50 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 text-orange-600"><Database size={32} /></div>
-            <h2 className="text-xl font-black text-slate-900 mb-2">Dashboard Empty?</h2>
-            <p className="text-sm text-slate-500 mb-6">Recover your data from a previous session:</p>
-            <div className="grid gap-3">
-              <button onClick={() => setHubId('SX-630')} className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold py-3 rounded-xl flex items-center justify-center gap-2"><Link2 size={16}/> Connect to "SX-630"</button>
-              <button onClick={() => setHubId(SYSTEM_ID)} className="bg-blue-50 hover:bg-blue-100 text-blue-700 font-bold py-3 rounded-xl flex items-center justify-center gap-2 border border-blue-100"><Shield size={16}/> Connect to "Garrett & Abby"</button>
-              <label className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold py-3 rounded-xl flex items-center justify-center gap-2 border border-emerald-100 cursor-pointer">
-                <Upload size={16}/> Upload Backup File
-                <input type="file" accept=".json" className="hidden" onChange={handleFileUpload} />
-              </label>
-            </div>
-          </div>
-        </div>
-      )}
 
+      {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
         {activeTab === 'dashboard' && <Dashboard stats={stats} onGeneratePlan={generateMealPlan} onAnalyzeGaps={analyzeInventory} isAiLoading={isAiLoading} />}
         {activeTab === 'inventory' && (
-          <InventoryManager 
+          <InventoryManager
             title="Supply Hub"
-            items={inventory} 
-            stats={stats} 
-            onAdd={(i) => handleAdd('inventory', i)} 
-            onUpdate={(id, i) => handleUpdate('inventory', id, i)} 
-            onDelete={(id) => handleDelete('inventory', id)} 
-            onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)} 
-            isAiLoading={isAiLoading} 
+            items={inventory}
+            stats={stats}
+            onAdd={(i) => handleAdd('inventory', i)}
+            onUpdate={(id, i) => handleUpdate('inventory', id, i)}
+            onDelete={(id) => handleDelete('inventory', id)}
+            onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)}
+            isAiLoading={isAiLoading}
           />
         )}
         {activeTab === 'shopping' && (
-          <InventoryManager 
+          <InventoryManager
             title="Shopping List"
-            items={shoppingList} 
-            stats={stats} 
+            items={shoppingList}
+            stats={stats}
             isShoppingMode={true}
-            onAdd={(i) => handleAdd('shopping_list', i)} 
-            onUpdate={(id, i) => handleUpdate('shopping_list', id, i)} 
-            onDelete={(id) => handleDelete('shopping_list', id)} 
+            onAdd={(i) => handleAdd('shopping_list', i)}
+            onUpdate={(id, i) => handleUpdate('shopping_list', id, i)}
+            onDelete={(id) => handleDelete('shopping_list', id)}
             onBuy={handleBuyItem}
-            onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)} 
-            isAiLoading={isAiLoading} 
+            onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)}
+            isAiLoading={isAiLoading}
           />
         )}
         {activeTab === 'power' && (
-          <ApplianceManager 
-            appliances={appliances} 
+          <ApplianceManager
+            appliances={appliances}
             stats={stats}
             onAdd={(i) => handleAdd('appliances', i)}
             onUpdate={(id, i) => handleUpdate('appliances', id, i)}
@@ -360,12 +257,12 @@ export default function App() {
             isAiLoading={isAiLoading}
           />
         )}
-        {activeTab === 'plan' && <EmergencyPlan plan={plan} onUpdate={(d) => setDoc(doc(db, 'artifacts', hubId, 'public', 'data', 'plan', 'current'), d, { merge: true })} onRunDrill={generateDrill} isAiLoading={isAiLoading} />}
+        {activeTab === 'plan' && <EmergencyPlan plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunDrill={generateDrill} isAiLoading={isAiLoading} />}
       </main>
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
-      
-      {showSyncModal && <SyncModal currentId={hubId} onSetId={setHubId} onClose={() => setShowSyncModal(false)} onImport={handleFileUpload} systemId={SYSTEM_ID} />}
+
+      {showSyncModal && <SyncModal onClose={() => setShowSyncModal(false)} onImport={handleFileUpload} onLogout={logout} />}
       {aiContent && <AiModal content={aiContent} onClose={() => setAiContent(null)} />}
     </div>
   );
@@ -385,7 +282,7 @@ function Dashboard({ stats, onGeneratePlan, onAnalyzeGaps, isAiLoading }) {
       <div className="bg-slate-900 text-white p-7 rounded-[2.5rem] shadow-2xl relative overflow-hidden">
         <div className="relative z-10">
           <h2 className="text-xl font-black mb-1">Readiness Score</h2>
-          <p className="text-slate-400 text-xs font-bold uppercase tracking-widest">Saint Anthony Hub</p>
+          <p className="text-slate-400 text-xs font-bold uppercase tracking-widest">Household Readiness</p>
           <div className="mt-6 space-y-4">
             <ProgressBar label="Food (14 Days)" percent={(stats.foodDays / SURVIVAL_GOAL_DAYS) * 100} color="bg-emerald-500" />
             <ProgressBar label="Water (14 Days)" percent={(stats.waterDays / SURVIVAL_GOAL_DAYS) * 100} color="bg-blue-500" />
@@ -417,11 +314,11 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
   const [form, setForm] = useState({ name: '', watts: '', hours: '', active: true });
 
   const reset = () => { setForm({ name: '', watts: '', hours: '', active: true }); setEditingId(null); setShowAdd(false); };
-  
+
   const submit = async (e) => {
     e.preventDefault();
     const data = { ...form, watts: Number(form.watts), hours: Number(form.hours) };
-    if (editingId) await onUpdate(editingId, data);
+    if (editingId) { if (!await onUpdate(editingId, data)) return; }
     else if (!await onAdd({ ...data, active: true })) return;
     reset();
   };
@@ -442,7 +339,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
          <div className="p-3 bg-violet-100 text-violet-600 rounded-full mb-2"><Zap size={24}/></div>
          <div className="text-3xl font-black text-slate-900">{stats.dailyLoadKwh.toFixed(2)} <span className="text-base font-bold text-slate-400">kWh/day</span></div>
          <div className="text-xs font-bold text-violet-400 uppercase tracking-widest mb-4">Active Daily Demand</div>
-         
+
          <div className="w-full bg-white p-4 rounded-2xl border border-violet-100 flex justify-between items-center">
             <div className="text-left">
                <div className="text-[10px] font-black uppercase text-slate-400">Stored Power</div>
@@ -468,7 +365,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
           <form onSubmit={submit} className="bg-white border-2 border-violet-100 rounded-[2.5rem] p-7 shadow-2xl space-y-4">
              <div className="flex justify-between items-center mb-2">
                 <h3 className="text-xs font-black uppercase text-violet-600 tracking-widest">{editingId ? 'Edit Device' : 'New Appliance'}</h3>
-                {editingId && <button type="button" onClick={() => onDelete(editingId)} className="text-red-500 flex items-center gap-1 text-[10px] font-black uppercase"><Trash2 size={12}/> Delete</button>}
+                {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-500 flex items-center gap-1 text-[10px] font-black uppercase"><Trash2 size={12}/> Delete</button>}
              </div>
              <div className="grid grid-cols-2 gap-4">
                 <div className="col-span-2"><Label>Device Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Fridge" /></div>
@@ -487,7 +384,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
         {appliances.map(app => (
           <div key={app.id} className={`border p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm transition-all ${app.active !== false ? 'bg-white border-slate-200' : 'bg-slate-50 border-slate-100 opacity-60'}`}>
              <div className="flex items-center gap-4">
-                <button 
+                <button
                   onClick={(e) => { e.stopPropagation(); onUpdate(app.id, { active: app.active === false ? true : false }); }}
                   className={`p-3.5 rounded-2xl transition-all active:scale-90 shadow-sm ${app.active !== false ? 'bg-violet-500 text-white shadow-violet-200' : 'bg-slate-200 text-slate-400'}`}
                 >
@@ -520,35 +417,36 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
   const [smartText, setSmartText] = useState('');
   const [isImgLoading, setIsImgLoading] = useState(false);
   const [sortBy, setSortBy] = useState(''); // 'expiry', 'calories', 'date'
-  
-  const [form, setForm] = useState({ 
-    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', purchaseDate: '', expiryDate: ''
+
+  const [form, setForm] = useState({
+    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', purchaseDate: '', expiryDate: ''
   });
 
-  const reset = () => { 
-    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', purchaseDate: '', expiryDate: '' }); 
-    setEditingItem(null); 
-    setShowAdd(false); 
+  const reset = () => {
+    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', purchaseDate: '', expiryDate: '' });
+    setEditingItem(null);
+    setShowAdd(false);
   };
-  
+
   const submit = async (e) => {
     e.preventDefault();
-    const payload = { 
-      ...form, 
-      quantity: Number(form.quantity), 
-      caloriesPerUnit: Number(form.caloriesPerUnit), 
+    const payload = {
+      ...form,
+      quantity: Number(form.quantity),
+      caloriesPerUnit: Number(form.caloriesPerUnit),
       hoursPerUnit: Number(form.hoursPerUnit),
       capacityPerUnit: Number(form.capacityPerUnit),
+      gallonsPerUnit: Number(form.gallonsPerUnit || 0),
       price: Number(form.price)
     };
-    if (editingItem) await onUpdate(editingItem.id, payload);
+    if (editingItem) { if (!await onUpdate(editingItem.id, payload)) return; }
     else if (!await onAdd(payload)) return;
     reset();
   };
 
   const handleEdit = (item) => { setForm(item); setEditingItem(item); setShowAdd(true); window.scrollTo({ top: 0, behavior: 'smooth' }); };
   const runSmart = async () => { const res = await onSmartSuggest(smartText); if (res) { setForm(prev => ({...prev, ...res})); setSmartText(''); } };
-  
+
   const handleGenerateImage = async () => {
     if (!form.name) return;
     setIsImgLoading(true);
@@ -577,7 +475,7 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
   const groupedItems = useMemo(() => {
     const groups = Object.create(null);
     const source = sortedItems;
-    
+
     if (isShoppingMode) {
       source.forEach(item => { const s = item.store || 'Uncategorized'; if (!groups[s]) groups[s] = []; groups[s].push(item); });
     } else {
@@ -616,9 +514,9 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
           <form onSubmit={submit} className="bg-white border-2 border-blue-100 rounded-[2.5rem] p-6 shadow-2xl space-y-4">
             <div className="flex justify-between mb-2">
               <h3 className="text-xs font-black uppercase text-blue-600">{editingItem ? 'Edit Item' : 'New Supply'}</h3>
-              {editingItem && <button type="button" onClick={() => onDelete(editingItem.id)} className="text-red-500 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
+              {editingItem && <button type="button" onClick={async () => { if (await onDelete(editingItem.id)) reset(); }} className="text-red-500 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
             </div>
-            
+
             <div className="flex justify-center mb-4">
                <div className="relative w-20 h-20 bg-slate-50 rounded-2xl flex items-center justify-center border-2 border-slate-100 overflow-hidden">
                  {form.image ? <img src={form.image} alt="icon" className="w-full h-full object-cover"/> : <span className="text-3xl">{form.emoji || '📦'}</span>}
@@ -632,13 +530,13 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
               <div className="col-span-2"><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} /></div>
               <div><Label>Quantity</Label><Input val={form.quantity} set={v => setForm({...form, quantity: v})} type="number" /></div>
               <div><Label>Unit</Label><Input val={form.unit} set={v => setForm({...form, unit: v})} /></div>
-              
+
               <div><Label>Purchase Date</Label><Input val={form.purchaseDate} set={v => setForm({...form, purchaseDate: v})} type="date" /></div>
               <div><Label>Expiry Date</Label><Input val={form.expiryDate} set={v => setForm({...form, expiryDate: v})} type="date" /></div>
 
               <div><Label>Price ($/Unit)</Label><Input val={form.price} set={v => setForm({...form, price: v})} type="number" placeholder="0.00" /></div>
               <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={["Food", "Water", "Medical", "Gear", "Fuel", "Power"]} /></div>
-              
+
               {isShoppingMode && <div className="col-span-2"><Label>Store</Label><Input val={form.store} set={v => setForm({...form, store: v})} placeholder="e.g. Costco" /></div>}
 
               {form.category === 'Food' && (
@@ -647,6 +545,7 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
                   <div><Label>Macro Tag</Label><Select val={form.macroTag} set={v => setForm({...form, macroTag: v})} opts={["", "Carbs", "Protein", "Fat", "Balanced"]} /></div>
                 </>
               )}
+              {form.category === 'Water' && <div className="col-span-2"><Label>Gallons per unit (for bottles or cases)</Label><Input val={form.gallonsPerUnit} set={v => setForm({...form, gallonsPerUnit:v})} type="number" placeholder="e.g. 0.132 for a 500 mL bottle" /><p className="text-xs text-slate-500 mt-2">Leave zero when your unit is gallons, liters, mL or fl oz. Other units need this value to count toward readiness.</p></div>}
               {form.category === 'Fuel' && <div className="col-span-2"><Label>Hours/Unit (Heat)</Label><Input val={form.hoursPerUnit} set={v => setForm({...form, hoursPerUnit: v})} type="number" /></div>}
               {form.category === 'Power' && <div className="col-span-2"><Label>Capacity (kWh)</Label><Input val={form.capacityPerUnit} set={v => setForm({...form, capacityPerUnit: v})} type="number" placeholder="e.g. 1.5"/></div>}
             </div>
@@ -691,7 +590,7 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
              <div key={groupName} className="mb-6">
                <div className="flex justify-between items-center mb-3 pl-2 pr-2">
                  <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-2">
-                   {isShoppingMode ? <Store size={12} /> : (getCategoryIcon(groupName)?.icon || <Layers size={12} />)} 
+                   {isShoppingMode ? <Store size={12} /> : (getCategoryIcon(groupName)?.icon || <Layers size={12} />)}
                    {groupName}
                  </h4>
                  {!isShoppingMode && groupName === 'Food' && (
@@ -726,7 +625,7 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
     <div className="space-y-6 animate-in fade-in duration-500">
       <div className="flex justify-between items-center px-1">
         <h2 className="text-xl font-black text-slate-800">Family Hub</h2>
-        <button onClick={async () => { try { if(isEditing) await onUpdate({...plan, shelterSpot: spot}); setIsEditing(!isEditing); } catch { alert("Could not save plan. Please retry."); } }} className="text-[10px] font-black px-6 py-2.5 rounded-full bg-blue-50 text-blue-600 uppercase tracking-widest">
+        <button onClick={async () => { try { if(isEditing && !await onUpdate({...plan, shelterSpot: spot})) return; setIsEditing(!isEditing); } catch { alert("Could not save plan. Please retry."); } }} className="text-[10px] font-black px-6 py-2.5 rounded-full bg-blue-50 text-blue-600 uppercase tracking-widest">
           {isEditing ? "Save" : "Edit"}
         </button>
       </div>
@@ -821,10 +720,10 @@ function InventoryItem({ item, onClick, onBuy }) {
   };
 
   const isExpiringSoon = item.expiryDate && new Date(item.expiryDate) < new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-  const isExpired = item.expiryDate && new Date(item.expiryDate) < new Date();
+  const expired = isExpired(item.expiryDate);
 
   return (
-    <div onClick={onClick} className={`bg-white border border-slate-200 p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm active:scale-95 transition-all cursor-pointer ${isExpired ? 'border-red-300 bg-red-50' : ''}`}>
+    <div onClick={onClick} className={`bg-white border border-slate-200 p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm active:scale-95 transition-all cursor-pointer ${expired ? 'border-red-300 bg-red-50' : ''}`}>
        <div className="flex items-center gap-4">
           <div className={`w-12 h-12 rounded-2xl flex items-center justify-center overflow-hidden ${style}`}>
             {item.image ? (
@@ -843,7 +742,7 @@ function InventoryItem({ item, onClick, onBuy }) {
                )}
              </div>
              <div className="flex gap-2 mt-1">
-               {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-600 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {isExpired ? 'EXPIRED' : 'Expiring Soon'}</span>}
+               {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-600 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">
                 {item.quantity} {item.unit}
                </p>
@@ -857,7 +756,7 @@ function InventoryItem({ item, onClick, onBuy }) {
        </div>
        <div className="flex items-center gap-2">
          {onBuy && (
-           <button 
+           <button
              onClick={(e) => { e.stopPropagation(); onBuy(item); }}
              className="p-2 bg-slate-100 text-slate-400 hover:bg-emerald-100 hover:text-emerald-600 rounded-full transition-colors"
              title="Buy & Move to Inventory"
@@ -958,40 +857,32 @@ function getCategoryIcon(cat) {
 }
 
 // --- Modals ---
-function SyncModal({ currentId, onSetId, onClose, onImport, systemId }) {
-  const [val, setVal] = useState('');
-  return (
-    <div className="fixed inset-0 z-[100] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-6 text-slate-900">
-      <div className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl">
-        <div className="flex justify-center mb-4 text-blue-600"><Database size={40} /></div>
-        <h3 className="text-xl font-black text-center mb-2">Connection Settings</h3>
-        <p className="text-center text-xs text-slate-400 mb-6 px-4">Current ID: <span className="font-mono bg-slate-100 px-1 rounded">{currentId}</span></p>
-        
-        <div className="space-y-3 mb-6">
-          <button onClick={() => { onSetId(systemId); onClose(); }} className="w-full py-3 rounded-xl font-bold text-xs bg-green-100 text-green-700 flex justify-center gap-2 border-2 border-green-200">
-            <CheckCircle size={14}/> Use Default Hub ID
-          </button>
-          <div className="flex gap-2">
-            <input className="flex-1 border-2 border-slate-100 rounded-xl p-3 text-xs font-mono text-center" placeholder="Paste Custom ID..." value={val ?? ""} onChange={(e) => setVal(e.target.value)} />
-            <button onClick={() => { if(val) { onSetId(val); onClose(); } }} className="bg-blue-600 text-white px-4 rounded-xl font-bold text-xs">Set</button>
-          </div>
-        </div>
-
-        <div className="border-t border-slate-100 pt-4">
-          <h4 className="text-xs font-black uppercase text-slate-400 text-center mb-3 flex justify-center gap-2"><History size={12}/> Recovery</h4>
-          <div className="grid gap-2">
-            <button onClick={() => { onSetId('SX-630'); onClose(); }} className="text-xs font-bold py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl">Load "SX-630"</button>
-            <button onClick={() => { onSetId('northstar-garrett-abby'); onClose(); }} className="text-xs font-bold py-3 bg-blue-50 text-blue-700 border border-blue-200 rounded-xl hover:bg-blue-100">Load "Garrett & Abby"</button>
-            <label className="text-xs font-bold py-3 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl hover:bg-emerald-100 flex items-center justify-center gap-2 cursor-pointer">
-              <Upload size={14}/> Upload Backup File
-              <input type="file" accept=".json" className="hidden" onChange={(e) => { onImport(e); onClose(); }} />
-            </label>
-          </div>
-        </div>
-        <button onClick={onClose} className="mt-4 w-full text-slate-400 font-bold text-xs uppercase">Close</button>
-      </div>
-    </div>
-  );
+function SyncModal({onClose,onImport,onLogout}) {
+  return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
+    <section role="dialog" aria-modal="true" aria-labelledby="settings-title" className="bg-white w-full max-w-sm rounded-3xl p-8 space-y-5">
+      <h2 id="settings-title" className="text-xl font-black">Household settings</h2>
+      <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances and your family plan.</p>
+      <label className="block text-sm font-bold">Import JSON backup<input type="file" accept=".json,application/json" onChange={onImport} className="block mt-2 w-full text-xs" /></label>
+      <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>
+      <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>
+    </section>
+  </div>;
+}
+function Login({configured,error,onLogin}) {
+  const [password,setPassword]=useState('');
+  const [message,setMessage]=useState(null);
+  const [pending,setPending]=useState(false);
+  const submit=async event=>{event.preventDefault();setPending(true);setMessage(null);try{await request('session',{password});setPassword('');onLogin();}catch(error){setMessage(error.message);}finally{setPending(false);}};
+  return <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
+    <form onSubmit={submit} className="w-full max-w-sm space-y-6">
+      <Shield className="text-blue-400" size={40}/><h1 className="text-3xl font-black">NorthStar Prep</h1>
+      <p className="text-slate-300">Sign in to your household supplies and emergency plan.</p>
+      {!configured && <p role="alert" className="text-amber-200">Setup required: connect the database and configure household login in Vercel.</p>}
+      {(message||error) && <p role="alert" className="text-red-300">{message||error}</p>}
+      <label className="block">Household password<input autoComplete="current-password" type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+      <button disabled={pending||!configured} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{pending?'Signing in…':'Sign in'}</button>
+    </form>
+  </main>;
 }
 
 function AiModal({ content, onClose }) {

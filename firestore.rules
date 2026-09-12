@@ -1,0 +1,12 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Provision memberships through the Firebase console or a trusted admin.
+    function member(hub) {
+      return request.auth != null && exists(/databases/$(database)/documents/artifacts/$(hub)/members/$(request.auth.uid));
+    }
+    match /artifacts/{hub}/public/data/{kind}/{id} {
+      allow read, write: if member(hub) && kind in ['inventory', 'shopping_list', 'appliances', 'plan'];
+    }
+  }
+}

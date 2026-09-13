@@ -80,10 +80,11 @@ test('mutations reject cross-site origins and non-JSON forms',()=>{
   assert.equal(sameOrigin({headers:{host:'example.com',origin:'https://evil.com','content-type':'application/json'}}),false);
   assert.equal(sameOrigin({headers:{host:'example.com',origin:'https://example.com','content-type':'text/plain'}}),false);
 });
-function response(){return {code:200,setHeader(){},status(code){this.code=code;return this;},json(data){this.data=data;return this;}};}
+function response(){return {code:200,headers:{},setHeader(name,value){this.headers[name]=value;},status(code){this.code=code;return this;},json(data){this.data=data;return this;}};}
 test('API refuses unauthenticated reads',async()=>{
   let called=false;const handler=createHandler({readState(){called=true;}},()=>false);const res=response();
   await handler({method:'GET',headers:{}},res);assert.equal(res.code,401);assert.equal(called,false);
+  assert.match(res.headers['x-request-id'],/^[0-9a-f-]{36}$/);
 });
 test('API reapplies a mutation after a concurrent write without losing either item',async()=>{
   let state=emptyState(),version=0,conflict=true;

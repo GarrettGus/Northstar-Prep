@@ -36,7 +36,7 @@ export function createHandler(repository = {readState, compareAndSave, logAudit:
         let next;
         try { next = applyAction(current.data,req.body); }
         catch { return res.status(400).json({error:'Invalid data or item conflict. Check fields and refresh before retrying.'}); }
-        const version = await repository.compareAndSave(current.version,next);
+        const version = await repository.compareAndSave(current.version,next,current.data);
         if (version !== undefined) {
           try { await repository.logAudit({userId: session.userId, action: req.body.type, ...summarizeAction(req.body, current.data)}); }
           catch (error) { console.error(JSON.stringify({event:'audit_log_failure', requestId:request.id, error: error instanceof Error ? error.name : 'UnknownError'})); }

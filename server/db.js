@@ -238,3 +238,27 @@ export async function listAuditLog(householdId = 1, limit = 50) {
     FROM northstar_audit_log a LEFT JOIN northstar_users u ON u.id = a.user_id
     WHERE a.household_id = ${householdId} ORDER BY a.created_at DESC LIMIT ${limit}`;
 }
+
+// --- Encrypted household backups. Ciphertext/IV/auth tag never leave insertBackupRecord/getBackupRecord. ---
+export async function insertBackupRecord({householdId = 1, status, error = null, checksum = null, sizeBytes = null, inventoryCount = null, shoppingCount = null, applianceCount = null, hasPlan = null, iv = null, authTag = null, ciphertext = null}) {
+  const sql = database();
+  await sql`INSERT INTO northstar_backups (household_id, status, error, checksum, size_bytes, inventory_count, shopping_count, appliance_count, has_plan, iv, auth_tag, ciphertext)
+    VALUES (${householdId}, ${status}, ${error}, ${checksum}, ${sizeBytes}, ${inventoryCount}, ${shoppingCount}, ${applianceCount}, ${hasPlan}, ${iv}, ${authTag}, ${ciphertext})`;
+}
+export async function listBackupRecords(householdId = 1, limit = 20) {
+  const sql = database();
+  return sql`SELECT id, created_at, status, error, checksum, size_bytes, inventory_count, shopping_count, appliance_count, has_plan
+    FROM northstar_backups WHERE household_id = ${householdId} ORDER BY created_at DESC LIMIT ${limit}`;
+}
+export async function getBackupRecord(id, householdId = 1) {
+  const sql = database();
+  const rows = await sql`SELECT id, created_at, checksum, iv, auth_tag, ciphertext
+    FROM northstar_backups WHERE id = ${id} AND household_id = ${householdId} AND status = 'success'`;
+  return rows[0];
+}
+export async function pruneBackups(householdId = 1, keep = 30) {
+  const sql = database();
+  await sql`DELETE FROM northstar_backups WHERE household_id = ${householdId} AND id NOT IN (
+    SELECT id FROM northstar_backups WHERE household_id = ${householdId} ORDER BY created_at DESC LIMIT ${keep}
+  )`;
+}

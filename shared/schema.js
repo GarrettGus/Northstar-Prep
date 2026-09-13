@@ -1,27 +1,48 @@
 import { z } from 'zod';
+
 const text = z.string().max(500);
 const number = z.coerce.number().finite().nonnegative().max(1e9).default(0);
 export const idSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,150}$/);
 const date = z.union([z.literal(''), z.iso.date()]).default('');
+export const fuelTypes = ['', 'Propane', 'Gasoline', 'Diesel', 'Wood', 'Kerosene', 'Battery', 'Other'];
+
+const fraction = z.coerce.number().finite().min(0).max(1);
 const settingsFields = {
   householdSize: z.coerce.number().int().min(1).max(50),
-  caloriesPerPersonDay: z.coerce.number().finite().min(500).max(10000),
-  waterPerPersonDay: z.coerce.number().finite().positive().max(20),
-  survivalGoalDays: z.coerce.number().finite().positive().max(365),
-  heatGoalHours: z.coerce.number().finite().nonnegative().max(8760),
-  powerGoalKwh: z.coerce.number().finite().nonnegative().max(100000),
-  powerRuntimeGoalDays: z.coerce.number().finite().positive().max(365),
+  caloriesPerPersonPerDay: z.coerce.number().finite().min(0).max(10000),
+  waterGallonsPerPersonPerDay: z.coerce.number().finite().min(0).max(20),
+  survivalGoalDays: z.coerce.number().int().min(1).max(365),
+  heatGoalHours: z.coerce.number().finite().min(0).max(10000),
+  powerGoalKwh: z.coerce.number().finite().min(0).max(10000),
+  batteryUsableFraction: fraction,
+  inverterEfficiency: fraction,
 };
-export const settingsSchema = z.object({
-  householdSize: z.coerce.number().int().min(1).max(50).default(4),
-  caloriesPerPersonDay: z.coerce.number().finite().min(500).max(10000).default(2000),
-  waterPerPersonDay: z.coerce.number().finite().positive().max(20).default(1),
-  survivalGoalDays: z.coerce.number().finite().positive().max(365).default(14),
-  heatGoalHours: z.coerce.number().finite().nonnegative().max(8760).default(36),
-  powerGoalKwh: z.coerce.number().finite().nonnegative().max(100000).default(20),
-  powerRuntimeGoalDays: z.coerce.number().finite().positive().max(365).default(2),
+
+// Accept names used by the first Firebase-free build so existing rows and backups remain readable.
+const normalizeSettingsAliases = value => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const next = {...value};
+  if (next.caloriesPerPersonPerDay === undefined && next.caloriesPerPersonDay !== undefined) next.caloriesPerPersonPerDay = next.caloriesPerPersonDay;
+  if (next.waterGallonsPerPersonPerDay === undefined && next.waterPerPersonDay !== undefined) next.waterGallonsPerPersonPerDay = next.waterPerPersonDay;
+  delete next.caloriesPerPersonDay;
+  delete next.waterPerPersonDay;
+  delete next.powerRuntimeGoalDays;
+  return next;
+};
+
+const settingsObject = z.object({
+  householdSize: settingsFields.householdSize.default(4),
+  caloriesPerPersonPerDay: settingsFields.caloriesPerPersonPerDay.default(2000),
+  waterGallonsPerPersonPerDay: settingsFields.waterGallonsPerPersonPerDay.default(1),
+  survivalGoalDays: settingsFields.survivalGoalDays.default(14),
+  heatGoalHours: settingsFields.heatGoalHours.default(36),
+  powerGoalKwh: settingsFields.powerGoalKwh.default(20),
+  batteryUsableFraction: settingsFields.batteryUsableFraction.default(0.9),
+  inverterEfficiency: settingsFields.inverterEfficiency.default(0.9),
 });
-export const settingsInputSchema = z.object(settingsFields).partial();
+export const settingsSchema = z.preprocess(normalizeSettingsAliases, settingsObject);
+export const settingsInputSchema = z.preprocess(normalizeSettingsAliases, z.object(settingsFields).partial());
+
 export const itemSchema = z.object({
   id: idSchema, name: z.string().trim().min(1).max(200), quantity: number,
   unit: z.string().max(80).default('units'),
@@ -30,6 +51,7 @@ export const itemSchema = z.object({
   gallonsPerUnit: number, target: number, store: text.default(''), emoji: z.string().max(30).default(''),
   image: z.string().max(180000).regex(/^(?:|data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+)$/).default(''),
   macroTag: z.enum(['', 'Carbs', 'Protein', 'Fat', 'Balanced']).default(''),
+  fuelType: z.enum(fuelTypes).default(''),
   purchaseDate: date, expiryDate: date,
 });
 export const applianceSchema = z.object({ id: idSchema, name: z.string().trim().min(1).max(200), watts: number, hours: z.coerce.number().finite().min(0).max(24), active: z.boolean().default(true) });
@@ -39,10 +61,11 @@ export const planSchema = z.object({
   contacts: z.array(z.object({name: text, phone: z.string().max(80), type: text.default('')})).max(50).default([]),
   meetingPoints: z.object({primary: text.default(''), secondary: text.default('')}).default({primary:'',secondary:''}),
 });
-export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable(), settings: settingsSchema.default({}) });
+export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable(), settings: settingsSchema.default(() => settingsSchema.parse({})) });
 export const backupSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable().default(null), settings: settingsInputSchema.optional() });
 export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], plan:null, settings:settingsSchema.parse({})});
 export const collectionKey = {inventory:'inventory', shopping_list:'shoppingList', appliances:'appliances'};
+
 export function normalizeBackup(input, makeId) {
   if (Array.isArray(input)) input = {inventory:input};
   if (!input || typeof input !== 'object') throw new Error('Expected a backup object.');
@@ -57,6 +80,7 @@ export function normalizeBackup(input, makeId) {
   result.settings = input.settings === undefined ? undefined : settingsInputSchema.parse(input.settings);
   return backupSchema.parse(result);
 }
+
 export function applyAction(state, action) {
   const next = structuredClone(state);
   if (action.type === 'import') {

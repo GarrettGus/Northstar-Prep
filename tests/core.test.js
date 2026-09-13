@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyAction, emptyState, normalizeBackup } from '../shared/schema.js';
+import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema } from '../shared/schema.js';
 import { token, validSession, validPassword, cookie, sameOrigin } from '../server/auth.js';
 import { createHandler } from '../api/hub.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
@@ -51,6 +51,22 @@ test('buy is atomic and idempotent; ID collisions never overwrite stock',()=>{
   state.inventory=bought.inventory;
   assert.throws(()=>applyAction(state,{type:'buy',id:item.id}));
 });
+test('settings action validates and applies configurable readiness assumptions',()=>{
+  const state=applyAction(emptyState(),{type:'settings',settings:{householdSize:6,caloriesPerPersonPerDay:2200}});
+  assert.equal(state.settings.householdSize,6);
+  assert.equal(state.settings.caloriesPerPersonPerDay,2200);
+  assert.equal(state.settings.waterGallonsPerPersonPerDay,1);
+  assert.throws(()=>applyAction(state,{type:'settings',settings:{householdSize:0}}));
+  assert.throws(()=>applyAction(state,{type:'settings',settings:{batteryUsableFraction:1.5}}));
+});
+test('legacy state without stored settings gets defaulted values, and backup import leaves settings untouched',()=>{
+  const legacy=stateSchema.parse({inventory:[],shoppingList:[],appliances:[],plan:null});
+  assert.deepEqual(legacy.settings,settingsSchema.parse({}));
+  const configured=applyAction(emptyState(),{type:'settings',settings:{householdSize:2}});
+  const backup=normalizeBackup({inventory:[item]},()=>'id');
+  const imported=applyAction(configured,{type:'import',backup});
+  assert.equal(imported.settings.householdSize,2);
+});
 test('session rejects tampering, expiry and password rotation',()=>{
   const now=Date.now();const value=token(now);
   const req={headers:{cookie:cookie(value)}};
@@ -79,7 +95,7 @@ test('API reapplies a mutation after a concurrent write without losing either it
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'add',collection:'inventory',id:'mine',item:{name:'My item'}}},res);
   assert.equal(res.code,200);assert.deepEqual(state.inventory.map(i=>i.id),['other','mine']);
 });
-import { waterGallons, isExpired } from '../shared/readiness.js';
+import { waterGallons, isExpired, computeReadiness } from '../shared/readiness.js';
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{
   assert.equal(waterGallons({quantity:3.785411784,unit:'liters'}),1);
   assert.equal(waterGallons({quantity:10,unit:'bottles'}),0);
@@ -89,4 +105,37 @@ test('expiration uses local calendar date and includes expiry day',()=>{
   const today=new Date(2026,8,12,19,30);
   assert.equal(isExpired('2026-09-12',today),false);
   assert.equal(isExpired('2026-09-11',today),true);
+});
+test('readiness needs scale with configurable household size and per-person rates',()=>{
+  const inventory=[{category:'Food',quantity:10,caloriesPerUnit:2000,name:'Rice'},{category:'Water',quantity:8,unit:'gal',name:'Water'}];
+  const solo=computeReadiness({inventory,appliances:[]},settingsSchema.parse({householdSize:1}));
+  const family=computeReadiness({inventory,appliances:[]},settingsSchema.parse({householdSize:4}));
+  assert.equal(solo.dailyCalorieNeed,2000);assert.equal(family.dailyCalorieNeed,8000);
+  assert.equal(solo.foodDays,10);assert.equal(family.foodDays,2.5);
+  assert.equal(solo.dailyWaterNeed,1);assert.equal(family.dailyWaterNeed,4);
+  assert.equal(solo.waterDays,8);assert.equal(family.waterDays,2);
+});
+test('readiness guards against divide-by-zero when per-person needs are zero',()=>{
+  const inventory=[{category:'Food',quantity:5,caloriesPerUnit:500,name:'Bar'}];
+  const stats=computeReadiness({inventory,appliances:[]},settingsSchema.parse({caloriesPerPersonPerDay:0,waterGallonsPerPersonPerDay:0}));
+  assert.equal(stats.dailyCalorieNeed,0);assert.equal(stats.foodDays,0);assert.equal(stats.waterDays,0);
+});
+test('stored power runtime accounts for battery usable capacity and inverter efficiency loss',()=>{
+  const inventory=[{category:'Power',quantity:1,capacityPerUnit:10,name:'Battery bank'}];
+  const appliances=[{watts:100,hours:24,active:true}];
+  const ideal=computeReadiness({inventory,appliances},settingsSchema.parse({batteryUsableFraction:1,inverterEfficiency:1}));
+  const lossy=computeReadiness({inventory,appliances},settingsSchema.parse({batteryUsableFraction:0.8,inverterEfficiency:0.9}));
+  assert.equal(ideal.totalPowerKwh,10);assert.equal(ideal.powerDays,10/2.4);
+  assert.equal(lossy.totalPowerKwh,10*0.8*0.9);
+  assert.ok(lossy.powerDays<ideal.powerDays);
+});
+test('fuel hours are grouped by fuel type for explainability',()=>{
+  const inventory=[
+    {category:'Fuel',quantity:2,hoursPerUnit:10,fuelType:'Propane',name:'Propane tank'},
+    {category:'Fuel',quantity:1,hoursPerUnit:6,fuelType:'Gasoline',name:'Gas can'},
+    {category:'Fuel',quantity:1,hoursPerUnit:4,name:'Mystery fuel'},
+  ];
+  const stats=computeReadiness({inventory,appliances:[]},settingsSchema.parse({}));
+  assert.equal(stats.totalFuelHours,30);
+  assert.deepEqual(stats.fuelByType,{Propane:20,Gasoline:6,Other:4});
 });

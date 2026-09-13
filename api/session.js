@@ -1,6 +1,8 @@
 import { configured, cookie, loginKey, sameOrigin, token, validPassword, validSession } from '../server/auth.js';
 import { rateLimit } from '../server/db.js';
+import { beginRequest, logFailure } from '../server/observability.js';
 export default async function handler(req,res) {
+  const request = beginRequest(req, res);
   res.setHeader('Cache-Control','no-store');
   if (req.method === 'GET') return res.status(200).json({authenticated:validSession(req), configured:configured()});
   if (!['POST','DELETE'].includes(req.method)) return res.status(405).json({error:'Method not allowed.'});
@@ -13,5 +15,5 @@ export default async function handler(req,res) {
     if (!validPassword(req.body.password)) return res.status(401).json({error:'Incorrect household password.'});
     res.setHeader('Set-Cookie',cookie(token()));
     return res.status(200).json({authenticated:true});
-  } catch { return res.status(503).json({error:'Login is unavailable. Check database setup.'}); }
+  } catch (error) { logFailure(request, '/api/session', 503, error); return res.status(503).json({error:'Login is unavailable. Check database setup.'}); }
 }

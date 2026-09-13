@@ -429,6 +429,7 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [formError, setFormError] = useState(null);
 
   const [form, setForm] = useState({
     name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: ''
@@ -438,10 +439,18 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
     setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '' });
     setEditingItem(null);
     setShowAdd(false);
+    setFormError(null);
   };
 
   const submit = async (e) => {
     e.preventDefault();
+    setFormError(null);
+    const normalizedName = String(form.name || '').trim().toLowerCase();
+    const duplicate = items.some(item => item.id !== editingItem?.id && item.category === form.category && String(item.name || '').trim().toLowerCase() === normalizedName);
+    if (duplicate) {
+      setFormError('An item with this name and category already exists. Edit the existing item or choose a different name.');
+      return;
+    }
     const payload = {
       ...form,
       quantity: Number(form.quantity),
@@ -589,6 +598,7 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
               )}
               {form.category === 'Power' && <div className="col-span-2"><Label>Capacity (kWh)</Label><Input val={form.capacityPerUnit} set={v => setForm({...form, capacityPerUnit: v})} type="number" placeholder="e.g. 1.5"/></div>}
             </div>
+            {formError && <p role="alert" className="text-xs font-bold text-red-600">{formError}</p>}
             <button type="submit" className="w-full bg-blue-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl active:bg-blue-700 transition-colors mt-2">
               {editingItem ? 'Save Changes' : 'Add to Hub'}
             </button>
@@ -914,6 +924,38 @@ function getCategoryIcon(cat) {
 }
 
 // --- Modals ---
+function useDialogFocus(dialogRef, onClose) {
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return undefined;
+    const previous = document.activeElement;
+    const focusableSelector = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const focusable = () => [...dialog.querySelectorAll(focusableSelector)];
+    (focusable()[0] || dialog).focus();
+    const handleKeyDown = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const elements = focusable();
+      if (!elements.length) return;
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    dialog.addEventListener('keydown', handleKeyDown);
+    return () => {
+      dialog.removeEventListener('keydown', handleKeyDown);
+      if (previous && typeof previous.focus === 'function') previous.focus();
+    };
+  }, [dialogRef]);
+}
+
 function SettingsForm({ settings, onSave }) {
   const [form, setForm] = useState({
     householdSize: settings.householdSize,
@@ -962,8 +1004,10 @@ function SettingsForm({ settings, onSave }) {
   );
 }
 function SyncModal({onClose,onImport,onLogout,settings,onUpdateSettings}) {
+  const dialogRef = useRef(null);
+  useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
-    <section role="dialog" aria-modal="true" aria-labelledby="settings-title" className="bg-white w-full max-w-sm rounded-3xl p-8 space-y-5 max-h-[85vh] overflow-y-auto">
+    <section ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="settings-title" className="bg-white w-full max-w-sm rounded-3xl p-8 space-y-5 max-h-[85vh] overflow-y-auto">
       <h2 id="settings-title" className="text-xl font-black">Household settings</h2>
       <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances and your family plan.</p>
       <label className="block text-sm font-bold">Import JSON backup<input type="file" accept=".json,application/json" onChange={onImport} className="block mt-2 w-full text-xs" /></label>
@@ -991,9 +1035,11 @@ function Login({configured,error,onLogin}) {
 }
 
 function AiModal({ content, onClose }) {
+  const dialogRef = useRef(null);
+  useDialogFocus(dialogRef, onClose);
   return (
     <div className="fixed inset-0 z-[110] bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-6 text-slate-900">
-      <div role="dialog" aria-modal="true" aria-labelledby="ai-modal-title" className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[80vh]">
+      <div ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title" className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[80vh]">
         <div className="flex justify-between items-center mb-6">
           <h3 id="ai-modal-title" className="text-xl font-black text-slate-900">{content.title}</h3>
           <button aria-label="Close AI result" onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-400"><X aria-hidden="true" size={16}/></button>

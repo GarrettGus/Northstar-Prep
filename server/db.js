@@ -6,7 +6,7 @@ export function database() {
   return neon(process.env.DATABASE_URL);
 }
 
-const householdId = 1;
+export const householdId = 1;
 
 // --- Household state, normalized across per-collection tables instead of one JSONB blob. ---
 // readState() joins the tables back into the shape the rest of the app already expects;

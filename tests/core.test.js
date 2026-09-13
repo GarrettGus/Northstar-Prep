@@ -127,6 +127,43 @@ test('API reapplies a mutation after a concurrent write without losing either it
   assert.equal(res.code,200);assert.deepEqual(state.inventory.map(i=>i.id),['other','mine']);
   assert.deepEqual(auditEntries,[{userId:'user-1',action:'add',collection:'inventory',itemId:'mine',itemName:'My item'}]);
 });
+test('add/update actions upload base64 images to object storage before saving; deleting or replacing an image cleans up the orphaned object',async()=>{
+  let state=emptyState(),version=0;
+  const stored=[],removed=[];
+  const repository={
+    async readState(){return {data:structuredClone(state),version};},
+    async compareAndSave(expected,next){if(expected!==version)return undefined;state=next;return ++version;},
+    async logAudit(){},
+  };
+  const imageStore={
+    async store(dataUrl,{householdId,itemId}){const url=`https://test.public.blob.vercel-storage.com/households/${householdId}/inventory/${itemId}/${stored.length}.png`;stored.push({dataUrl,url});return url;},
+    async remove(url){removed.push(url);},
+  };
+  const handler=createHandler(repository,()=>({userId:'user-1'}),imageStore),addRes=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'add',collection:'inventory',id:'lamp',item:{name:'Lamp',image:'data:image/png;base64,AAAA'}}},addRes);
+  assert.equal(addRes.code,200);assert.equal(state.inventory[0].image,stored[0].url);assert.equal(stored.length,1);
+
+  const updateRes=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'update',collection:'inventory',id:'lamp',item:{image:'data:image/png;base64,BBBB'}}},updateRes);
+  assert.equal(updateRes.code,200);assert.equal(state.inventory[0].image,stored[1].url);assert.deepEqual(removed,[stored[0].url]);
+
+  const deleteRes=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'delete',collection:'inventory',id:'lamp'}},deleteRes);
+  assert.equal(deleteRes.code,200);assert.deepEqual(removed,[stored[0].url,stored[1].url]);
+});
+test('image storage failures surface as 503 when unconfigured or 400 when invalid, without saving',async()=>{
+  let saved=false;
+  const repository={async readState(){return {data:emptyState(),version:0};},async compareAndSave(){saved=true;return 1;},async logAudit(){}};
+  const unconfigured=createHandler(repository,()=>({userId:'user-1'}),{async store(){const error=new Error('Object storage is not configured.');error.status=503;throw error;},async remove(){}});
+  const res1=response();
+  await unconfigured({method:'POST',headers:{'content-type':'application/json'},body:{type:'add',collection:'inventory',id:'x',item:{name:'X',image:'data:image/png;base64,AAAA'}}},res1);
+  assert.equal(res1.code,503);assert.equal(saved,false);
+
+  const invalid=createHandler(repository,()=>({userId:'user-1'}),{async store(){throw new Error('Image data does not match its declared file type.');},async remove(){}});
+  const res2=response();
+  await invalid({method:'POST',headers:{'content-type':'application/json'},body:{type:'add',collection:'inventory',id:'x',item:{name:'X',image:'data:image/png;base64,AAAA'}}},res2);
+  assert.equal(res2.code,400);assert.equal(saved,false);
+});
 test('session login verifies passwords, checks membership and rate-limits attempts',async()=>{
   const hash=hashPassword('super-secret-pw');
   const repository={

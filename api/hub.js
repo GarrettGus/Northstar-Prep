@@ -1,7 +1,8 @@
 import { validSession, sameOrigin } from '../server/auth.js';
-import { readState, compareAndSave, insertAuditLog } from '../server/db.js';
-import { applyAction, collectionKey } from '../shared/schema.js';
+import { readState, compareAndSave, insertAuditLog, householdId } from '../server/db.js';
+import { applyAction, collectionKey, idSchema } from '../shared/schema.js';
 import { beginRequest, logFailure } from '../server/observability.js';
+import { storeImage, deleteImage, isDataUrlImage, isManagedImageUrl } from '../server/imageStore.js';
 
 function summarizeAction(action, previousState) {
   const nameOf = (key, id) => previousState?.[key]?.find(row => row.id === id)?.name ?? null;
@@ -20,7 +21,48 @@ function summarizeAction(action, previousState) {
   }
 }
 
-export function createHandler(repository = {readState, compareAndSave, logAudit: insertAuditLog}, authenticate = validSession) {
+// Any base64 image data carried by an add/update/import action is uploaded to object storage
+// here, before it ever reaches applyAction/Postgres; only the resulting URL is persisted.
+function validItemId(id) {
+  if (!idSchema.safeParse(id).success) throw new Error('Invalid item ID.');
+  return id;
+}
+async function materializeRowImage(row, store) {
+  if (!row || typeof row !== 'object' || !isDataUrlImage(row.image)) return row;
+  return {...row, image: await store(row.image, {householdId, itemId: validItemId(row.id)})};
+}
+async function materializeActionImages(action, store) {
+  if ((action.type === 'add' || action.type === 'update') && action.item && isDataUrlImage(action.item.image)) {
+    return {...action, item: {...action.item, image: await store(action.item.image, {householdId, itemId: validItemId(action.id)})}};
+  }
+  if (action.type === 'import' && action.backup && typeof action.backup === 'object') {
+    const backup = {...action.backup};
+    for (const key of ['inventory', 'shoppingList']) {
+      if (!Array.isArray(backup[key])) continue;
+      backup[key] = await Promise.all(backup[key].map(row => materializeRowImage(row, store)));
+    }
+    return {...action, backup};
+  }
+  return action;
+}
+
+function managedImageUrls(state) {
+  const urls = new Set();
+  for (const row of [...state.inventory, ...state.shoppingList]) {
+    if (isManagedImageUrl(row.image, householdId)) urls.add(row.image);
+  }
+  return urls;
+}
+// Best-effort: deletes any object-storage image that no longer appears in the saved state
+// (item deleted, bulk-deleted, or its image replaced) so storage doesn't accumulate orphans.
+async function cleanupOrphanedImages(previousState, nextState, remove) {
+  const before = managedImageUrls(previousState);
+  const after = managedImageUrls(nextState);
+  const orphaned = [...before].filter(url => !after.has(url));
+  await Promise.allSettled(orphaned.map(url => remove(url, householdId)));
+}
+
+export function createHandler(repository = {readState, compareAndSave, logAudit: insertAuditLog}, authenticate = validSession, imageStore = {store: storeImage, remove: deleteImage}) {
   return async (req,res) => {
     const request = beginRequest(req, res);
     res.setHeader('Cache-Control','no-store');
@@ -31,15 +73,20 @@ export function createHandler(repository = {readState, compareAndSave, logAudit:
     try {
       if (req.method === 'GET') return res.status(200).json(await repository.readState());
       if (!req.body || typeof req.body !== 'object' || JSON.stringify(req.body).length > 3_000_000) return res.status(400).json({error:'Invalid or oversized request.'});
+      let action;
+      try { action = await materializeActionImages(req.body, imageStore.store); }
+      catch (error) { return res.status(error.status || 400).json({error: error.message || 'Invalid image.'}); }
       for (let attempt=0; attempt<4; attempt++) {
         const current = await repository.readState();
         let next;
-        try { next = applyAction(current.data,req.body); }
+        try { next = applyAction(current.data,action); }
         catch { return res.status(400).json({error:'Invalid data or item conflict. Check fields and refresh before retrying.'}); }
         const version = await repository.compareAndSave(current.version,next,current.data);
         if (version !== undefined) {
-          try { await repository.logAudit({userId: session.userId, action: req.body.type, ...summarizeAction(req.body, current.data)}); }
+          try { await repository.logAudit({userId: session.userId, action: action.type, ...summarizeAction(action, current.data)}); }
           catch (error) { console.error(JSON.stringify({event:'audit_log_failure', requestId:request.id, error: error instanceof Error ? error.name : 'UnknownError'})); }
+          try { await cleanupOrphanedImages(current.data, next, imageStore.remove); }
+          catch (error) { console.error(JSON.stringify({event:'image_cleanup_failure', requestId:request.id, error: error instanceof Error ? error.name : 'UnknownError'})); }
           return res.status(200).json({data:next,version});
         }
       }

@@ -53,7 +53,9 @@ export const itemSchema = z.object({
   category: z.enum(['Food', 'Water', 'Medical', 'Gear', 'Fuel', 'Power']).default('Gear'),
   caloriesPerUnit: number, hoursPerUnit: number, capacityPerUnit: number, price: number,
   gallonsPerUnit: number, target: number, store: text.default(''), emoji: z.string().max(30).default(''),
-  image: z.string().max(180000).regex(/^(?:|data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+)$/).default(''),
+  // Legacy/offline-queued rows may still carry a base64 data URL; the server converts those to
+  // an object storage URL (https://*.public.blob.vercel-storage.com/...) before persisting.
+  image: z.string().max(180000).regex(/^(?:|data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+|https:\/\/[a-z0-9-]+\.public\.blob\.vercel-storage\.com\/[A-Za-z0-9/_.-]+)$/).default(''),
   macroTag: z.enum(['', 'Carbs', 'Protein', 'Fat', 'Balanced']).default(''),
   fuelType: z.enum(fuelTypes).default(''),
   purchaseDate: date, expiryDate: date,

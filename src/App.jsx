@@ -33,7 +33,7 @@ const resizeBase64 = async (value) => `data:image/png;base64,${value}`;
 
 // --- Main App Component ---
 export default function App() {
-  const [user, setUser] = useState(false);
+  const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [configured, setConfigured] = useState(true);
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -72,7 +72,7 @@ export default function App() {
     return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
   }, []);
   useEffect(() => {
-    request('session').then(value => { setUser(value.authenticated); setConfigured(value.configured); })
+    request('session').then(value => { setUser(value.authenticated ? value.user : null); setConfigured(value.configured); })
       .catch(error=>setGlobalError(error.message)).finally(()=>setAuthReady(true));
   }, []);
   useEffect(() => {
@@ -88,7 +88,7 @@ export default function App() {
           const cached = loadCachedState();
           if (cached) { accept(cached, false); setLastSyncedAt(cached.savedAt ?? null); setGlobalError('Offline mode: showing the last saved copy. Changes will sync when you reconnect.'); }
           else setGlobalError('Offline and no saved copy is available. Download a backup after reconnecting.');
-        } else if (!cancelled) { setGlobalError(error.message); if(error.status===401) setUser(false); }
+        } else if (!cancelled) { setGlobalError(error.message); if(error.status===401) setUser(null); }
       }
       finally {running=false;if(!cancelled) setLoading(false);}
     };
@@ -133,12 +133,12 @@ export default function App() {
     try { const result=await request('hub',action); if(started===epoch.current){accept(result);setPendingSync(loadQueuedActions().length);setGlobalError(null);} return true; }
     catch(error) {
       if(started===epoch.current && !error.status) return queueOffline(action);
-      if(started===epoch.current){setGlobalError(error.message);if(error.status===401)setUser(false);} return false;
+      if(started===epoch.current){setGlobalError(error.message);if(error.status===401)setUser(null);} return false;
     }
     finally {busy.current=false;setIsSyncing(false);}
   };
   const logout = async () => {
-    try {await request('session',{},'DELETE');epoch.current++;setUser(false);setInventory([]);setShoppingList([]);setAppliances([]);setPlan(null);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    try {await request('session',{},'DELETE');epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setPlan(null);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
@@ -215,8 +215,17 @@ export default function App() {
   const handleBulkDelete = (collection, ids) => mutate({type:'bulk_delete',collection,ids});
   const handleBuyItem = item => mutate({type:'buy',id:item.id});
 
+  const handleAuthenticated = (profile) => {
+    epoch.current++;revision.current=-1;setLoading(true);setUser(profile);setGlobalError(null);
+    window.history.replaceState(null,'',window.location.pathname);
+  };
+
   if (!authReady) return <LoadingScreen />;
-  if (!user) return <Login configured={configured} error={globalError} onLogin={() => {epoch.current++;revision.current=-1;setLoading(true);setUser(true);setGlobalError(null);}} />;
+  if (!user) {
+    const inviteToken = new URLSearchParams(window.location.search).get('invite');
+    if (inviteToken) return <AcceptInvite token={inviteToken} onJoined={handleAuthenticated} />;
+    return <Login configured={configured} error={globalError} onLogin={handleAuthenticated} />;
+  }
   if (loading && !inventory.length && !globalError) return <LoadingScreen />;
 
   return (
@@ -274,7 +283,7 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} />}
+      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} />}
       {aiContent && <AiModal content={aiContent} onClose={() => setAiContent(null)} />}
     </div>
   );
@@ -1013,7 +1022,106 @@ function SettingsForm({ settings, onSave }) {
     </form>
   );
 }
-function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onLogout,settings,onUpdateSettings}) {
+function MembersPanel({ currentUserId }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [inviteForm, setInviteForm] = useState({ email: '', role: 'member' });
+  const [inviteLink, setInviteLink] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = () => request('members').then(setData).catch(err => setError(err.message));
+  useEffect(() => { load(); }, []);
+
+  const invite = async e => {
+    e.preventDefault(); setError(null); setBusy(true);
+    try {
+      const result = await request('members', { type: 'invite', email: inviteForm.email, role: inviteForm.role });
+      setInviteLink(`${window.location.origin}${window.location.pathname}?invite=${result.token}`);
+      setInviteForm({ email: '', role: 'member' });
+      await load();
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  };
+  const remove = async userId => {
+    if (!confirm('Remove this member? They will lose access immediately.')) return;
+    setError(null);
+    try { await request('members', { type: 'remove', userId }); await load(); } catch (err) { setError(err.message); }
+  };
+  const revoke = async invitationId => {
+    setError(null);
+    try { await request('members', { type: 'revoke', invitationId }); await load(); } catch (err) { setError(err.message); }
+  };
+  const copyLink = () => { if (inviteLink) navigator.clipboard?.writeText(inviteLink).catch(() => {}); };
+
+  if (!data) return <p className="text-xs text-slate-500">Loading household members…</p>;
+  return (
+    <div className="space-y-3 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Household members</h3>
+      {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}
+      <ul className="space-y-2">
+        {data.members.map(m => (
+          <li key={m.user_id} className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2 text-sm">
+            <span className="truncate">{m.email} <span className="text-[10px] font-black uppercase text-slate-500">{m.role}</span></span>
+            {data.role === 'owner' && m.user_id !== currentUserId && (
+              <button onClick={() => remove(m.user_id)} className="text-red-600 text-[10px] font-black uppercase ml-2 shrink-0">Remove</button>
+            )}
+          </li>
+        ))}
+      </ul>
+      {data.role === 'owner' && (
+        <>
+          <form onSubmit={invite} className="space-y-2">
+            <div className="grid grid-cols-[1fr_auto] gap-2">
+              <Input val={inviteForm.email} set={v => setInviteForm({...inviteForm, email: v})} type="email" placeholder="Invite by email" />
+              <Select val={inviteForm.role} set={v => setInviteForm({...inviteForm, role: v})} opts={['member', 'owner']} />
+            </div>
+            <button type="submit" disabled={busy || !inviteForm.email} className="w-full rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">Create invite link</button>
+          </form>
+          {inviteLink && (
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 space-y-2 text-xs">
+              <p className="font-black text-emerald-900">Send this link to the person you invited:</p>
+              <input readOnly value={inviteLink} onFocus={e => e.target.select()} className="w-full bg-white rounded-lg p-2 text-[10px] font-mono border border-emerald-200" />
+              <button type="button" onClick={copyLink} className="rounded-lg bg-emerald-600 text-white px-3 py-1.5 font-black">Copy link</button>
+            </div>
+          )}
+          {data.invitations.length > 0 && (
+            <div className="space-y-1">
+              <p className="text-[10px] font-black uppercase text-slate-500">Pending invitations</p>
+              {data.invitations.map(inv => (
+                <div key={inv.id} className="flex items-center justify-between bg-amber-50 rounded-xl px-3 py-2 text-xs">
+                  <span>{inv.email} · {inv.role}</span>
+                  <button onClick={() => revoke(inv.id)} className="text-red-600 font-black uppercase text-[10px]">Revoke</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ActivityPanel() {
+  const [entries, setEntries] = useState(null);
+  useEffect(() => { request('audit').then(r => setEntries(r.entries)).catch(() => setEntries([])); }, []);
+  if (!entries) return null;
+  return (
+    <div className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Recent activity</h3>
+      {entries.length === 0 ? <p className="text-xs text-slate-500">No activity recorded yet.</p> : (
+        <ul className="space-y-1 max-h-40 overflow-y-auto text-xs text-slate-600">
+          {entries.map((e, i) => (
+            <li key={i}>
+              <span className="font-bold text-slate-800">{e.actor_email || 'Someone'}</span> {e.action}
+              {e.item_name ? ` "${e.item_name}"` : ''} · <span className="text-slate-400">{new Date(e.created_at).toLocaleString()}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onLogout,settings,onUpdateSettings,currentUserId}) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
@@ -1028,25 +1136,67 @@ function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImpor
         <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">Merge backup</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
       </div>}
       <SettingsForm settings={settings} onSave={onUpdateSettings} />
+      <MembersPanel currentUserId={currentUserId} />
+      <ActivityPanel />
       <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>
       <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>
     </section>
   </div>;
 }
 function Login({configured,error,onLogin}) {
+  const [email,setEmail]=useState('');
   const [password,setPassword]=useState('');
   const [message,setMessage]=useState(null);
   const [pending,setPending]=useState(false);
-  const submit=async event=>{event.preventDefault();setPending(true);setMessage(null);try{await request('session',{password});setPassword('');onLogin();}catch(error){setMessage(error.message);}finally{setPending(false);}};
+  const submit=async event=>{event.preventDefault();setPending(true);setMessage(null);try{const result=await request('session',{email,password});setPassword('');onLogin(result.user);}catch(error){setMessage(error.message);}finally{setPending(false);}};
   return <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
     <form onSubmit={submit} className="w-full max-w-sm space-y-6">
       <Shield className="text-blue-400" size={40}/><h1 className="text-3xl font-black">NorthStar Prep</h1>
       <p className="text-slate-300">Sign in to your household supplies and emergency plan.</p>
       {!configured && <p role="alert" className="text-amber-200">Setup required: connect the database and configure household login in Vercel.</p>}
       {(message||error) && <p role="alert" className="text-red-300">{message||error}</p>}
-      <label className="block">Household password<input autoComplete="current-password" type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+      <label className="block">Email<input autoComplete="username" type="email" required value={email} onChange={e=>setEmail(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+      <label className="block">Password<input autoComplete="current-password" type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
       <button disabled={pending||!configured} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{pending?'Signing in…':'Sign in'}</button>
+      <p className="text-xs text-slate-400">Household members join by invitation from an existing owner. Ask them for an invite link if you don't have an account yet.</p>
     </form>
+  </main>;
+}
+
+function AcceptInvite({token,onJoined}) {
+  const [status,setStatus]=useState('checking');
+  const [invitation,setInvitation]=useState(null);
+  const [email,setEmail]=useState('');
+  const [password,setPassword]=useState('');
+  const [message,setMessage]=useState(null);
+  const [pending,setPending]=useState(false);
+  useEffect(() => {
+    request(`invite?token=${encodeURIComponent(token)}`).then(result => {
+      if (!result.valid) { setStatus('invalid'); return; }
+      setInvitation(result); setEmail(result.email); setStatus('ready');
+    }).catch(() => setStatus('invalid'));
+  }, [token]);
+  const submit = async event => {
+    event.preventDefault(); setPending(true); setMessage(null);
+    try { const result = await request('invite', {token, email, password}); onJoined(result.user); }
+    catch (error) { setMessage(error.message); }
+    finally { setPending(false); }
+  };
+  return <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
+    <div className="w-full max-w-sm space-y-6">
+      <Shield className="text-blue-400" size={40}/><h1 className="text-3xl font-black">NorthStar Prep</h1>
+      {status === 'checking' && <p className="text-slate-300">Checking your invitation…</p>}
+      {status === 'invalid' && <p role="alert" className="text-red-300">This invitation link is invalid, expired or already used. Ask the household owner for a new one.</p>}
+      {status === 'ready' && (
+        <form onSubmit={submit} className="space-y-6">
+          <p className="text-slate-300">You've been invited to join as a household {invitation.role}. Set a password to create your account.</p>
+          {message && <p role="alert" className="text-red-300">{message}</p>}
+          <label className="block">Email<input autoComplete="username" type="email" required value={email} onChange={e=>setEmail(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+          <label className="block">Choose a password<input autoComplete="new-password" type="password" required minLength={8} value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+          <button disabled={pending} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{pending?'Joining…':'Join household'}</button>
+        </form>
+      )}
+    </div>
   </main>;
 }
 

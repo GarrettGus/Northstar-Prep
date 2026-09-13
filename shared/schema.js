@@ -6,6 +6,10 @@ export const idSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,150}$/);
 const date = z.union([z.literal(''), z.iso.date()]).default('');
 export const fuelTypes = ['', 'Propane', 'Gasoline', 'Diesel', 'Wood', 'Kerosene', 'Battery', 'Other'];
 
+export const emailSchema = z.preprocess(value => typeof value === 'string' ? value.trim().toLowerCase() : value, z.email().max(254));
+export const passwordSchema = z.string().min(8).max(200);
+export const roleSchema = z.enum(['owner', 'member']);
+
 const fraction = z.coerce.number().finite().min(0).max(1);
 const settingsFields = {
   householdSize: z.coerce.number().int().min(1).max(50),

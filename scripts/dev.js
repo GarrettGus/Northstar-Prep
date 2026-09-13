@@ -3,11 +3,14 @@ import { createServer as createViteServer } from 'vite';
 import session from '../api/session.js';
 import hub from '../api/hub.js';
 import health from '../api/health.js';
+import members from '../api/members.js';
+import invite from '../api/invite.js';
+import audit from '../api/audit.js';
 const vite = await createViteServer({server:{middlewareMode:true},appType:'spa'});
 createServer(async(req,res)=>{
   const path = new URL(req.url,'http://localhost').pathname;
   if (!path.startsWith('/api/')) return vite.middlewares(req,res);
-  const handler = {'/api/session':session,'/api/hub':hub,'/api/health':health}[path];
+  const handler = {'/api/session':session,'/api/hub':hub,'/api/health':health,'/api/members':members,'/api/invite':invite,'/api/audit':audit}[path];
   res.status = code => {res.statusCode=code;return res;};
   res.json = data => {res.setHeader('Content-Type','application/json');res.end(JSON.stringify(data));};
   if (!handler) return res.status(404).json({error:'Not found.'});

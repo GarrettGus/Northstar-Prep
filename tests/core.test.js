@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema } from '../shared/schema.js';
-import { token, validSession, validPassword, cookie, sameOrigin } from '../server/auth.js';
+import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema } from '../shared/schema.js';
+import { token, validSession, hashPassword, verifyPassword, hashToken, randomToken, cookie, sameOrigin } from '../server/auth.js';
 import { createHandler } from '../api/hub.js';
+import { createHandler as createSessionHandler } from '../api/session.js';
+import { createHandler as createMembersHandler } from '../api/members.js';
+import { createHandler as createInviteHandler } from '../api/invite.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
-process.env.HOUSEHOLD_PASSWORD='test-only-household-password';
+process.env.DATABASE_URL='postgres://test-only/db';
 const item={id:'rice',name:'Rice',quantity:2,category:'Food'};
 test('legacy backups get IDs, restore plans and reject invalid data',()=>{
   const backup=normalizeBackup({inventory:[{name:'Rice'}],plan:{shelterSpot:'Basement'}},()=> 'generated');
@@ -67,14 +70,36 @@ test('legacy state without stored settings gets defaulted values, and backup imp
   const imported=applyAction(configured,{type:'import',backup});
   assert.equal(imported.settings.householdSize,2);
 });
-test('session rejects tampering, expiry and password rotation',()=>{
-  const now=Date.now();const value=token(now);
+test('email, password and role schemas validate and normalize input',()=>{
+  assert.equal(emailSchema.parse('  Foo@Example.com '),'foo@example.com');
+  assert.throws(()=>emailSchema.parse('not-an-email'));
+  assert.equal(passwordSchema.parse('longenoughpw'),'longenoughpw');
+  assert.throws(()=>passwordSchema.parse('short'));
+  assert.equal(roleSchema.parse('owner'),'owner');
+  assert.throws(()=>roleSchema.parse('admin'));
+});
+test('password hashing verifies correct passwords and rejects wrong ones or malformed hashes',()=>{
+  const hash=hashPassword('correct horse battery staple');
+  assert.equal(verifyPassword('correct horse battery staple',hash),true);
+  assert.equal(verifyPassword('wrong password',hash),false);
+  assert.equal(verifyPassword('anything','not-a-real-hash'),false);
+});
+test('invitation tokens are opaque, single-use secrets that hash deterministically',()=>{
+  const t=randomToken();
+  assert.ok(t.length>20);
+  assert.equal(hashToken(t),hashToken(t));
+  assert.notEqual(hashToken(t),hashToken(randomToken()));
+});
+test('sessions carry the signed-in user, reject tampering/expiry, and rotating SESSION_SECRET invalidates them',()=>{
+  const now=Date.now();const value=token('user-1',now);
   const req={headers:{cookie:cookie(value)}};
-  assert.equal(validSession(req,now),true);
+  assert.deepEqual(validSession(req,now),{userId:'user-1'});
   assert.equal(validSession(req,now+8*86400000),false);
   assert.equal(validSession({headers:{cookie:cookie(value+'x')}},now),false);
-  assert.equal(validPassword('wrong'),false);
-  process.env.HOUSEHOLD_PASSWORD+='-rotated';assert.equal(validSession(req,now),false);
+  const previousSecret=process.env.SESSION_SECRET;
+  process.env.SESSION_SECRET='a-different-secret-that-is-also-long-enough';
+  assert.equal(validSession(req,now),false);
+  process.env.SESSION_SECRET=previousSecret;
 });
 test('mutations reject cross-site origins and non-JSON forms',()=>{
   assert.equal(sameOrigin({headers:{host:'example.com',origin:'https://evil.com','content-type':'application/json'}}),false);
@@ -86,15 +111,138 @@ test('API refuses unauthenticated reads',async()=>{
   await handler({method:'GET',headers:{}},res);assert.equal(res.code,401);assert.equal(called,false);
   assert.match(res.headers['x-request-id'],/^[0-9a-f-]{36}$/);
 });
-test('API reapplies a mutation after a concurrent write without losing either item',async()=>{
+test('API reapplies a mutation after a concurrent write without losing either item, and records who made it',async()=>{
   let state=emptyState(),version=0,conflict=true;
-  const repository={async readState(){return {data:structuredClone(state),version};},async compareAndSave(expected,next){
-    if(conflict){conflict=false;state=applyAction(state,{type:'add',collection:'inventory',id:'other',item:{name:'Other device item'}});version++;return undefined;}
-    assert.equal(expected,version);state=next;return ++version;
-  }};
-  const handler=createHandler(repository,()=>true),res=response();
+  const auditEntries=[];
+  const repository={
+    async readState(){return {data:structuredClone(state),version};},
+    async compareAndSave(expected,next){
+      if(conflict){conflict=false;state=applyAction(state,{type:'add',collection:'inventory',id:'other',item:{name:'Other device item'}});version++;return undefined;}
+      assert.equal(expected,version);state=next;return ++version;
+    },
+    async logAudit(entry){auditEntries.push(entry);},
+  };
+  const handler=createHandler(repository,()=>({userId:'user-1'})),res=response();
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'add',collection:'inventory',id:'mine',item:{name:'My item'}}},res);
   assert.equal(res.code,200);assert.deepEqual(state.inventory.map(i=>i.id),['other','mine']);
+  assert.deepEqual(auditEntries,[{userId:'user-1',action:'add',collection:'inventory',itemId:'mine',itemName:'My item'}]);
+});
+test('session login verifies passwords, checks membership and rate-limits attempts',async()=>{
+  const hash=hashPassword('super-secret-pw');
+  const repository={
+    async rateLimit(){return true;},
+    async findUserByEmail(email){return email==='owner@example.com' ? {id:'user-1',email,password_hash:hash} : undefined;},
+    async getMembership(userId){return userId==='user-1' ? {role:'owner'} : undefined;},
+  };
+  const success=response();
+  await createSessionHandler(repository)({method:'POST',headers:{'content-type':'application/json'},body:{email:'owner@example.com',password:'super-secret-pw'}},success);
+  assert.equal(success.code,200);assert.equal(success.data.user.role,'owner');assert.match(success.headers['Set-Cookie'],/northstar=/);
+
+  const wrong=response();
+  await createSessionHandler(repository)({method:'POST',headers:{'content-type':'application/json'},body:{email:'owner@example.com',password:'nope'}},wrong);
+  assert.equal(wrong.code,401);
+
+  const unknown=response();
+  await createSessionHandler(repository)({method:'POST',headers:{'content-type':'application/json'},body:{email:'nobody@example.com',password:'whatever1'}},unknown);
+  assert.equal(unknown.code,401);
+
+  const noMembership=response();
+  await createSessionHandler({...repository,async getMembership(){return undefined;}})({method:'POST',headers:{'content-type':'application/json'},body:{email:'owner@example.com',password:'super-secret-pw'}},noMembership);
+  assert.equal(noMembership.code,403);
+
+  const limited=response();
+  await createSessionHandler({...repository,async rateLimit(){return false;}})({method:'POST',headers:{'content-type':'application/json'},body:{email:'owner@example.com',password:'super-secret-pw'}},limited);
+  assert.equal(limited.code,429);
+});
+test('GET session reports the authenticated profile or logged-out state',async()=>{
+  const repository={async getMembership(userId){return userId==='user-1' ? {role:'member'} : undefined;}};
+  const handler=createSessionHandler(repository);
+  const authed=response();
+  await handler({method:'GET',headers:{cookie:cookie(token('user-1'))}},authed);
+  assert.deepEqual(authed.data,{authenticated:true,configured:true,user:{id:'user-1',role:'member'}});
+  const loggedOut=response();
+  await handler({method:'GET',headers:{}},loggedOut);
+  assert.equal(loggedOut.data.authenticated,false);
+});
+test('members API: owners can invite, list and revoke; members cannot manage membership; self-removal is blocked',async()=>{
+  const invitations=[];
+  const repository={
+    async getMembership(userId){return {'owner-1':{role:'owner'},'member-1':{role:'member'}}[userId];},
+    async listMembers(){return [{user_id:'owner-1',email:'owner@example.com',role:'owner',added_at:'now'}];},
+    async listPendingInvitations(){return invitations;},
+    async createInvitation(entry){invitations.push({id:'inv-1',email:entry.email,role:entry.role,created_at:'now',expires_at:entry.expiresAt});},
+    async revokeInvitation(id){const before=invitations.length;const kept=invitations.filter(i=>i.id!==id);invitations.length=0;invitations.push(...kept);return kept.length<before;},
+  };
+  const asOwner=createMembersHandler(repository,()=>({userId:'owner-1'}));
+  const asMember=createMembersHandler(repository,()=>({userId:'member-1'}));
+
+  const list=response();
+  await asOwner({method:'GET',headers:{}},list);
+  assert.equal(list.data.role,'owner');
+
+  const invited=response();
+  await asOwner({method:'POST',headers:{'content-type':'application/json'},body:{type:'invite',email:'new@example.com',role:'member'}},invited);
+  assert.equal(invited.code,200);assert.equal(invitations.length,1);
+
+  const denied=response();
+  await asMember({method:'POST',headers:{'content-type':'application/json'},body:{type:'invite',email:'x@example.com',role:'member'}},denied);
+  assert.equal(denied.code,403);
+
+  const selfRemove=response();
+  await asOwner({method:'POST',headers:{'content-type':'application/json'},body:{type:'remove',userId:'owner-1'}},selfRemove);
+  assert.equal(selfRemove.code,400);
+
+  const revoked=response();
+  await asOwner({method:'POST',headers:{'content-type':'application/json'},body:{type:'revoke',invitationId:'inv-1'}},revoked);
+  assert.equal(revoked.code,200);assert.equal(invitations.length,0);
+});
+test('members API surfaces a 400 when the repository blocks a removal, e.g. the last owner',async()=>{
+  const repository={
+    async getMembership(userId){return userId==='owner-1' ? {role:'owner'} : undefined;},
+    async removeMember(){return false;},
+  };
+  const res=response();
+  await createMembersHandler(repository,()=>({userId:'owner-1'}))({method:'POST',headers:{'content-type':'application/json'},body:{type:'remove',userId:'member-2'}},res);
+  assert.equal(res.code,400);
+});
+test('invite API validates tokens, enforces the invited email, and rejects accounts that already exist',async()=>{
+  const future=new Date(Date.now()+86400000).toISOString();
+  const past=new Date(Date.now()-86400000).toISOString();
+  const repository={
+    async findInvitationByTokenHash(hash){
+      if(hash===hashToken('good-token')) return {id:'inv-1',household_id:1,email:'invitee@example.com',role:'member',expires_at:future,accepted_at:null};
+      if(hash===hashToken('expired-token')) return {id:'inv-2',household_id:1,email:'invitee@example.com',role:'member',expires_at:past,accepted_at:null};
+      if(hash===hashToken('taken-token')) return {id:'inv-3',household_id:1,email:'taken@example.com',role:'member',expires_at:future,accepted_at:null};
+      return undefined;
+    },
+    async findUserByEmail(email){return email==='taken@example.com' ? {id:'existing'} : undefined;},
+    async acceptInvitation(){return 'new-user-id';},
+  };
+  const handler=createInviteHandler(repository);
+
+  const validCheck=response();
+  await handler({method:'GET',url:'/api/invite?token=good-token',headers:{}},validCheck);
+  assert.deepEqual(validCheck.data,{valid:true,email:'invitee@example.com',role:'member'});
+
+  const invalidCheck=response();
+  await handler({method:'GET',url:'/api/invite?token=nope',headers:{}},invalidCheck);
+  assert.equal(invalidCheck.data.valid,false);
+
+  const expiredCheck=response();
+  await handler({method:'GET',url:'/api/invite?token=expired-token',headers:{}},expiredCheck);
+  assert.equal(expiredCheck.data.valid,false);
+
+  const wrongEmail=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',email:'someoneelse@example.com',password:'longenoughpw'}},wrongEmail);
+  assert.equal(wrongEmail.code,400);
+
+  const alreadyExists=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'taken-token',email:'taken@example.com',password:'longenoughpw'}},alreadyExists);
+  assert.equal(alreadyExists.code,409);
+
+  const success=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',email:'invitee@example.com',password:'longenoughpw'}},success);
+  assert.equal(success.code,200);assert.equal(success.data.user.id,'new-user-id');assert.match(success.headers['Set-Cookie'],/northstar=/);
 });
 import { waterGallons, isExpired, computeReadiness } from '../shared/readiness.js';
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{

@@ -4,9 +4,9 @@ A household preparedness tracker built with React, Vite and Tailwind, backed by 
 
 ## Architecture
 
-The browser calls same-origin `/api/session` and `/api/hub` endpoints. Only server code connects to Postgres. A shared household passphrase creates a signed, HttpOnly, SameSite=Strict session cookie (Secure in production). All household data requires a valid session. Sessions last seven days; rotating either secret invalidates existing sessions. Login attempts are rate-limited in Postgres.
+The browser calls same-origin `/api/session`, `/api/hub`, `/api/members` and `/api/invite` endpoints. Only server code connects to Postgres. Individual accounts (email plus a scrypt-hashed password) sign in to create a signed, HttpOnly, SameSite=Strict session cookie (Secure in production) that carries just the user's ID; every request re-checks that user's household membership and role directly from Postgres rather than trusting a role baked into the cookie. Sessions last seven days; rotating `SESSION_SECRET` invalidates all of them. Login attempts are rate-limited in Postgres.
 
-This is a **single-household application**. Anyone with the household password can read and modify that household. There is no anonymous access, client database SDK, or public hub-ID access. Do not use this shared-login design for unrelated households.
+This is a **single-household application** with individual accounts inside it. An owner invites others from **Household settings**, which generates a one-time shareable link (there is no outbound email — send the link yourself); members can be promoted to owner at invite time or removed later, and every add, edit, delete, purchase, import, plan and settings change is recorded with who made it. There is no anonymous access, client database SDK, or public hub-ID access. Do not use this shared-household design for unrelated households.
 
 Database updates use compare-and-swap revisions and bounded retries. Shopping purchases move the current stored record atomically; backups merge by ID. Devices refresh every 15 seconds and on window focus.
 
@@ -15,12 +15,16 @@ Database updates use compare-and-swap revisions and bounded retries. Shopping pu
 1. Create a Neon Postgres database through Vercel's marketplace, using its free plan if suitable. Connect it to this Vercel project. Accept any marketplace terms in your own account.
 2. Set server-only environment variables:
    - `DATABASE_URL`: Neon connection string.
-   - `HOUSEHOLD_PASSWORD`: a random password of at least 20 characters, shared only with household members.
-   - `SESSION_SECRET`: an independent random value of at least 32 characters.
+   - `SESSION_SECRET`: a random value of at least 32 characters.
+   - `HOUSEHOLD_OWNER_EMAIL` and `HOUSEHOLD_PASSWORD`: used **once**, by the migration script, to create the first owner account (a random password of at least 20 characters). They're safe to leave set afterward — the migration only creates an account while none exist yet.
 3. Copy `.env.example` to `.env.local` for local development, or pull the project's development variables using Vercel CLI. Never commit credentials. No `VITE_` variables are needed. Use `DATABASE_URL_UNPOOLED` for migrations when Neon provides it; the app uses pooled `DATABASE_URL` for request traffic.
-4. Run `npm ci` and `npm run db:migrate`. The migration creates the tables and an empty household without overwriting existing records.
-5. Run `npm run dev` for the frontend and API at `http://127.0.0.1:5173`. Check `GET /api/health` for a database health signal.
+4. Run `npm ci` and `npm run db:migrate`. The migration creates the tables (household state, accounts, membership, invitations, audit history) without overwriting existing records, and creates the first owner account from `HOUSEHOLD_OWNER_EMAIL`/`HOUSEHOLD_PASSWORD` the first time it runs with no accounts yet.
+5. Run `npm run dev` for the frontend and API at `http://127.0.0.1:5173`. Check `GET /api/health` for a database health signal. Sign in with the owner email and password from step 4, then invite other household members from **Household settings**.
 6. Run `npm test` and `npm run build`. Pull requests also run both checks through `.github/workflows/ci.yml`.
+
+### Migrating from the shared household password
+
+Earlier versions of this app used one `HOUSEHOLD_PASSWORD` shared by everyone. To move to individual accounts: set `HOUSEHOLD_OWNER_EMAIL` alongside the existing `HOUSEHOLD_PASSWORD`, redeploy, then re-run `npm run db:migrate` against production. That creates the first owner account from those two values — sign in with that email and the same password. The shared password stops working for login from that point on (existing household data is untouched); invite everyone else individually afterward.
 
 ## Deploy
 

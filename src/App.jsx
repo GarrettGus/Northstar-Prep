@@ -48,6 +48,7 @@ export default function App() {
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [globalError, setGlobalError] = useState(null);
   const [settings, setSettings] = useState(() => settingsSchema.parse({}));
+  const [pendingImport, setPendingImport] = useState(null);
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
   const [online, setOnline] = useState(() => typeof navigator === 'undefined' ? true : navigator.onLine);
   const [pendingSync, setPendingSync] = useState(() => loadQueuedActions().length);
@@ -137,7 +138,7 @@ export default function App() {
     finally {busy.current=false;setIsSyncing(false);}
   };
   const logout = async () => {
-    try {await request('session',{},'DELETE');epoch.current++;setUser(false);setInventory([]);setShoppingList([]);setAppliances([]);setPlan(null);setSettings(settingsSchema.parse({}));revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    try {await request('session',{},'DELETE');epoch.current++;setUser(false);setInventory([]);setShoppingList([]);setAppliances([]);setPlan(null);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
@@ -151,8 +152,17 @@ export default function App() {
     try {
       if(file.size>2_000_000)throw new Error('Backup must be smaller than 2 MB.');
       const backup=normalizeBackup(JSON.parse(await file.text()),()=>crypto.randomUUID());
-      if(await mutate({type:'import',backup})) {setShowSyncModal(false);alert('Backup imported. Existing records were merged by ID.');}
+      setPendingImport(backup);
+      setGlobalError(null);
     } catch(error){setGlobalError(`Import failed: ${error.message}`);}
+  };
+  const confirmImport = async () => {
+    if (!pendingImport) return false;
+    if (!await mutate({type:'import',backup:pendingImport})) return false;
+    setPendingImport(null);
+    setShowSyncModal(false);
+    alert('Backup imported. Existing records were merged by ID.');
+    return true;
   };
 
   // --- Logic Helpers ---
@@ -264,7 +274,7 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => setShowSyncModal(false)} onImport={handleFileUpload} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} />}
+      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} />}
       {aiContent && <AiModal content={aiContent} onClose={() => setAiContent(null)} />}
     </div>
   );
@@ -1003,7 +1013,7 @@ function SettingsForm({ settings, onSave }) {
     </form>
   );
 }
-function SyncModal({onClose,onImport,onLogout,settings,onUpdateSettings}) {
+function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onLogout,settings,onUpdateSettings}) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
@@ -1011,6 +1021,12 @@ function SyncModal({onClose,onImport,onLogout,settings,onUpdateSettings}) {
       <h2 id="settings-title" className="text-xl font-black">Household settings</h2>
       <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances and your family plan.</p>
       <label className="block text-sm font-bold">Import JSON backup<input type="file" accept=".json,application/json" onChange={onImport} className="block mt-2 w-full text-xs" /></label>
+      {pendingImport && <div role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-2 text-sm">
+        <p className="font-black text-amber-900">Backup ready to review</p>
+        <p className="text-amber-800">{pendingImport.inventory.length} inventory items, {pendingImport.shoppingList.length} shopping items, {pendingImport.appliances.length} appliances and {pendingImport.plan ? 'a family plan' : 'no family plan'} will be merged by ID.</p>
+        {pendingImport.settings && <p className="text-amber-800">Readiness assumptions are included.</p>}
+        <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">Merge backup</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
+      </div>}
       <SettingsForm settings={settings} onSave={onUpdateSettings} />
       <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>
       <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>

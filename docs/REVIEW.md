@@ -16,6 +16,7 @@
 - Added configurable readiness assumptions and settings backup support.
 - Added inventory search/status filters, multi-select and atomic bulk deletion.
 - Added accessible names, progress semantics, save/sync/offline indicators and a database health endpoint.
+- Audited text and icon-only control colors against WCAG AA contrast (4.5:1 for text, 3:1 for non-text UI components) and darkened the failing pairs (muted labels, delete/status text, macro tags, toggle states); added a regression test that pins the audited pairs' contrast ratios.
 - Added Node 22 pinning and pull-request CI for tests and production builds.
 - Readiness assumptions (household size, calories/water per person, survival/heat/power goals, battery usable capacity and inverter efficiency) are configurable per household, persisted with the state, and shown as plain-language assumptions on the dashboard. Fuel items can be tagged by fuel type, and heat hours are broken down per type.
 
@@ -32,7 +33,7 @@
 - Offline edits are cached in browser storage and limited to 100 queued actions; clearing site data loses unsynced edits. Keep a downloaded backup for outages.
 - Power estimates account for battery usable capacity and inverter efficiency, but not surge loads or individualized nutrition models.
 - Offline edits are cached in browser storage and limited to 100 queued actions; clearing site data loses unsynced edits. Keep a downloaded backup for outages.
-- Modal focus trapping and some icon-button accessibility need refinement. Family member/contact editing is limited to backup import; shelter editing is supported.
+- Accessibility regression coverage is limited to a static contrast-ratio test; no automated browser-based accessibility scan runs in CI yet. Family member/contact editing is limited to backup import; shelter editing is supported.
 - Login-limit rows should be periodically purged after expiration for long-lived deployments. They store hashed IP identifiers, not raw IP addresses.
 - Stock count changes are not an audit ledger. Conflicting edits to the same field follow successful server processing order.
 

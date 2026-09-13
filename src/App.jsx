@@ -301,7 +301,7 @@ function Dashboard({ stats, settings, onGeneratePlan, onAnalyzeGaps, isAiLoading
             <ProgressBar label={`Heat (${settings.heatGoalHours}h)`} percent={progressPercent(stats.totalFuelHours, settings.heatGoalHours)} color="bg-amber-500" />
             <ProgressBar label={`Power (Goal: ${settings.powerGoalKwh} kWh)`} percent={progressPercent(stats.totalPowerKwh, settings.powerGoalKwh)} color="bg-violet-500" />
           </div>
-          <p className="mt-5 text-[10px] leading-relaxed text-slate-500">
+          <p className="mt-5 text-[10px] leading-relaxed text-slate-400">
             Assumes {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} needing {settings.caloriesPerPersonPerDay.toLocaleString()} kcal
             and {settings.waterGallonsPerPersonPerDay} gal water per person/day ({stats.dailyCalorieNeed.toLocaleString()} kcal
             and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household). Stored power counts {Math.round(settings.batteryUsableFraction * 100)}%
@@ -356,16 +356,16 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
 
       <div className="bg-violet-50 border border-violet-100 rounded-[2.5rem] p-6 shadow-sm flex flex-col items-center text-center">
          <div className="p-3 bg-violet-100 text-violet-600 rounded-full mb-2"><Zap size={24}/></div>
-         <div className="text-3xl font-black text-slate-900">{stats.dailyLoadKwh.toFixed(2)} <span className="text-base font-bold text-slate-400">kWh/day</span></div>
-         <div className="text-xs font-bold text-violet-400 uppercase tracking-widest mb-4">Active Daily Demand</div>
+         <div className="text-3xl font-black text-slate-900">{stats.dailyLoadKwh.toFixed(2)} <span className="text-base font-bold text-slate-600">kWh/day</span></div>
+         <div className="text-xs font-bold text-violet-600 uppercase tracking-widest mb-4">Active Daily Demand</div>
 
          <div className="w-full bg-white p-4 rounded-2xl border border-violet-100 flex justify-between items-center">
             <div className="text-left">
-               <div className="text-[10px] font-black uppercase text-slate-400">Stored Power</div>
+               <div className="text-[10px] font-black uppercase text-slate-600">Stored Power</div>
                <div className="text-lg font-black text-slate-800">{stats.totalPowerKwh.toFixed(1)} kWh</div>
             </div>
             <div className="text-right">
-               <div className="text-[10px] font-black uppercase text-slate-400">Est. Runtime</div>
+               <div className="text-[10px] font-black uppercase text-slate-600">Est. Runtime</div>
                <div className="text-lg font-black text-emerald-600">{stats.powerDays.toFixed(1)} Days</div>
             </div>
          </div>
@@ -384,7 +384,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
           <form onSubmit={submit} className="bg-white border-2 border-violet-100 rounded-[2.5rem] p-7 shadow-2xl space-y-4">
              <div className="flex justify-between items-center mb-2">
                 <h3 className="text-xs font-black uppercase text-violet-600 tracking-widest">{editingId ? 'Edit Device' : 'New Appliance'}</h3>
-                {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-500 flex items-center gap-1 text-[10px] font-black uppercase"><Trash2 size={12}/> Delete</button>}
+                {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 flex items-center gap-1 text-[10px] font-black uppercase"><Trash2 size={12}/> Delete</button>}
              </div>
              <div className="grid grid-cols-2 gap-4">
                 <div className="col-span-2"><Label>Device Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Fridge" /></div>
@@ -399,30 +399,30 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
       )}
 
       <div className="mt-4 space-y-3 px-1">
-        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] px-1">Devices (Tap Power to Toggle)</h3>
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-[0.2em] px-1">Devices (Tap Power to Toggle)</h3>
         {appliances.map(app => (
           <div key={app.id} className={`border p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm transition-all ${app.active !== false ? 'bg-white border-slate-200' : 'bg-slate-50 border-slate-100 opacity-60'}`}>
              <div className="flex items-center gap-4">
                 <button aria-label={`Turn ${app.name} ${app.active !== false ? 'off' : 'on'}`} title={`Turn ${app.name} ${app.active !== false ? 'off' : 'on'}`}
                   onClick={(e) => { e.stopPropagation(); onUpdate(app.id, { active: app.active === false ? true : false }); }}
-                  className={`p-3.5 rounded-2xl transition-all active:scale-90 shadow-sm ${app.active !== false ? 'bg-violet-500 text-white shadow-violet-200' : 'bg-slate-200 text-slate-400'}`}
+                  className={`p-3.5 rounded-2xl transition-all active:scale-90 shadow-sm ${app.active !== false ? 'bg-violet-500 text-white shadow-violet-200' : 'bg-slate-200 text-slate-500'}`}
                 >
                   <Power size={20} />
                 </button>
                 <div onClick={() => handleEdit(app)} className="cursor-pointer">
                    <h4 className="font-black text-slate-800 leading-tight">{app.name}</h4>
-                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">
+                   <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
                     {app.watts}W • {app.hours} hrs/day • {((app.watts * app.hours)/1000).toFixed(2)} kWh
                    </p>
                 </div>
              </div>
-             <button aria-label={`Edit ${app.name}`} onClick={() => handleEdit(app)} className="text-slate-200 hover:text-violet-400 transition-colors p-2">
+             <button aria-label={`Edit ${app.name}`} onClick={() => handleEdit(app)} className="text-slate-500 hover:text-violet-600 transition-colors p-2">
                <ChevronRight size={18} />
              </button>
           </div>
         ))}
         {appliances.length === 0 && !showAdd && (
-           <div className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">No appliances tracked</div>
+           <div className="text-center py-10 text-slate-600 text-xs font-bold uppercase tracking-widest">No appliances tracked</div>
         )}
       </div>
     </div>
@@ -538,7 +538,7 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
       <div className="flex justify-between items-center px-1">
         <h2 className="text-xl font-black text-slate-800">{title}</h2>
         <div className="flex gap-2">
-          <button aria-label="Sort by expiry date" title="Sort by expiry date" onClick={() => setSortBy(prev => prev === 'expiry' ? '' : 'expiry')} className={`p-2 rounded-full ${sortBy === 'expiry' ? 'bg-orange-100 text-orange-600' : 'bg-slate-100 text-slate-400'}`}>
+          <button aria-label="Sort by expiry date" title="Sort by expiry date" onClick={() => setSortBy(prev => prev === 'expiry' ? '' : 'expiry')} className={`p-2 rounded-full ${sortBy === 'expiry' ? 'bg-orange-100 text-orange-600' : 'bg-slate-100 text-slate-500'}`}>
             <Calendar aria-hidden="true" size={18}/>
           </button>
           <button aria-label={showAdd ? 'Cancel adding item' : 'Add item'} onClick={() => showAdd ? reset() : setShowAdd(true)} className="bg-slate-900 text-white px-5 py-2.5 rounded-2xl flex items-center gap-2 text-sm font-black active:scale-95 transition-all shadow-lg">
@@ -553,7 +553,7 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
           <option value="all">All</option><option value="low">Low stock</option><option value="expiring">Expiring</option><option value="expired">Expired</option>
         </select>
       </div>
-      {selectedIds.size > 0 && <div className="flex items-center justify-between gap-3 bg-blue-50 border border-blue-100 rounded-2xl px-4 py-3 text-sm"><span className="font-bold text-blue-800">{selectedIds.size} selected</span><button aria-label="Delete selected items" onClick={async () => { if (await onBulkDelete([...selectedIds])) setSelectedIds(new Set()); }} className="text-red-600 font-black">Delete selected</button></div>}
+      {selectedIds.size > 0 && <div className="flex items-center justify-between gap-3 bg-blue-50 border border-blue-100 rounded-2xl px-4 py-3 text-sm"><span className="font-bold text-blue-800">{selectedIds.size} selected</span><button aria-label="Delete selected items" onClick={async () => { if (await onBulkDelete([...selectedIds])) setSelectedIds(new Set()); }} className="text-red-700 font-black">Delete selected</button></div>}
 
       {showAdd && (
         <div className="space-y-4 mb-6 animate-in slide-in-from-top-4 duration-300">
@@ -568,7 +568,7 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
           <form onSubmit={submit} className="bg-white border-2 border-blue-100 rounded-[2.5rem] p-6 shadow-2xl space-y-4">
             <div className="flex justify-between mb-2">
               <h3 className="text-xs font-black uppercase text-blue-600">{editingItem ? 'Edit Item' : 'New Supply'}</h3>
-              {editingItem && <button type="button" onClick={async () => { if (await onDelete(editingItem.id)) reset(); }} className="text-red-500 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
+              {editingItem && <button type="button" onClick={async () => { if (await onDelete(editingItem.id)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
             </div>
 
             <div className="flex justify-center mb-4">
@@ -644,7 +644,7 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
       {isShoppingMode && (
          <div className="bg-emerald-50 border border-emerald-100 rounded-[2.5rem] p-5 shadow-sm flex items-center justify-between mb-6">
            <div>
-              <div className="text-[10px] font-black uppercase text-emerald-600 tracking-widest">Estimated Cost</div>
+              <div className="text-[10px] font-black uppercase text-emerald-700 tracking-widest">Estimated Cost</div>
               <div className="text-2xl font-black text-slate-800">${totalShopCost.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</div>
            </div>
            <div className="p-3 bg-emerald-100 text-emerald-600 rounded-full"><ShoppingCart size={24}/></div>
@@ -656,7 +656,7 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
            Object.entries(groupedItems).map(([groupName, groupItems]) => (
              <div key={groupName} className="mb-6">
                <div className="flex justify-between items-center mb-3 pl-2 pr-2">
-                 <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-2">
+                 <h4 className="text-[10px] font-black text-slate-600 uppercase tracking-widest flex items-center gap-2">
                    {isShoppingMode ? <Store size={12} /> : (getCategoryIcon(groupName)?.icon || <Layers size={12} />)}
                    {groupName}
                  </h4>
@@ -666,8 +666,8 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
                    </span>
                  )}
                  <div className="flex gap-2">
-                   <button onClick={() => setSortBy('expiry')} className={`text-[8px] font-bold px-2 py-0.5 rounded-md ${sortBy === 'expiry' ? 'bg-orange-100 text-orange-600' : 'text-slate-300'}`}>Exp</button>
-                   <button onClick={() => setSortBy('calories')} className={`text-[8px] font-bold px-2 py-0.5 rounded-md ${sortBy === 'calories' ? 'bg-emerald-100 text-emerald-600' : 'text-slate-300'}`}>Cal</button>
+                   <button onClick={() => setSortBy('expiry')} className={`text-[8px] font-bold px-2 py-0.5 rounded-md ${sortBy === 'expiry' ? 'bg-orange-100 text-orange-800' : 'text-slate-600'}`}>Exp</button>
+                   <button onClick={() => setSortBy('calories')} className={`text-[8px] font-bold px-2 py-0.5 rounded-md ${sortBy === 'calories' ? 'bg-emerald-100 text-emerald-700' : 'text-slate-600'}`}>Cal</button>
                  </div>
                </div>
                <div className="space-y-3">
@@ -676,7 +676,7 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
              </div>
            ))
         ) : (
-           <div className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">{items.length ? 'No matching items' : 'List Empty'}</div>
+           <div className="text-center py-10 text-slate-600 text-xs font-bold uppercase tracking-widest">{items.length ? 'No matching items' : 'List Empty'}</div>
         )}
       </div>
     </div>
@@ -703,13 +703,13 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
       </button>
 
       <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
-        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-6">Household Tracking</h3>
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-6">Household Tracking</h3>
         <div className="space-y-5">
           {plan?.family?.map((m, i) => (
             <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-4 last:border-0 last:pb-0">
                <div className="flex items-center gap-4">
                   <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-3xl flex items-center justify-center font-black text-xl">{m.name[0]}</div>
-                  <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-400 font-bold uppercase">{m.role} • {m.dob}</div></div>
+                  <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-600 font-bold uppercase">{m.role} • {m.dob}</div></div>
                </div>
                {m.role === 'Child' && <div className="bg-indigo-50 text-indigo-700 text-[9px] font-black uppercase px-3 py-1 rounded-full">Priority</div>}
             </div>
@@ -717,7 +717,7 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
         </div>
       </section>
       <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
-        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Storm Point</h3>
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Storm Point</h3>
         {isEditing ? (
           <textarea className="w-full bg-slate-50 border-2 rounded-2xl p-5 text-sm font-bold min-h-[100px] outline-none" value={spot} onChange={e => setSpot(e.target.value)} />
         ) : (
@@ -727,7 +727,7 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
 
       {/* Survival Sync Links Moved Here */}
       <div className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm mt-6">
-        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Survival Sync</h3>
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Survival Sync</h3>
         <div className="grid gap-3">
           {[
             { title: "MnDOT 511 Roads", url: "https://511mn.org", icon: <Navigation size={20}/>, color: "bg-blue-50 text-blue-600" },
@@ -738,7 +738,7 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
               <div className={`p-3 rounded-xl ${link.color}`}>{link.icon}</div>
               <div className="flex-1">
                 <div className="font-black text-sm text-slate-800">{link.title}</div>
-                <div className="text-[9px] text-slate-400 font-mono uppercase">{link.url.replace('https://', '')}</div>
+                <div className="text-[9px] text-slate-600 font-mono uppercase">{link.url.replace('https://', '')}</div>
               </div>
               <ChevronRight size={16} className="text-slate-300 group-hover:text-blue-500"/>
             </a>
@@ -750,7 +750,7 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
 }
 
 // --- Helper Components ---
-const Label = ({ children }) => <label className="text-[10px] font-black uppercase text-slate-400 mb-1 block">{children}</label>;
+const Label = ({ children }) => <label className="text-[10px] font-black uppercase text-slate-600 mb-1 block">{children}</label>;
 const Input = ({ val, set, type="text", placeholder }) => <input type={type} min={type === "number" ? 0 : undefined} step={type === "number" ? "any" : undefined} className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none focus:bg-white focus:border-blue-400 border border-transparent transition-all" value={val ?? ""} onChange={e => set(e.target.value)} placeholder={placeholder} />;
 const Select = ({ val, set, opts }) => <select className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none border border-transparent" value={val ?? ""} onChange={e => set(e.target.value)}>{opts.map(o => <option key={o} value={o}>{o}</option>)}</select>;
 
@@ -763,7 +763,7 @@ function SummaryCard({ icon, color, label, value, unit, pct }) {
          <div className={`p-1.5 rounded-lg ${bg} ${text}`}>{icon}</div>
          <span className="text-[10px] font-black uppercase tracking-widest text-slate-800">{label}</span>
       </div>
-      <div className="text-xl font-black text-slate-800 leading-none">{value.toFixed(1)} <span className="text-[9px] font-bold text-slate-300 ml-0.5 uppercase tracking-tighter">{unit}</span></div>
+      <div className="text-xl font-black text-slate-800 leading-none">{value.toFixed(1)} <span className="text-[9px] font-bold text-slate-600 ml-0.5 uppercase tracking-tighter">{unit}</span></div>
       <div className="mt-3 h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
          <div className={`h-full transition-all duration-700 ${bar}`} style={{ width: `${Math.min(pct, 100)}%` }} />
       </div>
@@ -778,10 +778,10 @@ function InventoryItem({ item, onClick, onBuy, selected, onSelect }) {
 
   const getTagColor = (tag) => {
     switch(tag) {
-      case 'Carbs': return 'bg-orange-100 text-orange-600';
-      case 'Protein': return 'bg-rose-100 text-rose-600';
-      case 'Fat': return 'bg-yellow-100 text-yellow-600';
-      case 'Balanced': return 'bg-emerald-100 text-emerald-600';
+      case 'Carbs': return 'bg-orange-100 text-orange-800';
+      case 'Protein': return 'bg-rose-100 text-rose-700';
+      case 'Fat': return 'bg-yellow-100 text-yellow-800';
+      case 'Balanced': return 'bg-emerald-100 text-emerald-700';
       default: return 'bg-slate-100 text-slate-600';
     }
   };
@@ -810,8 +810,8 @@ function InventoryItem({ item, onClick, onBuy, selected, onSelect }) {
                )}
              </div>
              <div className="flex gap-2 mt-1">
-               {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-600 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
-               <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">
+               {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
+               <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
                 {item.quantity} {item.unit}
                </p>
              </div>
@@ -826,7 +826,7 @@ function InventoryItem({ item, onClick, onBuy, selected, onSelect }) {
          {onBuy && (
            <button aria-label={`Move ${item.name} to inventory`}
              onClick={(e) => { e.stopPropagation(); onBuy(item); }}
-             className="p-2 bg-slate-100 text-slate-400 hover:bg-emerald-100 hover:text-emerald-600 rounded-full transition-colors"
+             className="p-2 bg-slate-100 text-slate-500 hover:bg-emerald-100 hover:text-emerald-600 rounded-full transition-colors"
              title="Buy & Move to Inventory"
            >
              <CheckCircle size={20} />
@@ -844,7 +844,7 @@ function StatusCard({ icon, color, value, label }) {
     <div className="bg-white border border-slate-200 p-6 rounded-[2.5rem] shadow-sm text-center flex flex-col items-center">
       <div className={`p-3 rounded-full mb-3 ${colors[color]}`}>{icon}</div>
       <div className="text-3xl font-black text-slate-900">{value}</div>
-      <div className="text-[10px] font-black uppercase text-slate-400 tracking-widest">{label}</div>
+      <div className="text-[10px] font-black uppercase text-slate-600 tracking-widest">{label}</div>
     </div>
   );
 }
@@ -903,8 +903,8 @@ function Header({ hubId, isSyncing, online, pendingSync, lastSyncedAt, onSyncCli
 
 function NavButton({ active, onClick, icon, label }) {
   return (
-    <button aria-current={active ? 'page' : undefined} aria-label={label} onClick={onClick} className={`flex flex-col items-center gap-1.5 p-3 min-w-0 flex-1 transition-all rounded-3xl ${active ? 'text-blue-600 bg-blue-50' : 'text-slate-400 hover:bg-slate-50'}`}>
-      <div className={`${active ? 'scale-110' : 'scale-100'} transition-transform text-slate-400 ${active ? 'text-blue-600' : ''}`}>{icon}</div>
+    <button aria-current={active ? 'page' : undefined} aria-label={label} onClick={onClick} className={`flex flex-col items-center gap-1.5 p-3 min-w-0 flex-1 transition-all rounded-3xl ${active ? 'text-blue-600 bg-blue-50' : 'text-slate-600 hover:bg-slate-50'}`}>
+      <div className={`${active ? 'scale-110' : 'scale-100'} transition-transform text-slate-600 ${active ? 'text-blue-600' : ''}`}>{icon}</div>
       <span className="text-[9px] font-black uppercase tracking-widest">{label}</span>
     </button>
   );
@@ -995,7 +995,7 @@ function SettingsForm({ settings, onSave }) {
 
   return (
     <form onSubmit={submit} className="space-y-3 border-t border-slate-100 pt-5">
-      <h3 className="text-xs font-black uppercase text-slate-400 tracking-widest">Readiness assumptions</h3>
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Readiness assumptions</h3>
       <div className="grid grid-cols-2 gap-3">
         <div><Label>Household size</Label><Input val={form.householdSize} set={v => setForm({...form, householdSize: v})} type="number" /></div>
         <div><Label>Goal (days)</Label><Input val={form.survivalGoalDays} set={v => setForm({...form, survivalGoalDays: v})} type="number" /></div>
@@ -1058,7 +1058,7 @@ function AiModal({ content, onClose }) {
       <div ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title" className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[80vh]">
         <div className="flex justify-between items-center mb-6">
           <h3 id="ai-modal-title" className="text-xl font-black text-slate-900">{content.title}</h3>
-          <button aria-label="Close AI result" onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-400"><X aria-hidden="true" size={16}/></button>
+          <button aria-label="Close AI result" onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-500"><X aria-hidden="true" size={16}/></button>
         </div>
         <div className="overflow-y-auto text-sm text-slate-600 leading-relaxed whitespace-pre-wrap flex-1">{content.text}</div>
         <button onClick={onClose} className="mt-6 w-full bg-slate-900 text-white py-4 rounded-2xl font-black">Close</button>

@@ -139,6 +139,25 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_settings (
 await sql`CREATE INDEX IF NOT EXISTS northstar_inventory_household_category_idx ON northstar_inventory (household_id, category)`;
 await sql`CREATE INDEX IF NOT EXISTS northstar_shopping_items_household_category_idx ON northstar_shopping_items (household_id, category)`;
 
+// --- Encrypted, scheduled household backups (see api/backup.js and server/backupCrypto.js). ---
+await sql`CREATE TABLE IF NOT EXISTS northstar_backups (
+  id bigserial PRIMARY KEY,
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  status text NOT NULL CHECK (status IN ('success','failed')),
+  error text,
+  checksum text,
+  size_bytes integer,
+  inventory_count integer,
+  shopping_count integer,
+  appliance_count integer,
+  has_plan boolean,
+  iv bytea,
+  auth_tag bytea,
+  ciphertext bytea
+)`;
+await sql`CREATE INDEX IF NOT EXISTS northstar_backups_household_idx ON northstar_backups (household_id, created_at DESC)`;
+
 // One-time backfill: copy the existing JSONB row into the new relational tables. Only runs while
 // the relational tables are still empty, so it's safe to leave in place and re-run this script.
 const [{count: inventoryRows}] = await sql`SELECT count(*)::int AS count FROM northstar_inventory`;

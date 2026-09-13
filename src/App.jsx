@@ -164,6 +164,13 @@ export default function App() {
     alert('Backup imported. Existing records were merged by ID.');
     return true;
   };
+  const restoreFromBackup = async (id) => {
+    try {
+      const result = await request('backup', {type:'restore', id});
+      setPendingImport(result.backup);
+      setGlobalError(null);
+    } catch (error) { setGlobalError(`Restore failed: ${error.message}`); }
+  };
 
   // --- Logic Helpers ---
   const stats = useMemo(() => computeReadiness({ inventory, appliances }, settings), [inventory, appliances, settings]);
@@ -283,7 +290,7 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} />}
+      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} />}
       {aiContent && <AiModal content={aiContent} onClose={() => setAiContent(null)} />}
     </div>
   );
@@ -1121,7 +1128,7 @@ function ActivityPanel() {
   );
 }
 
-function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onLogout,settings,onUpdateSettings,currentUserId}) {
+function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId}) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
@@ -1136,12 +1143,52 @@ function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImpor
         <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">Merge backup</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
       </div>}
       <SettingsForm settings={settings} onSave={onUpdateSettings} />
+      <BackupsPanel onRestore={onRestoreBackup} />
       <MembersPanel currentUserId={currentUserId} />
       <ActivityPanel />
       <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>
       <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>
     </section>
   </div>;
+}
+
+function BackupsPanel({ onRestore }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  useEffect(() => { request('backup').then(setData).catch(err => setError(err.message)); }, []);
+
+  return (
+    <div className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Automatic backups</h3>
+      {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}
+      {!data && !error && <p className="text-xs text-slate-500">Loading backup history…</p>}
+      {data && !data.configured && <p className="text-xs text-amber-700">Scheduled encrypted backups are not configured for this deployment yet.</p>}
+      {data && data.configured && (
+        data.backups.some(b => b.status === 'success')
+          ? (() => { const latest = data.backups.find(b => b.status === 'success'); return (
+              <p className="text-xs text-slate-600">Last successful backup: {new Date(latest.created_at).toLocaleString()} ({latest.inventory_count} supplies, {latest.shopping_count} shopping, {latest.appliance_count} appliances).</p>
+            ); })()
+          : <p className="text-xs text-slate-600">No successful automatic backup yet.</p>
+      )}
+      {data && data.backups.length > 0 && (
+        <ul className="space-y-1 max-h-40 overflow-y-auto text-xs">
+          {data.backups.map(b => (
+            <li key={b.id} className="flex items-center justify-between gap-2 bg-slate-50 rounded-xl px-3 py-2">
+              <span className={b.status === 'failed' ? 'text-red-700' : 'text-slate-700'}>
+                {new Date(b.created_at).toLocaleString()} · {b.status}{b.status === 'failed' && b.error ? `: ${b.error}` : ''}
+              </span>
+              {b.status === 'success' && (
+                <button type="button" disabled={busyId === b.id} onClick={async () => { setBusyId(b.id); try { await onRestore(b.id); } finally { setBusyId(null); } }} className="text-blue-700 font-black uppercase text-[10px] shrink-0 disabled:opacity-50">
+                  {busyId === b.id ? 'Loading…' : 'Preview restore'}
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 function Login({configured,error,onLogin}) {
   const [email,setEmail]=useState('');

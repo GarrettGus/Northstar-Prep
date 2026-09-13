@@ -17,6 +17,8 @@ Database updates use compare-and-swap revisions and bounded retries. Shopping pu
    - `DATABASE_URL`: Neon connection string.
    - `SESSION_SECRET`: a random value of at least 32 characters.
    - `HOUSEHOLD_OWNER_EMAIL` and `HOUSEHOLD_PASSWORD`: used **once**, by the migration script, to create the first owner account (a random password of at least 20 characters). They're safe to leave set afterward — the migration only creates an account while none exist yet.
+   - `BACKUP_ENCRYPTION_KEY`: 32 random bytes, base64-encoded (`openssl rand -base64 32`), used to encrypt scheduled backups at rest. Automatic backups fail closed without it.
+   - `CRON_SECRET`: a random secret (`openssl rand -hex 32`) that authorizes Vercel's Cron Jobs to trigger `/api/backup`; Vercel adds it as an `Authorization: Bearer` header automatically once both the env var and the `crons` entry in `vercel.json` are set.
 3. Copy `.env.example` to `.env.local` for local development, or pull the project's development variables using Vercel CLI. Never commit credentials. No `VITE_` variables are needed. Use `DATABASE_URL_UNPOOLED` for migrations when Neon provides it; the app uses pooled `DATABASE_URL` for request traffic.
 4. Run `npm ci` and `npm run db:migrate`. The migration creates the tables (household state, accounts, membership, invitations, audit history) without overwriting existing records, and creates the first owner account from `HOUSEHOLD_OWNER_EMAIL`/`HOUSEHOLD_PASSWORD` the first time it runs with no accounts yet.
 5. Run `npm run dev` for the frontend and API at `http://127.0.0.1:5173`. Check `GET /api/health` for a database health signal. Sign in with the owner email and password from step 4, then invite other household members from **Household settings**.
@@ -38,6 +40,8 @@ Use the Vite preset, `npm run build`, output directory `dist`, and Node 22 or ne
 ## Backups and migration
 
 Export JSON from the old app and import it in **Household settings** after signing in. Supplies, shopping, appliances and the plan are retained. Existing records merge by ID. Legacy records without IDs get new ones; repeated imports of such legacy files can duplicate those records. Imports never delete records absent from the backup, and an absent/null plan preserves the current plan. File limit: 2 MB; collection limits: 2,000 supplies, 2,000 shopping items, 200 appliances.
+
+In addition to manual export/import, `/api/backup` is called on a schedule (see `vercel.json`'s `crons` entry, daily by default — Vercel's Hobby plan allows one run per day within an hour of the scheduled time) to encrypt the current household state (AES-256-GCM, key from `BACKUP_ENCRYPTION_KEY`) and store it in Postgres, pruning older backups beyond the most recent 30. **Household settings** shows the last successful backup's time and item counts, plus recent history including failures. Restoring an automatic backup decrypts and validates it server-side (rejecting anything corrupted, tampered with, or that fails schema validation) before showing the same non-destructive preview used for file imports — nothing is applied until you confirm the merge.
 
 No data is retrieved automatically from the previous provider. Its cloud database is not altered or deleted. Keep the original backup until you have verified the import. The app caches the latest authenticated state locally and queues up to 100 edits while offline; queued writes sync after reconnecting and remain subject to server conflict checks.
 

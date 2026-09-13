@@ -4,7 +4,7 @@
 
 - Removed the previous cloud database/auth SDK, injected configuration, public hub paths and security-rules file.
 - Added Neon Postgres with a Vercel API boundary; credentials never enter the browser bundle.
-- Added shared household login, signed seven-day sessions, secure production cookies, database-backed login attempt limits, JSON/origin checks and fail-closed configuration handling.
+- Added household login, signed seven-day sessions, secure production cookies, database-backed login attempt limits, JSON/origin checks and fail-closed configuration handling.
 - Added server-side schemas for inventory, appliances and plans; malformed backups and unsafe image URLs are rejected.
 - Atomic state updates use revision checks and bounded conflict retries. Shopping purchases are idempotent and cannot partially add/delete or overwrite an inventory ID collision.
 - Restore includes the family plan and retains backup record IDs; merges preserve unrelated existing records.
@@ -19,14 +19,15 @@
 - Audited text and icon-only control colors against WCAG AA contrast (4.5:1 for text, 3:1 for non-text UI components) and darkened the failing pairs (muted labels, delete/status text, macro tags, toggle states); added a regression test that pins the audited pairs' contrast ratios.
 - Added Node 22 pinning and pull-request CI for tests and production builds.
 - Readiness assumptions (household size, calories/water per person, survival/heat/power goals, battery usable capacity and inverter efficiency) are configurable per household, persisted with the state, and shown as plain-language assumptions on the dashboard. Fuel items can be tagged by fuel type, and heat hours are broken down per type.
+- Replaced the single shared household password with individual accounts: email + scrypt-hashed password, a household membership table with owner/member roles, shareable one-time invite links (no outbound email needed), owner-only member removal (blocked for the last remaining owner), and an audit log recording who added, edited, deleted, bought, imported, or changed the plan/settings for every mutation. Session cookies now carry only a user ID; role and membership are re-checked from Postgres on every request. A one-time migration step (`HOUSEHOLD_OWNER_EMAIL` + the existing `HOUSEHOLD_PASSWORD`) creates the first owner account from an existing deployment.
 
 ## Verification
 
-`npm test` covers import validation/merge, atomic purchases, collision protection, cookie tampering/expiration/password rotation, cross-origin rejection, unauthenticated API denial, conflict retries, water conversions, local expiration dates and configurable readiness math (household size scaling, zero-need divide-by-zero guards, battery/inverter loss, fuel-type grouping, and legacy state defaulting). `npm run build` compiles the production frontend. Live database and deployment results are reported in the task, not implied by unit tests.
+`npm test` covers import validation/merge, atomic purchases, collision protection, cookie tampering/expiration/session-secret rotation, cross-origin rejection, unauthenticated API denial, conflict retries, water conversions, local expiration dates, configurable readiness math (household size scaling, zero-need divide-by-zero guards, battery/inverter loss, fuel-type grouping, and legacy state defaulting), password hashing, invitation token validity/expiry/email-matching, owner/member permission enforcement (including last-owner and self-removal protection), and audit log recording. `npm run build` compiles the production frontend. Live database and deployment results are reported in the task, not implied by unit tests.
 
 ## Remaining limitations
 
-- Single shared household password; no individual roles, invites or user audit trail. Use a strong generated password and rotate it when access should be revoked.
+- No account recovery flow (password reset) yet; a locked-out owner needs direct database access to reset a password hash. No email verification on invite acceptance beyond matching the invited address.
 - No automatic migration from the old database. Import a JSON export and verify counts and household details.
 - AI remains explicitly unavailable.
 - Simplified calorie/power assumptions; no inverter loss, battery derating, surge or individualized nutrition model.
@@ -35,7 +36,7 @@
 - Offline edits are cached in browser storage and limited to 100 queued actions; clearing site data loses unsynced edits. Keep a downloaded backup for outages.
 - Accessibility regression coverage is limited to a static contrast-ratio test; no automated browser-based accessibility scan runs in CI yet. Family member/contact editing is limited to backup import; shelter editing is supported.
 - Login-limit rows should be periodically purged after expiration for long-lived deployments. They store hashed IP identifiers, not raw IP addresses.
-- Stock count changes are not an audit ledger. Conflicting edits to the same field follow successful server processing order.
+- Every mutation is recorded in the audit log, but conflicting edits to the same field still follow successful server processing order rather than a field-level merge.
 
 ## Official references
 

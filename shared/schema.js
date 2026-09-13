@@ -3,6 +3,25 @@ const text = z.string().max(500);
 const number = z.coerce.number().finite().nonnegative().max(1e9).default(0);
 export const idSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,150}$/);
 const date = z.union([z.literal(''), z.iso.date()]).default('');
+const settingsFields = {
+  householdSize: z.coerce.number().int().min(1).max(50),
+  caloriesPerPersonDay: z.coerce.number().finite().min(500).max(10000),
+  waterPerPersonDay: z.coerce.number().finite().positive().max(20),
+  survivalGoalDays: z.coerce.number().finite().positive().max(365),
+  heatGoalHours: z.coerce.number().finite().nonnegative().max(8760),
+  powerGoalKwh: z.coerce.number().finite().nonnegative().max(100000),
+  powerRuntimeGoalDays: z.coerce.number().finite().positive().max(365),
+};
+export const settingsSchema = z.object({
+  householdSize: z.coerce.number().int().min(1).max(50).default(4),
+  caloriesPerPersonDay: z.coerce.number().finite().min(500).max(10000).default(2000),
+  waterPerPersonDay: z.coerce.number().finite().positive().max(20).default(1),
+  survivalGoalDays: z.coerce.number().finite().positive().max(365).default(14),
+  heatGoalHours: z.coerce.number().finite().nonnegative().max(8760).default(36),
+  powerGoalKwh: z.coerce.number().finite().nonnegative().max(100000).default(20),
+  powerRuntimeGoalDays: z.coerce.number().finite().positive().max(365).default(2),
+});
+export const settingsInputSchema = z.object(settingsFields).partial();
 export const itemSchema = z.object({
   id: idSchema, name: z.string().trim().min(1).max(200), quantity: number,
   unit: z.string().max(80).default('units'),
@@ -20,8 +39,9 @@ export const planSchema = z.object({
   contacts: z.array(z.object({name: text, phone: z.string().max(80), type: text.default('')})).max(50).default([]),
   meetingPoints: z.object({primary: text.default(''), secondary: text.default('')}).default({primary:'',secondary:''}),
 });
-export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable() });
-export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], plan:null});
+export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable(), settings: settingsSchema.default({}) });
+export const backupSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable().default(null), settings: settingsInputSchema.optional() });
+export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], plan:null, settings:settingsSchema.parse({})});
 export const collectionKey = {inventory:'inventory', shopping_list:'shoppingList', appliances:'appliances'};
 export function normalizeBackup(input, makeId) {
   if (Array.isArray(input)) input = {inventory:input};
@@ -34,19 +54,22 @@ export function normalizeBackup(input, makeId) {
     if (new Set(result[key].map(row => row.id)).size !== rows.length) throw new Error('Duplicate IDs in backup.');
   }
   result.plan = input.plan ?? null;
-  return stateSchema.parse(result);
+  result.settings = input.settings === undefined ? undefined : settingsInputSchema.parse(input.settings);
+  return backupSchema.parse(result);
 }
 export function applyAction(state, action) {
   const next = structuredClone(state);
   if (action.type === 'import') {
-    const backup = stateSchema.parse(action.backup);
+    const backup = backupSchema.parse(action.backup);
     for (const key of ['inventory','shoppingList','appliances']) {
       const merged = new Map(next[key].map(row => [row.id,row]));
       backup[key].forEach(row => merged.set(row.id,row));
       next[key] = [...merged.values()];
     }
     if (backup.plan !== null) next.plan = backup.plan;
+    if (backup.settings) next.settings = settingsSchema.parse({...next.settings, ...backup.settings});
   } else if (action.type === 'plan') next.plan = planSchema.parse(action.plan);
+  else if (action.type === 'settings') next.settings = settingsSchema.parse({...next.settings, ...action.settings});
   else if (action.type === 'buy') {
     const id = idSchema.parse(action.id);
     const item = next.shoppingList.find(row => row.id === id);
@@ -55,6 +78,13 @@ export function applyAction(state, action) {
     next.inventory.push(item);
     next.shoppingList = next.shoppingList.filter(row => row.id !== id);
   } else {
+    if (action.type === 'bulk_delete') {
+      if (!Object.hasOwn(collectionKey, action.collection) || !Array.isArray(action.ids) || action.ids.length > 2000) throw new Error('Invalid bulk delete.');
+      const key = collectionKey[action.collection];
+      const ids = new Set(action.ids.map(idSchema.parse));
+      next[key] = next[key].filter(row => !ids.has(row.id));
+      return stateSchema.parse(next);
+    }
     if (!Object.hasOwn(collectionKey, action.collection)) throw new Error('Unknown collection.');
     const key = collectionKey[action.collection];
     const id = idSchema.parse(action.id);

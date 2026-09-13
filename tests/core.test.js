@@ -23,6 +23,26 @@ test('backup merge is repeatable and preserves existing records',()=>{
   assert.equal(once.inventory.length,2);
   assert.equal(once.plan.shelterSpot,'Basement');
 });
+test('settings are validated, persisted and used by imports',()=>{
+  const updated=applyAction(emptyState(),{type:'settings',settings:{householdSize:'6',survivalGoalDays:'30'}});
+  assert.equal(updated.settings.householdSize,6);
+  assert.equal(updated.settings.survivalGoalDays,30);
+  const imported=normalizeBackup({settings:{householdSize:2},inventory:[]},()=> 'id');
+  const merged=applyAction(updated,{type:'import',backup:imported});
+  assert.equal(merged.settings.householdSize,2);
+  assert.equal(merged.settings.survivalGoalDays,30);
+  assert.throws(()=>applyAction(emptyState(),{type:'settings',settings:{householdSize:0}}));
+});
+test('bulk delete removes only validated IDs from one collection',()=>{
+  let state=emptyState();
+  state=applyAction(state,{type:'add',collection:'inventory',id:'a',item:{name:'A'}});
+  state=applyAction(state,{type:'add',collection:'inventory',id:'b',item:{name:'B'}});
+  state.shoppingList.push({...item,id:'shop'});
+  const next=applyAction(state,{type:'bulk_delete',collection:'inventory',ids:['a']});
+  assert.deepEqual(next.inventory.map(row=>row.id),['b']);
+  assert.equal(next.shoppingList.length,1);
+  assert.throws(()=>applyAction(state,{type:'bulk_delete',collection:'inventory',ids:['bad.id']}));
+});
 test('buy is atomic and idempotent; ID collisions never overwrite stock',()=>{
   const state=applyAction(emptyState(),{type:'add',collection:'shopping_list',id:item.id,item});
   const bought=applyAction(state,{type:'buy',id:item.id});

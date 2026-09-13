@@ -12,6 +12,11 @@
 - Removed hardcoded family identities and legacy recovery IDs before public publication.
 - Water units convert to US gallons; bottle/case sizes can be specified. Expired food/water are excluded, and expiration compares local calendar dates through the end of the expiry day.
 - Fractional number inputs, prototype-safe grouping, local development API, backup URL cleanup and responsive navigation fixes retained.
+- Added an installable app shell, local authenticated-state cache, bounded offline action queue and reconnect sync.
+- Added configurable readiness assumptions and settings backup support.
+- Added inventory search/status filters, multi-select and atomic bulk deletion.
+- Added accessible names, progress semantics, save/sync/offline indicators and a database health endpoint.
+- Added Node 22 pinning and pull-request CI for tests and production builds.
 
 ## Verification
 
@@ -23,7 +28,7 @@
 - No automatic migration from the old database. Import a JSON export and verify counts and household details.
 - AI remains explicitly unavailable.
 - Simplified calorie/power assumptions; no inverter loss, battery derating, surge or individualized nutrition model.
-- Network connection required; no offline service worker or durable write queue. Keep a downloaded backup for outages.
+- Offline edits are cached in browser storage and limited to 100 queued actions; clearing site data loses unsynced edits. Keep a downloaded backup for outages.
 - Modal focus trapping and some icon-button accessibility need refinement. Family member/contact editing is limited to backup import; shelter editing is supported.
 - Login-limit rows should be periodically purged after expiration for long-lived deployments. They store hashed IP identifiers, not raw IP addresses.
 - Stock count changes are not an audit ledger. Conflicting edits to the same field follow successful server processing order.

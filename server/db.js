@@ -28,7 +28,7 @@ export async function readState() {
           macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate",
           barcode, recurring_days AS "recurringDays"
         FROM northstar_shopping_items WHERE household_id = ${householdId} ORDER BY seq`,
-    sql`SELECT id, name, watts, hours, active FROM northstar_appliances WHERE household_id = ${householdId} ORDER BY seq`,
+    sql`SELECT id, name, watts, hours, active, priority FROM northstar_appliances WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, title, category, recurring_days AS "recurringDays", notes, start_date AS "startDate",
           last_completed_date AS "lastCompletedDate", snoozed_until AS "snoozedUntil"
         FROM northstar_reminders WHERE household_id = ${householdId} ORDER BY seq`,
@@ -126,10 +126,10 @@ export async function compareAndSave(version, next, current = emptyState()) {
     for (const item of shoppingDiff.toUpsert) statements.push(upsertShoppingItem(tx, item, guard));
     for (const id of applianceDiff.toDelete) statements.push(tx`DELETE FROM northstar_appliances WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
     for (const appliance of applianceDiff.toUpsert) statements.push(tx`
-      INSERT INTO northstar_appliances (household_id, id, name, watts, hours, active)
-      SELECT ${householdId}, ${appliance.id}, ${appliance.name}, ${appliance.watts}, ${appliance.hours}, ${appliance.active}
+      INSERT INTO northstar_appliances (household_id, id, name, watts, hours, active, priority)
+      SELECT ${householdId}, ${appliance.id}, ${appliance.name}, ${appliance.watts}, ${appliance.hours}, ${appliance.active}, ${appliance.priority}
       WHERE ${guard}
-      ON CONFLICT (household_id, id) DO UPDATE SET name = EXCLUDED.name, watts = EXCLUDED.watts, hours = EXCLUDED.hours, active = EXCLUDED.active`);
+      ON CONFLICT (household_id, id) DO UPDATE SET name = EXCLUDED.name, watts = EXCLUDED.watts, hours = EXCLUDED.hours, active = EXCLUDED.active, priority = EXCLUDED.priority`);
     for (const id of reminderDiff.toDelete) statements.push(tx`DELETE FROM northstar_reminders WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
     for (const reminder of reminderDiff.toUpsert) statements.push(upsertReminder(tx, reminder, guard));
     for (const id of checklistDiff.toDelete) statements.push(tx`DELETE FROM northstar_checklist_checks WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);

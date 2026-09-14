@@ -113,8 +113,11 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_appliances (
   watts numeric NOT NULL DEFAULT 0,
   hours numeric NOT NULL DEFAULT 0,
   active boolean NOT NULL DEFAULT true,
+  priority text NOT NULL DEFAULT 'normal',
   PRIMARY KEY (household_id, id)
 )`;
+// Existing deployments created this table before outage load-shedding priorities existed.
+await sql`ALTER TABLE northstar_appliances ADD COLUMN IF NOT EXISTS priority text NOT NULL DEFAULT 'normal'`;
 await sql`CREATE TABLE IF NOT EXISTS northstar_reminders (
   household_id integer NOT NULL REFERENCES northstar_household(id),
   id text NOT NULL,
@@ -250,8 +253,8 @@ if (inventoryRows === 0 && settingsRows === 0) {
         ON CONFLICT (household_id, id) DO NOTHING`;
     }
     for (const appliance of state.appliances) {
-      await sql`INSERT INTO northstar_appliances (household_id, id, name, watts, hours, active)
-        VALUES (1, ${appliance.id}, ${appliance.name}, ${appliance.watts}, ${appliance.hours}, ${appliance.active})
+      await sql`INSERT INTO northstar_appliances (household_id, id, name, watts, hours, active, priority)
+        VALUES (1, ${appliance.id}, ${appliance.name}, ${appliance.watts}, ${appliance.hours}, ${appliance.active}, ${appliance.priority})
         ON CONFLICT (household_id, id) DO NOTHING`;
     }
     if (state.plan) {

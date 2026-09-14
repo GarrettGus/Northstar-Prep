@@ -66,7 +66,10 @@ export const itemSchema = z.object({
   // Days between replenishments; 0 means the item does not recur. Measured from purchaseDate.
   recurringDays: z.coerce.number().int().min(0).max(3650).default(0),
 });
-export const applianceSchema = z.object({ id: idSchema, name: z.string().trim().min(1).max(200), watts: number, hours: z.coerce.number().finite().min(0).max(24), active: z.boolean().default(true) });
+// Load-shedding order during an outage: 'low' sheds first, 'critical' last. Existing appliances
+// default to 'normal' so the column is additive (see simulateOutage in shared/outage.js).
+export const appliancePrioritySchema = z.enum(['critical', 'high', 'normal', 'low']).default('normal');
+export const applianceSchema = z.object({ id: idSchema, name: z.string().trim().min(1).max(200), watts: number, hours: z.coerce.number().finite().min(0).max(24), active: z.boolean().default(true), priority: appliancePrioritySchema });
 
 // --- Recurring maintenance reminders (water rotation, medication expiry, batteries, generator tests, etc). ---
 export const reminderCategories = ['Water Rotation', 'Medication', 'Batteries', 'Generator Test', 'Other'];

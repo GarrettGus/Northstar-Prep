@@ -343,6 +343,101 @@ test('readiness needs scale with configurable household size and per-person rate
   assert.equal(solo.dailyWaterNeed,1);assert.equal(family.dailyWaterNeed,4);
   assert.equal(solo.waterDays,8);assert.equal(family.waterDays,2);
 });
+import { simulateOutage, outageResources, appliancePriorities } from '../shared/outage.js';
+const outageState={
+  inventory:[
+    {id:'w',name:'Water',category:'Water',quantity:20,unit:'gal'},
+    {id:'b',name:'Battery',category:'Power',quantity:1,capacityPerUnit:10},
+    {id:'f',name:'Propane',category:'Fuel',quantity:2,hoursPerUnit:12},
+  ],
+  appliances:[
+    {id:'fridge',name:'Fridge',watts:150,hours:24,active:true,priority:'critical'},
+    {id:'tv',name:'TV',watts:100,hours:5,active:true,priority:'low'},
+    {id:'heater',name:'Space heater',watts:1500,hours:4,active:true,priority:'normal'},
+    {id:'off',name:'Unplugged',watts:900,hours:8,active:false,priority:'low'},
+  ],
+  plan:null,
+};
+test('outage resources count usable stored power and ignore inactive appliances',()=>{
+  const settings=settingsSchema.parse({householdSize:2,batteryUsableFraction:0.5,inverterEfficiency:0.5});
+  const resources=outageResources(outageState,settings);
+  // 10 kWh nameplate derated by depth-of-discharge and inverter loss.
+  assert.equal(resources.powerKwh,2.5);
+  // Fridge 3.6 + TV 0.5 + heater 6.0 kWh/day; the unplugged 7.2 kWh device is excluded.
+  assert.equal(resources.dailyLoadKwh,10.1);
+  assert.equal(resources.waterGallons,20);
+  assert.equal(resources.fuelHours,24);
+  assert.equal(resources.dailyWaterNeed,2);
+});
+test('outage resources exclude expired water but still count fuel',()=>{
+  const settings=settingsSchema.parse({});
+  const state={inventory:[
+    {id:'w1',name:'Fresh',category:'Water',quantity:5,unit:'gal',expiryDate:'2099-01-01'},
+    {id:'w2',name:'Lapsed',category:'Water',quantity:5,unit:'gal',expiryDate:'2020-01-01'},
+    {id:'f',name:'Old propane',category:'Fuel',quantity:1,hoursPerUnit:10,expiryDate:'2020-01-01'},
+  ],appliances:[],plan:null};
+  const resources=outageResources(state,settings);
+  assert.equal(resources.waterGallons,5);
+  // Propane does not spoil, so a past date does not remove it from the drawdown.
+  assert.equal(resources.fuelHours,10);
+});
+test('outage simulation reports what runs out first and when',()=>{
+  const settings=settingsSchema.parse({householdSize:2,batteryUsableFraction:1,inverterEfficiency:1});
+  const result=simulateOutage(outageState,settings,{hours:72});
+  // Power: 10 kWh at 10.1 kWh/day ~= 23.8h. Fuel: 24h. Water: 20 gal at 2 gal/day = 240h.
+  assert.equal(result.firstExhausted.key,'power');
+  assert.ok(result.firstExhausted.runwayHours<24);
+  assert.equal(result.survives,false);
+  assert.deepEqual(result.runways.map(r=>r.key),['power','fuel','water']);
+  // The timeline ends exactly at the requested duration and never goes negative.
+  assert.equal(result.timeline.at(-1).hour,72);
+  assert.equal(result.timeline.at(-1).power,0);
+  assert.equal(result.timeline[0].water,20);
+  assert.ok(result.timeline.every(point=>point.power>=0&&point.fuel>=0&&point.water>=0));
+});
+test('a resource nothing consumes never runs out',()=>{
+  const settings=settingsSchema.parse({householdSize:2,waterGallonsPerPersonPerDay:0});
+  const result=simulateOutage({inventory:outageState.inventory,appliances:[],plan:null},settings,{hours:48});
+  // No appliances and no water need: only fuel is being drawn down, and it lasts 24 of the 48h.
+  assert.deepEqual(result.runways.map(r=>r.key),['fuel']);
+  assert.equal(result.firstExhausted.key,'fuel');
+  assert.equal(result.survives,false);
+  // Stored power and water are untouched because nothing consumes them.
+  assert.equal(result.timeline.at(-1).water,20);
+  assert.equal(result.timeline.at(-1).power,result.timeline[0].power);
+});
+test('load shedding drops least essential loads first and the hungriest within a tier',()=>{
+  const settings=settingsSchema.parse({batteryUsableFraction:1,inverterEfficiency:1});
+  const result=simulateOutage(outageState,settings,{hours:48});
+  // 10 kWh over 48h allows 5 kWh/day. Shedding the low-priority TV leaves 9.6, still too much,
+  // so the normal-priority heater goes next; the critical fridge is never shed.
+  assert.deepEqual(result.shedding.shed.map(a=>a.id),['tv','heater']);
+  assert.ok(Math.abs(result.shedding.remainingDailyLoadKwh-3.6)<1e-9);
+  // The critical fridge survived the plan, so no critical-load warning is raised.
+  assert.equal(result.shedding.shedsCritical,false);
+});
+test('load shedding warns when reaching the duration costs a critical load',()=>{
+  const settings=settingsSchema.parse({batteryUsableFraction:1,inverterEfficiency:1});
+  const state={inventory:[{id:'b',name:'Battery',category:'Power',quantity:1,capacityPerUnit:0.1}],appliances:outageState.appliances,plan:null};
+  const result=simulateOutage(state,settings,{hours:240});
+  // Every active appliance has to go, lowest priority first and critical last -- which is the
+  // warning worth surfacing, since shedding everything trivially "reaches" any duration.
+  assert.deepEqual(result.shedding.shed.map(a=>a.id),['tv','heater','fridge']);
+  assert.equal(result.shedding.shedsCritical,true);
+  assert.equal(result.shedding.remainingDailyLoadKwh,0);
+});
+test('load shedding is empty when stored power already covers the outage',()=>{
+  const settings=settingsSchema.parse({batteryUsableFraction:1,inverterEfficiency:1});
+  const result=simulateOutage(outageState,settings,{hours:12});
+  assert.deepEqual(result.shedding.shed,[]);
+  assert.equal(result.shedding.shedsCritical,false);
+});
+test('appliance priority defaults to normal and rejects unknown levels',()=>{
+  const state=applyAction(emptyState(),{type:'add',collection:'appliances',id:'fan',item:{name:'Fan',watts:50,hours:8}});
+  assert.equal(state.appliances[0].priority,'normal');
+  assert.deepEqual(appliancePriorities,['critical','high','normal','low']);
+  assert.throws(()=>applyAction(emptyState(),{type:'add',collection:'appliances',id:'fan',item:{name:'Fan',priority:'urgent'}}));
+});
 test('days until expiry counts whole local calendar days either side of today',()=>{
   const now=new Date(2026,8,14,23,45);
   assert.equal(daysUntilExpiry('2026-09-14',now),0);

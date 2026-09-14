@@ -10,6 +10,7 @@ import {
 import { request } from './api.js';
 import { computeReadiness, computeReadinessGaps, isExpired, isRecurringDue, expirationQueue } from '../shared/readiness.js';
 import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
+import { simulateOutage, appliancePriorities, appliancePriorityLabels } from '../shared/outage.js';
 import { effectiveReminderDueDate, isReminderOverdue, todayLocal, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
 import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
@@ -17,14 +18,6 @@ import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, sav
 // --- Constants ---
 const SYSTEM_ID = 'Household';
 const progressPercent = (value, goal) => goal > 0 ? (value / goal) * 100 : 0;
-
-// The emergency drill remains unavailable until an authenticated server endpoint is configured.
-// Meal planning, gap analysis and item/appliance suggestions no longer need one: gap analysis is
-// computed deterministically (see computeReadinessGaps), and the others were removed rather than
-// left as dead buttons.
-async function callGemini() {
-  throw new Error('AI is not configured.');
-}
 
 // --- Main App Component ---
 export default function App() {
@@ -42,8 +35,7 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [showSyncModal, setShowSyncModal] = useState(false);
   const [showBinder, setShowBinder] = useState(false);
-  const [aiContent, setAiContent] = useState(null);
-  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [outage, setOutage] = useState(null);
   const [globalError, setGlobalError] = useState(null);
   const [settings, setSettings] = useState(() => settingsSchema.parse({}));
   const [pendingImport, setPendingImport] = useState(null);
@@ -186,18 +178,10 @@ export default function App() {
     return Promise.resolve(false);
   };
 
-  const generateDrill = async () => {
-    setIsAiLoading(true);
-    const familyNames = plan?.family?.map(f => f.name).join(', ') || "the family";
-    const shelter = plan?.shelterSpot || "basement";
-    const prompt = `Create a realistic 10-minute emergency drill scenario for a family in suburban Minnesota (Winter). Family: ${familyNames}. Safe spot: ${shelter}. Scenario: Severe blizzard with power loss or tornado siren. Give 3 immediate action steps for the household to practice.`;
-    try {
-      const result = await callGemini(prompt);
-      setAiContent({ title: "🚨 AI Emergency Drill", text: result });
-    } catch (e) {
-      setAiContent({ title: "Error", text: e.message });
-    }
-    setIsAiLoading(false);
+  // Replaces the old "Run Emergency Simulation" AI stub: the same question answered as plain
+  // arithmetic over what the household has actually recorded, so it works offline.
+  const runOutageSimulation = (hours) => {
+    setOutage(simulateOutage({inventory, appliances, plan}, settings, {hours}));
   };
 
   const handleAdd = (collection,item) => mutate({type:'add',collection,id:crypto.randomUUID(),item});
@@ -284,7 +268,7 @@ export default function App() {
         )}
         {activeTab === 'plan' && (
           <EmergencyPlan
-            plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunDrill={generateDrill} isAiLoading={isAiLoading}
+            plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunSimulation={runOutageSimulation} settings={settings}
             onOpenBinder={() => setShowBinder(true)}
             reminders={reminders} checklistChecks={checklistChecks}
             onAddReminder={(i) => handleAdd('reminders', i)}
@@ -300,7 +284,7 @@ export default function App() {
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
       {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
-      {aiContent && <AiModal content={aiContent} onClose={() => setAiContent(null)} />}
+      {outage && <OutageSimulationModal result={outage} settings={settings} onClose={() => setOutage(null)} />}
     </div>
   );
 }
@@ -427,9 +411,9 @@ function ReadinessGaps({ gaps, onAddShortfall }) {
 function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingId, setEditingId] = useState(null);
-  const [form, setForm] = useState({ name: '', watts: '', hours: '', active: true });
+  const [form, setForm] = useState({ name: '', watts: '', hours: '', active: true, priority: 'normal' });
 
-  const reset = () => { setForm({ name: '', watts: '', hours: '', active: true }); setEditingId(null); setShowAdd(false); };
+  const reset = () => { setForm({ name: '', watts: '', hours: '', active: true, priority: 'normal' }); setEditingId(null); setShowAdd(false); };
 
   const submit = async (e) => {
     e.preventDefault();
@@ -478,6 +462,13 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
                 <div className="col-span-2"><Label>Device Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Fridge" /></div>
                 <div><Label>Watts (Running)</Label><Input val={form.watts} set={v => setForm({...form, watts: v})} type="number" placeholder="150" /></div>
                 <div><Label>Hours/Day</Label><Input val={form.hours} set={v => setForm({...form, hours: v})} type="number" placeholder="24" /></div>
+                <div className="col-span-2">
+                  <Label>Outage priority</Label>
+                  <select aria-label="Outage priority" value={form.priority || 'normal'} onChange={e => setForm({...form, priority: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold text-slate-700">
+                    {appliancePriorities.map(level => <option key={level} value={level}>{appliancePriorityLabels[level]}</option>)}
+                  </select>
+                  <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">Lowest priority loads are shed first when the outage simulator works out what to turn off.</p>
+                </div>
              </div>
              <button type="submit" className="w-full bg-violet-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl active:bg-violet-700 transition-colors mt-2">
                {editingId ? 'Update Device' : 'Add to Load'}
@@ -500,7 +491,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
                 <div onClick={() => handleEdit(app)} className="cursor-pointer">
                    <h4 className="font-black text-slate-800 leading-tight">{app.name}</h4>
                    <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
-                    {app.watts}W • {app.hours} hrs/day • {((app.watts * app.hours)/1000).toFixed(2)} kWh
+                    {app.watts}W • {app.hours} hrs/day • {((app.watts * app.hours)/1000).toFixed(2)} kWh • {appliancePriorityLabels[app.priority || 'normal']} priority
                    </p>
                 </div>
              </div>
@@ -955,7 +946,7 @@ function ContactsSection({ contacts, isEditing, onChange }) {
   );
 }
 
-function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, onOpenBinder, reminders = [], checklistChecks = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem }) {
+function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder, reminders = [], checklistChecks = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem }) {
   const [isEditing, setIsEditing] = useState(false);
   const [spot, setSpot] = useState(plan?.shelterSpot || '');
   const [family, setFamily] = useState(plan?.family || []);
@@ -1020,10 +1011,20 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, onOpenBinder, 
       </div>
       {saveError && <p role="alert" className="text-xs font-bold text-red-600 px-1">{saveError}</p>}
 
-      <button onClick={onRunDrill} disabled={isAiLoading} className="w-full bg-indigo-50 text-indigo-700 py-4 rounded-[2.5rem] flex items-center justify-center gap-2 font-black text-xs uppercase tracking-widest border border-indigo-100 active:scale-95 transition-all">
-        {isAiLoading ? <RefreshCw className="animate-spin" size={16}/> : <Siren size={16}/>}
-        Run Emergency Simulation
-      </button>
+      <div className="bg-indigo-50 border border-indigo-100 rounded-[2.5rem] p-6 space-y-3">
+        <h3 className="text-[10px] font-black uppercase tracking-widest text-indigo-700 flex items-center gap-2"><Siren size={14}/> Outage simulator</h3>
+        <p className="text-[11px] text-slate-600 leading-relaxed">
+          Draws your stored power, heating fuel and water down over an outage of a given length, using the figures
+          you have recorded. Runs entirely on this device.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {[24, 72, settings.survivalGoalDays * 24].map(hours => (
+            <button key={hours} onClick={() => onRunSimulation(hours)} className="px-4 py-2.5 rounded-2xl bg-white border border-indigo-200 text-indigo-700 text-[10px] font-black uppercase tracking-widest active:scale-95 transition-all">
+              {hours < 48 ? `${hours} hours` : `${Math.round(hours / 24)} days`}
+            </button>
+          ))}
+        </div>
+      </div>
 
       <button onClick={onOpenBinder} className="w-full bg-slate-50 text-slate-700 py-4 rounded-[2.5rem] flex items-center justify-center gap-2 font-black text-xs uppercase tracking-widest border border-slate-200 active:scale-95 transition-all">
         <BookOpen size={16}/>
@@ -1908,17 +1909,100 @@ function AcceptInvite({token,onJoined}) {
   </main>;
 }
 
-export function AiModal({ content, onClose }) {
+// Results of a deterministic outage simulation (shared/outage.js). This replaced the old AI
+// "Run Emergency Simulation" stub, so everything shown here is arithmetic over recorded figures.
+export function OutageSimulationModal({ result, settings, onClose }) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
+  const hours = result.hours;
+  const label = hours < 48 ? `${Math.round(hours)}-hour` : `${Math.round(hours / 24)}-day`;
+  const formatRunway = value => value === null ? 'Not consumed' : value >= 48 ? `${(value / 24).toFixed(1)} days` : `${value.toFixed(0)} hours`;
+  const units = {power: 'kWh', fuel: 'h', water: 'gal'};
+
   return (
     <div className="fixed inset-0 z-[110] bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-6 text-slate-900">
-      <div ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title" className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[80vh]">
-        <div className="flex justify-between items-center mb-6">
-          <h3 id="ai-modal-title" className="text-xl font-black text-slate-900">{content.title}</h3>
-          <button aria-label="Close AI result" onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-500"><X aria-hidden="true" size={16}/></button>
+      <div ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="outage-modal-title" className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[85vh]">
+        <div className="flex justify-between items-center mb-4">
+          <h3 id="outage-modal-title" className="text-xl font-black text-slate-900">{label} outage</h3>
+          <button aria-label="Close simulation result" onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-500"><X aria-hidden="true" size={16}/></button>
         </div>
-        <div className="overflow-y-auto text-sm text-slate-600 leading-relaxed whitespace-pre-wrap flex-1">{content.text}</div>
+
+        <div className="overflow-y-auto flex-1 space-y-5 text-sm text-slate-600">
+          <p className={`font-bold ${result.survives ? 'text-emerald-700' : 'text-red-700'}`}>
+            {result.survives
+              ? `Nothing you track runs out within ${label.toLowerCase().replace('-', ' ')}.`
+              : `${result.firstExhausted.label} runs out first, after ${formatRunway(result.firstExhausted.runwayHours)}.`}
+          </p>
+
+          <section>
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">How long each lasts</h4>
+            <ul className="space-y-1">
+              {result.runways.map(resource => (
+                <li key={resource.key} className="flex justify-between gap-3">
+                  <span className="font-bold text-slate-700">{resource.label}</span>
+                  <span className={resource.runwayHours !== null && resource.runwayHours < hours ? 'text-red-700 font-bold' : ''}>{formatRunway(resource.runwayHours)}</span>
+                </li>
+              ))}
+              {result.runways.length === 0 && <li className="text-slate-500">Nothing recorded is being consumed — add appliances, water and fuel to see a drawdown.</li>}
+            </ul>
+          </section>
+
+          <section>
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">Drawdown</h4>
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px]">
+                <thead>
+                  <tr className="text-slate-500 text-left">
+                    <th scope="col" className="font-black uppercase py-1">Hour</th>
+                    <th scope="col" className="font-black uppercase py-1 text-right">Power</th>
+                    <th scope="col" className="font-black uppercase py-1 text-right">Fuel</th>
+                    <th scope="col" className="font-black uppercase py-1 text-right">Water</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.timeline.map(point => (
+                    <tr key={point.hour} className="border-t border-slate-100">
+                      <td className="py-1 font-bold text-slate-700">{Math.round(point.hour)}h</td>
+                      <td className="py-1 text-right">{point.power.toFixed(1)} {units.power}</td>
+                      <td className="py-1 text-right">{point.fuel.toFixed(0)} {units.fuel}</td>
+                      <td className="py-1 text-right">{point.water.toFixed(1)} {units.water}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section>
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">Loads to shed</h4>
+            {result.shedding.shed.length === 0 ? (
+              <p>{result.resources.dailyLoadKwh > 0
+                ? 'Stored power already lasts the whole outage with every active appliance running.'
+                : 'No active appliances are recorded, so there is nothing to shed.'}</p>
+            ) : (
+              <>
+                <p className="mb-2">Turn these off, lowest priority first, so stored power lasts the full {label.toLowerCase().replace('-', ' ')}:</p>
+                <ol className="space-y-1 list-decimal list-inside">
+                  {result.shedding.shed.map(appliance => (
+                    <li key={appliance.id} className="font-bold text-slate-700">
+                      {appliance.name} <span className="font-normal text-slate-500">({appliancePriorityLabels[appliance.priority || 'normal']} priority, {(((appliance.watts || 0) * (appliance.hours || 0)) / 1000).toFixed(2)} kWh/day)</span>
+                    </li>
+                  ))}
+                </ol>
+                {result.shedding.shedsCritical && (
+                  <p className="mt-2 text-red-700 font-bold">Reaching the full duration means turning off loads you marked critical.</p>
+                )}
+              </>
+            )}
+          </section>
+
+          <p className="text-[10px] leading-relaxed text-slate-500">
+            Stored power counts {Math.round(settings.batteryUsableFraction * 100)}% usable capacity after a {Math.round(settings.inverterEfficiency * 100)}% efficient
+            inverter conversion. Heating fuel is drawn down at one recorded hour per hour. Water uses the same daily
+            need as the Dashboard. Expired water is excluded; fuel is counted whatever its date.
+          </p>
+        </div>
+
         <button onClick={onClose} className="mt-6 w-full bg-slate-900 text-white py-4 rounded-2xl font-black">Close</button>
       </div>
     </div>

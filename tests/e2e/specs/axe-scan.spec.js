@@ -12,8 +12,8 @@ test('harness has no detectable accessibility violations (default state)', async
 
 test('harness has no detectable accessibility violations (dialog open)', async ({ page }) => {
   await page.goto('/');
-  await page.getByTestId('open-ai-modal').click();
-  await expect(page.getByRole('dialog', { name: 'Meal Plan' })).toBeVisible();
+  await page.getByTestId('open-simulation-modal').click();
+  await expect(page.getByRole('dialog', { name: '3-day outage' })).toBeVisible();
   const results = await new AxeBuilder({ page }).analyze();
   expect(results.violations).toEqual([]);
 });

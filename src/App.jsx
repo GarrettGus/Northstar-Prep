@@ -370,7 +370,81 @@ function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueRemin
       </div>
 
       <ReadinessGaps gaps={gaps} onAddShortfall={onAddGapShortfall} />
+      <ReadinessTrend settings={settings} />
     </div>
+  );
+}
+
+// Progress over time, from the daily snapshot the backup cron records (see api/backup.js).
+// Aggregate figures only, so nothing here reveals what the household actually keeps.
+function ReadinessTrend({ settings }) {
+  const [entries, setEntries] = useState(null);
+  const [error, setError] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    request('readiness-history')
+      .then(data => { if (!cancelled) setEntries(data.entries || []); })
+      .catch(err => { if (!cancelled) setError(err.message); });
+    return () => { cancelled = true; };
+  }, []);
+
+  if (error) return null;
+  if (entries === null) return null;
+  if (entries.length < 2) {
+    return (
+      <section className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm">
+        <h3 className="text-[10px] font-black uppercase tracking-widest text-slate-600 mb-2">Readiness over time</h3>
+        <p className="text-xs text-slate-500 leading-relaxed">
+          A snapshot is recorded once a day. {entries.length === 0 ? 'The first one will appear after the next daily run.' : 'Come back tomorrow to see a trend.'}
+        </p>
+      </section>
+    );
+  }
+
+  const first = entries[0];
+  const latest = entries.at(-1);
+  const series = [
+    {key: 'waterDays', label: 'Water days', color: 'bg-blue-500'},
+    {key: 'foodDays', label: 'Food days', color: 'bg-emerald-500'},
+    {key: 'powerDays', label: 'Power days', color: 'bg-violet-500'},
+  ];
+  const peak = Math.max(settings.survivalGoalDays, ...entries.flatMap(entry => series.map(item => Number(entry[item.key]) || 0)));
+
+  return (
+    <section className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-4">
+      <div className="flex items-baseline justify-between gap-3">
+        <h3 className="text-[10px] font-black uppercase tracking-widest text-slate-600">Readiness over time</h3>
+        <span className="text-[10px] font-bold text-slate-500">{entries.length} days</span>
+      </div>
+      {series.map(item => {
+        const from = Number(first[item.key]) || 0;
+        const to = Number(latest[item.key]) || 0;
+        const change = to - from;
+        return (
+          <div key={item.key} className="space-y-1">
+            <div className="flex items-baseline justify-between gap-3 text-xs">
+              <span className="font-bold text-slate-700">{item.label}</span>
+              <span className="font-bold text-slate-700">
+                {to.toFixed(1)}
+                <span className={`ml-2 font-black ${change > 0.05 ? 'text-emerald-600' : change < -0.05 ? 'text-red-600' : 'text-slate-400'}`}>
+                  {change > 0.05 ? '▲' : change < -0.05 ? '▼' : '—'} {Math.abs(change).toFixed(1)}
+                </span>
+              </span>
+            </div>
+            <div className="flex items-end gap-px h-8" role="img" aria-label={`${item.label}: ${from.toFixed(1)} ${entries.length} days ago, ${to.toFixed(1)} now`}>
+              {entries.map(entry => (
+                <div key={entry.day} className="flex-1 bg-slate-100 rounded-sm flex items-end" style={{height: '100%'}}>
+                  <div className={`w-full ${item.color} rounded-sm`} style={{height: `${peak > 0 ? Math.min(100, ((Number(entry[item.key]) || 0) / peak) * 100) : 0}%`}} />
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      <p className="text-[10px] text-slate-500 leading-relaxed">
+        Recorded once a day alongside the encrypted backup. Aggregate figures only — no item details are kept in this history.
+      </p>
+    </section>
   );
 }
 

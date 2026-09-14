@@ -58,6 +58,56 @@ test('backup API: a valid cron secret creates a backup and prunes old backups an
   assert.equal(res.data.metricsPruned, true);
 });
 
+test('backup API: the same cron run records a readiness snapshot and prunes old ones', async () => {
+  const state = {
+    ...emptyState(),
+    inventory: [
+      {id:'water',name:'Water',quantity:14,unit:'gal',category:'Water',caloriesPerUnit:0,hoursPerUnit:0,capacityPerUnit:0,price:0,gallonsPerUnit:1,target:14,store:'',emoji:'',image:'',macroTag:'',fuelType:'',purchaseDate:'',expiryDate:'',barcode:'',recurringDays:0},
+      {id:'old',name:'Lapsed',quantity:1,unit:'units',category:'Food',caloriesPerUnit:0,hoursPerUnit:0,capacityPerUnit:0,price:0,gallonsPerUnit:0,target:1,store:'',emoji:'',image:'',macroTag:'',fuelType:'',purchaseDate:'',expiryDate:'2020-01-01',barcode:'',recurringDays:0},
+    ],
+  };
+  let snapshot = null, snapshotRetention = null;
+  const repository = {
+    async readState() { return {data: state, version: 1}; },
+    async insertBackupRecord() {},
+    async pruneBackups() {},
+    async pruneRequestMetrics() {},
+    async recordReadinessSnapshot(entry) { snapshot = entry; },
+    async pruneReadinessHistory(days) { snapshotRetention = days; },
+  };
+  const res = response();
+  await createHandler(repository)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
+  assert.equal(res.data.readinessRecorded, true);
+  // 14 gallons against the default 4 gal/day household need.
+  assert.equal(snapshot.waterDays, 3.5);
+  assert.equal(snapshot.itemCount, 2);
+  assert.equal(snapshot.expired, 1);
+  assert.match(snapshot.day, /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(snapshotRetention, 365);
+  // Aggregates only: nothing identifying what the household actually stores may be recorded.
+  assert.deepEqual(Object.keys(snapshot).sort(), ['day','expired','foodDays','fuelHours','itemCount','lowStock','powerDays','waterDays']);
+  assert.ok(!JSON.stringify(snapshot).includes('Water'));
+});
+
+test('backup API: a failed readiness snapshot is reported without failing the backup', async () => {
+  let inserted = null;
+  const repository = {
+    async readState() { return {data: emptyState(), version: 1}; },
+    async insertBackupRecord(entry) { inserted = entry; },
+    async pruneBackups() {},
+    async pruneRequestMetrics() {},
+    async recordReadinessSnapshot() { throw new Error('snapshot table missing'); },
+    async pruneReadinessHistory() {},
+  };
+  const res = response();
+  await createHandler(repository)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
+  // The backup the cron exists for still succeeded.
+  assert.equal(res.code, 200);
+  assert.equal(res.data.status, 'success');
+  assert.equal(inserted.status, 'success');
+  assert.equal(res.data.readinessRecorded, false);
+});
+
 test('backup API: cron creation failure while reading state is recorded and surfaced', async () => {
   let recordedError = null;
   const repository = {

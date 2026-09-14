@@ -52,8 +52,8 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
         'northstar_alert_state', 'northstar_appliances', 'northstar_audit_log', 'northstar_backups',
         'northstar_checklist_checks', 'northstar_contacts', 'northstar_family_members', 'northstar_household',
         'northstar_household_members', 'northstar_inventory', 'northstar_invitations', 'northstar_login_limits',
-        'northstar_plan', 'northstar_reminder_history', 'northstar_reminders', 'northstar_request_metrics',
-        'northstar_settings', 'northstar_shopping_items', 'northstar_users',
+        'northstar_plan', 'northstar_readiness_history', 'northstar_reminder_history', 'northstar_reminders',
+        'northstar_request_metrics', 'northstar_settings', 'northstar_shopping_items', 'northstar_users',
       ]);
     });
 
@@ -133,6 +133,30 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       assert.deepEqual(summary, [{route: '/api/hub', outcome: 'ok', requests: 2, average_latency_ms: 21, max_latency_ms: 30, last_seen: summary[0].last_seen}]);
       assert.equal(await db.countRecentFailures('/api/hub'), 0);
     });
+
+    it('stores one readiness snapshot per day, upserting and pruning by retention', async () => {
+      const db = await loadDb(database.url);
+      const snapshot = {waterDays: 3.5, foodDays: 7, powerDays: 1.25, fuelHours: 24, itemCount: 12, lowStock: 2, expired: 1};
+      await db.recordReadinessSnapshot({day: '2026-09-10', ...snapshot});
+      await db.recordReadinessSnapshot({day: '2026-09-11', ...snapshot, waterDays: 4.5});
+      // A second run on the same day updates that day rather than adding a row, so the daily
+      // cron running twice cannot double-count.
+      await db.recordReadinessSnapshot({day: '2026-09-11', ...snapshot, waterDays: 6});
+
+      const entries = await db.listReadinessHistory();
+      assert.equal(entries.length, 2);
+      // Oldest first, so the client can plot straight through without reversing.
+      assert.deepEqual(entries.map(entry => Number(entry.waterDays)), [3.5, 6]);
+      assert.equal(Number(entries[0].itemCount), 12);
+      assert.equal(Number(entries[1].expired), 1);
+      // The column is a date, and comes back as one rather than a timestamp string.
+      assert.ok(entries[0].day instanceof Date || /^\d{4}-\d{2}-\d{2}/.test(String(entries[0].day)));
+
+      // Retention is measured from today, and these rows are historical fixtures, so a
+      // zero-tolerance window would be ambiguous: prune everything older than one day.
+      await db.pruneReadinessHistory(1);
+      assert.deepEqual(await db.listReadinessHistory(), []);
+    });
   });
 
   describe('re-running the migration', () => {
@@ -162,7 +186,9 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       await migrate(database.url, ownerEnv);
 
       const after = await db.readState();
-      assert.deepEqual(after.data.appliances, [appliance]);
+      // Saved without an outage priority, so it reads back at the column's default rather than
+      // failing the write: compareAndSave does not assume its caller parsed the input first.
+      assert.deepEqual(after.data.appliances, [{...appliance, priority: 'normal'}]);
       assert.equal(after.version, version + 1, 're-running the migration must not bump the household version');
     });
   });
@@ -194,8 +220,15 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       const {data} = await db.readState();
       assert.deepEqual(data.inventory.map(row => [row.name, row.quantity, row.barcode, row.recurringDays]), [['Water Jug', 4, '', 0]]);
       assert.deepEqual(data.shoppingList.map(row => [row.name, row.store]), [['Beans', 'Costco']]);
-      assert.deepEqual(data.appliances, [legacyState.appliances[0]]);
-      assert.deepEqual(data.plan, legacyState.plan);
+      // A pre-relational blob predates outage priorities; backfilled rows take the default.
+      assert.deepEqual(data.appliances, [{...legacyState.appliances[0], priority: 'normal'}]);
+      // A pre-relational blob predates per-member consumption figures. Members come back as
+      // people with blank overrides -- blank, not zero -- so readiness keeps using the flat
+      // householdSize math for this household until someone opts in.
+      assert.deepEqual(data.plan, {
+        ...legacyState.plan,
+        family: legacyState.plan.family.map(member => ({...member, kind: 'person', caloriesPerDay: '', waterGallonsPerDay: ''})),
+      });
       assert.deepEqual(data.settings, legacyState.settings);
       assert.deepEqual(data.reminders, [], 'a blob predating reminders must migrate to an empty collection');
       assert.deepEqual(data.checklistChecks, []);

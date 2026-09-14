@@ -10,6 +10,7 @@ import { createHandler as createSessionHandler } from '../api/session.js';
 import { createHandler as createMembersHandler } from '../api/members.js';
 import { createHandler as createInviteHandler } from '../api/invite.js';
 import { createHandler as createReminderHistoryHandler } from '../api/reminder-history.js';
+import { createHandler as createReadinessHistoryHandler } from '../api/readiness-history.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
 process.env.DATABASE_URL='postgres://test-only/db';
 const item={id:'rice',name:'Rice',quantity:2,category:'Food'};
@@ -748,6 +749,29 @@ test('API records reminder completion and snooze history, but not plain field ed
   assert.equal(historyEvents.length,2);
   assert.equal(historyEvents[1].event,'snoozed');
   assert.equal(historyEvents[1].eventDate,'2026-02-10');
+});
+test('readiness history API enforces membership, method and returns entries',async()=>{
+  const entries=[{day:'2026-09-01',waterDays:3.5,foodDays:7,powerDays:1.2,fuelHours:24,itemCount:12,lowStock:2,expired:1}];
+  const repository={async getMembership(){return {role:'member'};},async listReadinessHistory(){return entries;}};
+  const ok=response();
+  await createReadinessHistoryHandler(repository,()=>({userId:'user-1'}))({method:'GET',headers:{}},ok);
+  assert.equal(ok.code,200);assert.deepEqual(ok.data.entries,entries);
+
+  const denied=response();
+  await createReadinessHistoryHandler({...repository,async getMembership(){return undefined;}},()=>({userId:'user-1'}))({method:'GET',headers:{}},denied);
+  assert.equal(denied.code,403);
+
+  const unauthed=response();
+  await createReadinessHistoryHandler(repository,()=>false)({method:'GET',headers:{}},unauthed);
+  assert.equal(unauthed.code,401);
+
+  const wrongMethod=response();
+  await createReadinessHistoryHandler(repository,()=>({userId:'user-1'}))({method:'POST',headers:{}},wrongMethod);
+  assert.equal(wrongMethod.code,405);
+
+  const broken=response();
+  await createReadinessHistoryHandler({...repository,async listReadinessHistory(){throw new Error('down');}},()=>({userId:'user-1'}))({method:'GET',headers:{}},broken);
+  assert.equal(broken.code,503);
 });
 test('reminder history API enforces membership and returns entries',async()=>{
   const entries=[{reminderId:'r1',reminderTitle:'Rotate water',category:'Water Rotation',event:'completed',eventDate:'2026-02-01',createdAt:'2026-02-01T00:00:00Z',actorEmail:'a@example.com'}];

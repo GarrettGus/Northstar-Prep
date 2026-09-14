@@ -228,6 +228,26 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_request_metrics (
 )`;
 await sql`CREATE INDEX IF NOT EXISTS northstar_request_metrics_recent_idx ON northstar_request_metrics (bucket DESC)`;
 await sql`CREATE INDEX IF NOT EXISTS northstar_request_metrics_route_idx ON northstar_request_metrics (route, outcome, bucket DESC)`;
+// --- Readiness history: one aggregate snapshot per household per day. ---
+// Deliberately content-free in the same way request metrics are: days of supply, totals and
+// counts only, never item names, quantities or categories. That keeps the history safe to
+// retain (and to read) independently of the household data it describes. The primary key is
+// (household_id, day), so re-running the daily cron updates that day rather than duplicating it.
+await sql`CREATE TABLE IF NOT EXISTS northstar_readiness_history (
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  day date NOT NULL,
+  water_days numeric NOT NULL DEFAULT 0,
+  food_days numeric NOT NULL DEFAULT 0,
+  power_days numeric NOT NULL DEFAULT 0,
+  fuel_hours numeric NOT NULL DEFAULT 0,
+  item_count integer NOT NULL DEFAULT 0,
+  low_stock integer NOT NULL DEFAULT 0,
+  expired integer NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (household_id, day)
+)`;
+await sql`CREATE INDEX IF NOT EXISTS northstar_readiness_history_day_idx ON northstar_readiness_history (household_id, day DESC)`;
+
 await sql`CREATE TABLE IF NOT EXISTS northstar_alert_state (
   key text PRIMARY KEY,
   last_sent_at timestamptz NOT NULL DEFAULT now()
@@ -254,7 +274,7 @@ if (inventoryRows === 0 && settingsRows === 0) {
     }
     for (const appliance of state.appliances) {
       await sql`INSERT INTO northstar_appliances (household_id, id, name, watts, hours, active, priority)
-        VALUES (1, ${appliance.id}, ${appliance.name}, ${appliance.watts}, ${appliance.hours}, ${appliance.active}, ${appliance.priority})
+        VALUES (1, ${appliance.id}, ${appliance.name}, ${appliance.watts}, ${appliance.hours}, ${appliance.active}, ${appliance.priority || 'normal'})
         ON CONFLICT (household_id, id) DO NOTHING`;
     }
     if (state.plan) {

@@ -1281,6 +1281,7 @@ function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImpor
         <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">Merge backup</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
       </div>}
       <SettingsForm settings={settings} onSave={onUpdateSettings} />
+      <ServiceHealthPanel />
       <BackupsPanel onRestore={onRestoreBackup} />
       <MembersPanel currentUserId={currentUserId} />
       <ActivityPanel />
@@ -1288,6 +1289,42 @@ function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImpor
       <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>
     </section>
   </div>;
+}
+
+// Operational visibility for whoever runs the deployment: API/database availability now, plus
+// the last 24 hours of failed writes, sign-in failures and database latency. Everything shown
+// comes from content-free counters (route, outcome, status, latency), never household data.
+function ServiceHealthPanel() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  useEffect(() => { request('health').then(setData).catch(err => setError(err.message)); }, []);
+  const metrics = data?.metrics;
+  const failing = metrics ? metrics.totals.failedWrites + metrics.totals.serverErrors : 0;
+
+  return (
+    <div className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Service health</h3>
+      {error && <p role="alert" className="text-xs font-bold text-red-600">API or database unavailable: {error}</p>}
+      {!data && !error && <p className="text-xs text-slate-500">Checking service health…</p>}
+      {data && <p className="text-xs text-slate-600">API and database reachable · {data.latencyMs} ms database round trip.</p>}
+      {metrics && <>
+        <p className={`text-xs font-bold ${failing ? 'text-red-700' : 'text-emerald-700'}`}>
+          {failing ? `${failing} failed request${failing === 1 ? '' : 's'} in the last 24 hours` : 'No failed requests in the last 24 hours'}
+        </p>
+        <ul className="text-xs text-slate-600 space-y-1">
+          <li>{metrics.totals.requests} requests measured · {metrics.totals.failedWrites} failed saves · {metrics.totals.serverErrors} server errors</li>
+          <li>{metrics.totals.authFailures} sign-in failures · {metrics.totals.rateLimited} rate-limited attempts</li>
+          {metrics.database.probes > 0 && <li>Database latency: {metrics.database.averageLatencyMs} ms average, {metrics.database.maxLatencyMs} ms peak</li>}
+          <li>
+            {metrics.alerting.webhookConfigured
+              ? `Alerts on ${metrics.alerting.thresholdFailures} failures in ${metrics.alerting.windowMinutes} minutes.`
+              : 'No alert webhook configured; failures are recorded in the server logs only.'}
+          </li>
+        </ul>
+        <p className="text-[10px] text-slate-500">Counters cover routes, outcomes and timings only — no household contents — and are kept for {metrics.retentionDays} days.</p>
+      </>}
+    </div>
+  );
 }
 
 function BackupsPanel({ onRestore }) {

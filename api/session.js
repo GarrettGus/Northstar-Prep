@@ -1,7 +1,7 @@
 import { configured, cookie, hashPassword, loginKey, randomToken, sameOrigin, token, validSession, verifyPassword } from '../server/auth.js';
 import { findUserByEmail, getMembership, rateLimit } from '../server/db.js';
 import { emailSchema } from '../shared/schema.js';
-import { beginRequest, logFailure } from '../server/observability.js';
+import { beginRequest, logFailure, observe } from '../server/observability.js';
 
 // Computed once so a login attempt against a non-existent email still runs a full
 // scrypt verification, keeping response timing close to a real wrong-password attempt.
@@ -40,4 +40,4 @@ export function createHandler(repository = {rateLimit, findUserByEmail, getMembe
     } catch (error) { logFailure(request, '/api/session', 503, error); return res.status(503).json({error: 'Login is unavailable. Check database setup.'}); }
   };
 }
-export default createHandler();
+export default observe('/api/session', createHandler());

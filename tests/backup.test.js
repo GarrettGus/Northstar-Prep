@@ -38,13 +38,14 @@ test('decryptBackup detects tampered ciphertext, a wrong auth tag and a checksum
   assert.throws(() => decryptBackup({ ...record, checksum: 'not-the-real-checksum' }));
 });
 
-test('backup API: a valid cron secret creates a backup and prunes old ones', async () => {
+test('backup API: a valid cron secret creates a backup and prunes old backups and request metrics', async () => {
   const state = { ...emptyState(), inventory: [{id:'rice',name:'Rice',quantity:2,unit:'units',category:'Food',caloriesPerUnit:0,hoursPerUnit:0,capacityPerUnit:0,price:0,gallonsPerUnit:0,target:0,store:'',emoji:'',image:'',macroTag:'',fuelType:'',purchaseDate:'',expiryDate:''}] };
-  let inserted = null, pruned = false;
+  let inserted = null, pruned = false, metricsRetention = null;
   const repository = {
     async readState() { return {data: state, version: 1}; },
     async insertBackupRecord(entry) { inserted = entry; },
     async pruneBackups() { pruned = true; },
+    async pruneRequestMetrics(days) { metricsRetention = days; },
   };
   const res = response();
   await createHandler(repository)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
@@ -53,6 +54,8 @@ test('backup API: a valid cron secret creates a backup and prunes old ones', asy
   assert.equal(inserted.status, 'success');
   assert.equal(inserted.inventoryCount, 1);
   assert.ok(pruned);
+  assert.equal(metricsRetention, 14);
+  assert.equal(res.data.metricsPruned, true);
 });
 
 test('backup API: cron creation failure while reading state is recorded and surfaced', async () => {

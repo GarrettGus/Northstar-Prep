@@ -1,6 +1,6 @@
 import { getMembership, listAuditLog } from '../server/db.js';
 import { validSession } from '../server/auth.js';
-import { beginRequest, logFailure } from '../server/observability.js';
+import { beginRequest, logFailure, observe } from '../server/observability.js';
 
 export function createHandler(repository = {getMembership, listAuditLog}, authenticate = validSession) {
   return async function handler(req, res) {
@@ -17,4 +17,4 @@ export function createHandler(repository = {getMembership, listAuditLog}, authen
     } catch (error) { logFailure(request, '/api/audit', 503, error); return res.status(503).json({error: 'Activity history is unavailable.'}); }
   };
 }
-export default createHandler();
+export default observe('/api/audit', createHandler());

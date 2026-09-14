@@ -1,7 +1,7 @@
 import { hashToken, randomToken, sameOrigin, validSession } from '../server/auth.js';
 import { createInvitation, getMembership, listMembers, listPendingInvitations, removeMember, revokeInvitation } from '../server/db.js';
 import { emailSchema, idSchema, roleSchema } from '../shared/schema.js';
-import { beginRequest, logFailure } from '../server/observability.js';
+import { beginRequest, logFailure, observe } from '../server/observability.js';
 
 const inviteLifetimeMs = 7 * 24 * 3600 * 1000;
 
@@ -51,4 +51,4 @@ export function createHandler(repository = {getMembership, listMembers, listPend
     }
   };
 }
-export default createHandler();
+export default observe('/api/members', createHandler());

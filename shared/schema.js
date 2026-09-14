@@ -5,6 +5,8 @@ const number = z.coerce.number().finite().nonnegative().max(1e9).default(0);
 export const idSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,150}$/);
 const date = z.union([z.literal(''), z.iso.date()]).default('');
 export const fuelTypes = ['', 'Propane', 'Gasoline', 'Diesel', 'Wood', 'Kerosene', 'Battery', 'Other'];
+export const categories = ['Food', 'Water', 'Medical', 'Gear', 'Fuel', 'Power'];
+export const categorySchema = z.enum(categories);
 
 export const emailSchema = z.preprocess(value => typeof value === 'string' ? value.trim().toLowerCase() : value, z.email().max(254));
 export const passwordSchema = z.string().min(8).max(200);
@@ -50,7 +52,7 @@ export const settingsInputSchema = z.preprocess(normalizeSettingsAliases, z.obje
 export const itemSchema = z.object({
   id: idSchema, name: z.string().trim().min(1).max(200), quantity: number,
   unit: z.string().max(80).default('units'),
-  category: z.enum(['Food', 'Water', 'Medical', 'Gear', 'Fuel', 'Power']).default('Gear'),
+  category: categorySchema.default('Gear'),
   caloriesPerUnit: number, hoursPerUnit: number, capacityPerUnit: number, price: number,
   gallonsPerUnit: number, target: number, store: text.default(''), emoji: z.string().max(30).default(''),
   // Legacy/offline-queued rows may still carry a base64 data URL; the server converts those to
@@ -59,6 +61,10 @@ export const itemSchema = z.object({
   macroTag: z.enum(['', 'Carbs', 'Protein', 'Fat', 'Balanced']).default(''),
   fuelType: z.enum(fuelTypes).default(''),
   purchaseDate: date, expiryDate: date,
+  // Scanned or manually entered product barcode (UPC/EAN/etc.), used for quick re-add and duplicate detection.
+  barcode: z.string().trim().max(64).regex(/^[A-Za-z0-9-]*$/).default(''),
+  // Days between replenishments; 0 means the item does not recur. Measured from purchaseDate.
+  recurringDays: z.coerce.number().int().min(0).max(3650).default(0),
 });
 export const applianceSchema = z.object({ id: idSchema, name: z.string().trim().min(1).max(200), watts: number, hours: z.coerce.number().finite().min(0).max(24), active: z.boolean().default(true) });
 export const planSchema = z.object({
@@ -71,6 +77,7 @@ export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), 
 export const backupSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable().default(null), settings: settingsInputSchema.optional() });
 export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], plan:null, settings:settingsSchema.parse({})});
 export const collectionKey = {inventory:'inventory', shopping_list:'shoppingList', appliances:'appliances'};
+const bulkQuantitySchema = z.object({mode: z.enum(['set', 'delta']), value: z.coerce.number().finite().max(1e9)});
 
 export function normalizeBackup(input, makeId) {
   if (Array.isArray(input)) input = {inventory:input};
@@ -113,6 +120,26 @@ export function applyAction(state, action) {
       const key = collectionKey[action.collection];
       const ids = new Set(action.ids.map(idSchema.parse));
       next[key] = next[key].filter(row => !ids.has(row.id));
+      return stateSchema.parse(next);
+    }
+    if (action.type === 'bulk_update') {
+      if (action.collection !== 'inventory' && action.collection !== 'shopping_list') throw new Error('Invalid bulk update.');
+      if (!Array.isArray(action.ids) || action.ids.length > 2000) throw new Error('Invalid bulk update.');
+      const key = collectionKey[action.collection];
+      const ids = new Set(action.ids.map(idSchema.parse));
+      const category = action.category === undefined ? undefined : categorySchema.parse(action.category);
+      const quantity = action.quantity === undefined ? undefined : bulkQuantitySchema.parse(action.quantity);
+      if (category === undefined && quantity === undefined) throw new Error('No changes specified.');
+      next[key] = next[key].map(row => {
+        if (!ids.has(row.id)) return row;
+        const patch = {};
+        if (category !== undefined) patch.category = category;
+        if (quantity !== undefined) {
+          const current = Number(row.quantity) || 0;
+          patch.quantity = quantity.mode === 'set' ? quantity.value : Math.max(0, current + quantity.value);
+        }
+        return itemSchema.parse({...row, ...patch});
+      });
       return stateSchema.parse(next);
     }
     if (!Object.hasOwn(collectionKey, action.collection)) throw new Error('Unknown collection.');

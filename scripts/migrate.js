@@ -68,6 +68,8 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_inventory (
   fuel_type text NOT NULL DEFAULT '',
   purchase_date text NOT NULL DEFAULT '',
   expiry_date text NOT NULL DEFAULT '',
+  barcode text NOT NULL DEFAULT '',
+  recurring_days integer NOT NULL DEFAULT 0,
   PRIMARY KEY (household_id, id)
 )`;
 await sql`CREATE TABLE IF NOT EXISTS northstar_shopping_items (
@@ -91,8 +93,15 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_shopping_items (
   fuel_type text NOT NULL DEFAULT '',
   purchase_date text NOT NULL DEFAULT '',
   expiry_date text NOT NULL DEFAULT '',
+  barcode text NOT NULL DEFAULT '',
+  recurring_days integer NOT NULL DEFAULT 0,
   PRIMARY KEY (household_id, id)
 )`;
+// Existing deployments created these tables before barcode/recurring_days existed.
+await sql`ALTER TABLE northstar_inventory ADD COLUMN IF NOT EXISTS barcode text NOT NULL DEFAULT ''`;
+await sql`ALTER TABLE northstar_inventory ADD COLUMN IF NOT EXISTS recurring_days integer NOT NULL DEFAULT 0`;
+await sql`ALTER TABLE northstar_shopping_items ADD COLUMN IF NOT EXISTS barcode text NOT NULL DEFAULT ''`;
+await sql`ALTER TABLE northstar_shopping_items ADD COLUMN IF NOT EXISTS recurring_days integer NOT NULL DEFAULT 0`;
 await sql`CREATE TABLE IF NOT EXISTS northstar_appliances (
   household_id integer NOT NULL REFERENCES northstar_household(id),
   id text NOT NULL,

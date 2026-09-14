@@ -38,6 +38,10 @@ Use the Vite preset, `npm run build`, output directory `dist`, and Node 22 or ne
 
 `npm run preview` previews the compiled frontend only; use `npm run dev` or a Vercel deployment to exercise API functionality.
 
+## Inventory management
+
+Supply Hub and Shopping List support search (name, category, store, unit), status filters (low stock, expiring, expired), multi-select and duplicate detection (matching name+category, or a matching barcode) before an item is created. Selecting items also exposes bulk actions: set a category or set/adjust quantity (by an absolute value or a +/- delta) across every selected item in one request, alongside bulk delete. Each item can carry an optional barcode, entered manually or captured with the device camera via the browser's `BarcodeDetector` API where supported (Chrome/Edge; Safari falls back to the manual field, which is always available). Items can also be marked to recur every N days from their purchase date; due items surface a "due for restock" banner with a one-tap action that queues them onto the shopping list.
+
 ## Backups and migration
 
 Export JSON from the old app and import it in **Household settings** after signing in. Supplies, shopping, appliances and the plan are retained. Existing records merge by ID. Legacy records without IDs get new ones; repeated imports of such legacy files can duplicate those records. Imports never delete records absent from the backup, and an absent/null plan preserves the current plan. File limit: 2 MB; collection limits: 2,000 supplies, 2,000 shopping items, 200 appliances.

@@ -10,14 +10,24 @@ if (!url) {
 const attempts = Number(process.env.SMOKE_TEST_ATTEMPTS) || 5;
 const delayMs = Number(process.env.SMOKE_TEST_DELAY_MS) || 5000;
 const healthUrl = new URL('/api/health', url).toString();
+// Deployments behind Vercel Authentication (Project Settings -> Deployment Protection) reject
+// unauthenticated requests before they reach the app. Vercel's "Protection Bypass for Automation"
+// feature issues a secret that this header exchanges for access; see README's staging smoke test
+// setup notes. Without it, a protected deployment cannot be smoke tested at all.
+const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function checkOnce() {
-  const response = await fetch(healthUrl, { headers: { 'cache-control': 'no-store' } });
+  const headers = { 'cache-control': 'no-store' };
+  if (bypassSecret) headers['x-vercel-protection-bypass'] = bypassSecret;
+  const response = await fetch(healthUrl, { headers });
   const body = await response.json().catch(() => null);
   if (!response.ok || body?.status !== 'ok' || body?.database !== 'ok') {
-    throw new Error(`Unhealthy response (${response.status}): ${JSON.stringify(body)}`);
+    const hint = body === null && !bypassSecret
+      ? ' (non-JSON response with no bypass secret set — this may be a Vercel Authentication interstitial rather than the app; see README)'
+      : '';
+    throw new Error(`Unhealthy response (${response.status}): ${JSON.stringify(body)}${hint}`);
   }
   return body;
 }

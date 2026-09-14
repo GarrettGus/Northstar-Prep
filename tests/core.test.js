@@ -1,14 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema } from '../shared/schema.js';
+import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema, planSchema } from '../shared/schema.js';
 import { nextReminderDueDate, effectiveReminderDueDate, isReminderOverdue, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
+import { categories } from '../shared/schema.js';
 import { token, validSession, hashPassword, verifyPassword, hashToken, randomToken, cookie, sameOrigin } from '../server/auth.js';
 import { createHandler } from '../api/hub.js';
 import { createHandler as createSessionHandler } from '../api/session.js';
 import { createHandler as createMembersHandler } from '../api/members.js';
 import { createHandler as createInviteHandler } from '../api/invite.js';
 import { createHandler as createReminderHistoryHandler } from '../api/reminder-history.js';
+import { createHandler as createReadinessHistoryHandler } from '../api/readiness-history.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
 process.env.DATABASE_URL='postgres://test-only/db';
 const item={id:'rice',name:'Rice',quantity:2,category:'Food'};
@@ -314,7 +316,7 @@ test('invite API validates tokens, enforces the invited email, and rejects accou
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',email:'invitee@example.com',password:'longenoughpw'}},success);
   assert.equal(success.code,200);assert.equal(success.data.user.id,'new-user-id');assert.match(success.headers['Set-Cookie'],/northstar=/);
 });
-import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate } from '../shared/readiness.js';
+import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds, daysUntilExpiry, expirationQueue, expirationSummary } from '../shared/readiness.js';
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{
   assert.equal(waterGallons({quantity:3.785411784,unit:'liters'}),1);
   assert.equal(waterGallons({quantity:10,unit:'bottles'}),0);
@@ -342,6 +344,269 @@ test('readiness needs scale with configurable household size and per-person rate
   assert.equal(solo.foodDays,10);assert.equal(family.foodDays,2.5);
   assert.equal(solo.dailyWaterNeed,1);assert.equal(family.dailyWaterNeed,4);
   assert.equal(solo.waterDays,8);assert.equal(family.waterDays,2);
+});
+import { supplyTemplateCatalog, templateScales, scaleTemplateQuantity, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
+test('starter template catalog has unique IDs and valid, scalable items throughout',()=>{
+  const ids=supplyTemplateCatalog.map(t=>t.id);
+  assert.ok(ids.length>0);
+  assert.equal(new Set(ids).size,ids.length);
+  for (const template of supplyTemplateCatalog) {
+    assert.ok(template.label&&template.description);
+    assert.ok(template.items.length>0);
+    assert.equal(new Set(template.items.map(i=>i.id)).size,template.items.length);
+    for (const item of template.items) {
+      assert.ok(templateScales.includes(item.scale),`${item.id} has scale ${item.scale}`);
+      assert.ok(categories.includes(item.category),`${item.id} has category ${item.category}`);
+      assert.ok(Number(item.quantity)>0);
+    }
+  }
+});
+test('every starter template produces rows the item schema accepts',()=>{
+  const settings=settingsSchema.parse({householdSize:3,survivalGoalDays:7});
+  for (const template of supplyTemplateCatalog) {
+    const backup=normalizeBackup(templateToBackup(template,settings),()=>'unused');
+    assert.equal(backup.inventory.length,template.items.length);
+    for (const row of backup.inventory) assert.doesNotThrow(()=>itemSchema.parse(row));
+  }
+});
+test('template quantities scale by household size and survival goal, and round up',()=>{
+  const small=settingsSchema.parse({householdSize:1,survivalGoalDays:3});
+  const large=settingsSchema.parse({householdSize:4,survivalGoalDays:14});
+  const perPersonPerDay={scale:'perPersonPerDay',quantity:1};
+  assert.equal(scaleTemplateQuantity(perPersonPerDay,small),3);
+  assert.equal(scaleTemplateQuantity(perPersonPerDay,large),56);
+  const perPerson={scale:'perPerson',quantity:2};
+  assert.equal(scaleTemplateQuantity(perPerson,small),2);
+  assert.equal(scaleTemplateQuantity(perPerson,large),8);
+  // A fixed line is one per household however large, and the survival goal does not touch it.
+  const fixed={scale:'fixed',quantity:1};
+  assert.equal(scaleTemplateQuantity(fixed,small),1);
+  assert.equal(scaleTemplateQuantity(fixed,large),1);
+  // Fractional lines round up rather than down, and never below one.
+  assert.equal(scaleTemplateQuantity({scale:'perPersonPerDay',quantity:0.15},large),9);
+  assert.equal(scaleTemplateQuantity({scale:'perPersonPerDay',quantity:0.01},small),1);
+});
+test('applying a starter template is non-destructive and repeatable',()=>{
+  const settings=settingsSchema.parse({householdSize:2,survivalGoalDays:7});
+  const template=findSupplyTemplate('water-and-food');
+  assert.ok(template);
+  assert.equal(findSupplyTemplate('no-such-template'),null);
+  let state=applyAction(emptyState(),{type:'add',collection:'inventory',id:'mine',item:{name:'My own rice',quantity:5,category:'Food'}});
+  const backup=normalizeBackup(templateToBackup(template,settings),()=>'unused');
+  const once=applyAction(state,{type:'import',backup});
+  // The household's own row survives untouched alongside the template's rows.
+  assert.equal(once.inventory.find(row=>row.id==='mine').quantity,5);
+  assert.equal(once.inventory.length,1+template.items.length);
+  // Applying the same template again merges by ID instead of duplicating every line.
+  const twice=applyAction(once,{type:'import',backup});
+  assert.deepEqual(twice,once);
+});
+test('a template seeds its restock target so new rows do not read as low stock',()=>{
+  const settings=settingsSchema.parse({householdSize:2,survivalGoalDays:7});
+  const backup=templateToBackup(findSupplyTemplate('first-aid'),settings);
+  for (const row of backup.inventory) assert.equal(row.target,row.quantity);
+  const stats=computeReadiness({inventory:normalizeBackup(backup,()=>'x').inventory,appliances:[]},settings);
+  assert.equal(stats.lowStock,0);
+});
+import { simulateOutage, outageResources, appliancePriorities } from '../shared/outage.js';
+const outageState={
+  inventory:[
+    {id:'w',name:'Water',category:'Water',quantity:20,unit:'gal'},
+    {id:'b',name:'Battery',category:'Power',quantity:1,capacityPerUnit:10},
+    {id:'f',name:'Propane',category:'Fuel',quantity:2,hoursPerUnit:12},
+  ],
+  appliances:[
+    {id:'fridge',name:'Fridge',watts:150,hours:24,active:true,priority:'critical'},
+    {id:'tv',name:'TV',watts:100,hours:5,active:true,priority:'low'},
+    {id:'heater',name:'Space heater',watts:1500,hours:4,active:true,priority:'normal'},
+    {id:'off',name:'Unplugged',watts:900,hours:8,active:false,priority:'low'},
+  ],
+  plan:null,
+};
+test('outage resources count usable stored power and ignore inactive appliances',()=>{
+  const settings=settingsSchema.parse({householdSize:2,batteryUsableFraction:0.5,inverterEfficiency:0.5});
+  const resources=outageResources(outageState,settings);
+  // 10 kWh nameplate derated by depth-of-discharge and inverter loss.
+  assert.equal(resources.powerKwh,2.5);
+  // Fridge 3.6 + TV 0.5 + heater 6.0 kWh/day; the unplugged 7.2 kWh device is excluded.
+  assert.equal(resources.dailyLoadKwh,10.1);
+  assert.equal(resources.waterGallons,20);
+  assert.equal(resources.fuelHours,24);
+  assert.equal(resources.dailyWaterNeed,2);
+});
+test('outage resources exclude expired water but still count fuel',()=>{
+  const settings=settingsSchema.parse({});
+  const state={inventory:[
+    {id:'w1',name:'Fresh',category:'Water',quantity:5,unit:'gal',expiryDate:'2099-01-01'},
+    {id:'w2',name:'Lapsed',category:'Water',quantity:5,unit:'gal',expiryDate:'2020-01-01'},
+    {id:'f',name:'Old propane',category:'Fuel',quantity:1,hoursPerUnit:10,expiryDate:'2020-01-01'},
+  ],appliances:[],plan:null};
+  const resources=outageResources(state,settings);
+  assert.equal(resources.waterGallons,5);
+  // Propane does not spoil, so a past date does not remove it from the drawdown.
+  assert.equal(resources.fuelHours,10);
+});
+test('outage simulation reports what runs out first and when',()=>{
+  const settings=settingsSchema.parse({householdSize:2,batteryUsableFraction:1,inverterEfficiency:1});
+  const result=simulateOutage(outageState,settings,{hours:72});
+  // Power: 10 kWh at 10.1 kWh/day ~= 23.8h. Fuel: 24h. Water: 20 gal at 2 gal/day = 240h.
+  assert.equal(result.firstExhausted.key,'power');
+  assert.ok(result.firstExhausted.runwayHours<24);
+  assert.equal(result.survives,false);
+  assert.deepEqual(result.runways.map(r=>r.key),['power','fuel','water']);
+  // The timeline ends exactly at the requested duration and never goes negative.
+  assert.equal(result.timeline.at(-1).hour,72);
+  assert.equal(result.timeline.at(-1).power,0);
+  assert.equal(result.timeline[0].water,20);
+  assert.ok(result.timeline.every(point=>point.power>=0&&point.fuel>=0&&point.water>=0));
+});
+test('a resource nothing consumes never runs out',()=>{
+  const settings=settingsSchema.parse({householdSize:2,waterGallonsPerPersonPerDay:0});
+  const result=simulateOutage({inventory:outageState.inventory,appliances:[],plan:null},settings,{hours:48});
+  // No appliances and no water need: only fuel is being drawn down, and it lasts 24 of the 48h.
+  assert.deepEqual(result.runways.map(r=>r.key),['fuel']);
+  assert.equal(result.firstExhausted.key,'fuel');
+  assert.equal(result.survives,false);
+  // Stored power and water are untouched because nothing consumes them.
+  assert.equal(result.timeline.at(-1).water,20);
+  assert.equal(result.timeline.at(-1).power,result.timeline[0].power);
+});
+test('load shedding drops least essential loads first and the hungriest within a tier',()=>{
+  const settings=settingsSchema.parse({batteryUsableFraction:1,inverterEfficiency:1});
+  const result=simulateOutage(outageState,settings,{hours:48});
+  // 10 kWh over 48h allows 5 kWh/day. Shedding the low-priority TV leaves 9.6, still too much,
+  // so the normal-priority heater goes next; the critical fridge is never shed.
+  assert.deepEqual(result.shedding.shed.map(a=>a.id),['tv','heater']);
+  assert.ok(Math.abs(result.shedding.remainingDailyLoadKwh-3.6)<1e-9);
+  // The critical fridge survived the plan, so no critical-load warning is raised.
+  assert.equal(result.shedding.shedsCritical,false);
+});
+test('load shedding warns when reaching the duration costs a critical load',()=>{
+  const settings=settingsSchema.parse({batteryUsableFraction:1,inverterEfficiency:1});
+  const state={inventory:[{id:'b',name:'Battery',category:'Power',quantity:1,capacityPerUnit:0.1}],appliances:outageState.appliances,plan:null};
+  const result=simulateOutage(state,settings,{hours:240});
+  // Every active appliance has to go, lowest priority first and critical last -- which is the
+  // warning worth surfacing, since shedding everything trivially "reaches" any duration.
+  assert.deepEqual(result.shedding.shed.map(a=>a.id),['tv','heater','fridge']);
+  assert.equal(result.shedding.shedsCritical,true);
+  assert.equal(result.shedding.remainingDailyLoadKwh,0);
+});
+test('load shedding is empty when stored power already covers the outage',()=>{
+  const settings=settingsSchema.parse({batteryUsableFraction:1,inverterEfficiency:1});
+  const result=simulateOutage(outageState,settings,{hours:12});
+  assert.deepEqual(result.shedding.shed,[]);
+  assert.equal(result.shedding.shedsCritical,false);
+});
+test('appliance priority defaults to normal and rejects unknown levels',()=>{
+  const state=applyAction(emptyState(),{type:'add',collection:'appliances',id:'fan',item:{name:'Fan',watts:50,hours:8}});
+  assert.equal(state.appliances[0].priority,'normal');
+  assert.deepEqual(appliancePriorities,['critical','high','normal','low']);
+  assert.throws(()=>applyAction(emptyState(),{type:'add',collection:'appliances',id:'fan',item:{name:'Fan',priority:'urgent'}}));
+});
+test('days until expiry counts whole local calendar days either side of today',()=>{
+  const now=new Date(2026,8,14,23,45);
+  assert.equal(daysUntilExpiry('2026-09-14',now),0);
+  assert.equal(daysUntilExpiry('2026-09-15',now),1);
+  assert.equal(daysUntilExpiry('2026-09-13',now),-1);
+  assert.equal(daysUntilExpiry('',now),null);
+  assert.equal(daysUntilExpiry('not-a-date',now),null);
+});
+test('rotation queue lists unlapsed supplies soonest first inside the 90 day horizon',()=>{
+  const now=new Date(2026,8,14);
+  const inventory=[
+    {id:'far',name:'Far',expiryDate:'2027-04-01'},
+    {id:'mid',name:'Mid',expiryDate:'2026-10-29'},
+    {id:'lapsed',name:'Lapsed',expiryDate:'2026-09-01'},
+    {id:'today',name:'Today',expiryDate:'2026-09-14'},
+    {id:'none',name:'No date',expiryDate:''},
+  ];
+  const queue=expirationQueue(inventory,now);
+  // Soonest first; already-expired, undated and beyond-horizon items are all left out.
+  assert.deepEqual(queue.map(row=>row.item.id),['today','mid']);
+  assert.deepEqual(queue.map(row=>row.daysRemaining),[0,45]);
+  // Each row is tagged with the tightest window it falls inside.
+  assert.deepEqual(queue.map(row=>row.window),[30,60]);
+});
+test('rotation windows count cumulatively so 60 days includes the first 30',()=>{
+  const now=new Date(2026,8,14);
+  const inventory=[
+    {id:'a',name:'A',expiryDate:'2026-09-20'},
+    {id:'b',name:'B',expiryDate:'2026-10-20'},
+    {id:'c',name:'C',expiryDate:'2026-12-10'},
+  ];
+  const {counts,total}=expirationSummary(inventory,now);
+  assert.equal(counts[30],1);
+  assert.equal(counts[60],2);
+  assert.equal(counts[90],3);
+  assert.equal(total,3);
+});
+test('readiness reports an expiring-soon count beside the existing expired count',()=>{
+  const settings=settingsSchema.parse({});
+  const soon=new Date(Date.now()+20*86400000);
+  const iso=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const inventory=[{id:'a',name:'A',category:'Food',quantity:1,expiryDate:iso(soon)},{id:'b',name:'B',category:'Food',quantity:1,expiryDate:'2020-01-01'}];
+  const stats=computeReadiness({inventory,appliances:[]},settings);
+  assert.equal(stats.expiringSoon,1);
+  assert.equal(stats.expired,1);
+});
+test('readiness falls back to household size until a member opts in',()=>{
+  const settings=settingsSchema.parse({householdSize:4});
+  const plan=planSchema.parse({family:[{name:'Ada',role:'Adult',dob:''},{name:'Baz',role:'Child',dob:''}]});
+  // Two members recorded but no figures given: the flat householdSize math still applies, so an
+  // existing household that only ever wrote down names sees no change to its numbers.
+  const needs=householdNeeds(plan,settings);
+  assert.equal(needs.mode,'household');
+  assert.equal(needs.dailyCalorieNeed,8000);
+  assert.equal(needs.dailyWaterNeed,4);
+  assert.deepEqual(householdNeeds(null,settings),needs);
+  const inventory=[{category:'Food',quantity:10,caloriesPerUnit:2000,name:'Rice'}];
+  assert.equal(computeReadiness({inventory,appliances:[],plan},settings).foodDays,2.5);
+});
+test('readiness sums per-member and pet needs once any member carries its own figures',()=>{
+  const settings=settingsSchema.parse({householdSize:4});
+  const plan=planSchema.parse({family:[
+    {name:'Ada',role:'Adult',dob:'',caloriesPerDay:2400,waterGallonsPerDay:1.5},
+    {name:'Baz',role:'Toddler',dob:'',caloriesPerDay:1200},
+    {name:'Cy',role:'Adult',dob:''},
+    {name:'Rex',role:'Dog',dob:'',kind:'pet',caloriesPerDay:700,waterGallonsPerDay:0.25},
+  ]});
+  const needs=householdNeeds(plan,settings);
+  assert.equal(needs.mode,'members');
+  assert.equal(needs.people,3);
+  assert.equal(needs.pets,1);
+  // Ada 2400 + Baz 1200 + Cy at the 2000 default + Rex 700; householdSize 4 is ignored entirely.
+  assert.equal(needs.dailyCalorieNeed,6300);
+  // Ada 1.5 + Baz at the 1 gal default + Cy 1 + Rex 0.25.
+  assert.equal(needs.dailyWaterNeed,3.75);
+  const stats=computeReadiness({inventory:[],appliances:[],plan},settings);
+  assert.equal(stats.needsMode,'members');
+  assert.equal(stats.dailyCalorieNeed,6300);
+});
+test('a pet with no figures counts for nothing but still switches on per-member mode',()=>{
+  const settings=settingsSchema.parse({householdSize:2});
+  const plan=planSchema.parse({family:[{name:'Ada',role:'Adult',dob:''},{name:'Rex',role:'Dog',dob:'',kind:'pet'}]});
+  const needs=householdNeeds(plan,settings);
+  assert.equal(needs.mode,'members');
+  // One person at the defaults; the pet contributes nothing until its own figures are entered.
+  assert.equal(needs.dailyCalorieNeed,2000);
+  assert.equal(needs.dailyWaterNeed,1);
+});
+test('member figures round-trip blank, zero and null distinctly',()=>{
+  const parsed=planSchema.parse({family:[
+    {name:'Ada',role:'',dob:''},
+    {name:'Baz',role:'',dob:'',caloriesPerDay:0,waterGallonsPerDay:0},
+    {name:'Cy',role:'',dob:'',caloriesPerDay:null,waterGallonsPerDay:null},
+  ]});
+  assert.equal(parsed.family[0].caloriesPerDay,'');
+  assert.equal(parsed.family[0].kind,'person');
+  // An explicit zero is a real figure and must not collapse back into "use the default".
+  assert.equal(parsed.family[1].caloriesPerDay,0);
+  // A NULL database column reads back as blank, not as zero.
+  assert.equal(parsed.family[2].caloriesPerDay,'');
+  const settings=settingsSchema.parse({householdSize:3});
+  assert.equal(householdNeeds(parsed,settings).dailyCalorieNeed,2000+0+2000);
+  assert.throws(()=>planSchema.parse({family:[{name:'A',role:'',dob:'',kind:'robot'}]}));
+  assert.throws(()=>planSchema.parse({family:[{name:'A',role:'',dob:'',caloriesPerDay:-5}]}));
 });
 test('readiness guards against divide-by-zero when per-person needs are zero',()=>{
   const inventory=[{category:'Food',quantity:5,caloriesPerUnit:500,name:'Bar'}];
@@ -484,6 +749,29 @@ test('API records reminder completion and snooze history, but not plain field ed
   assert.equal(historyEvents.length,2);
   assert.equal(historyEvents[1].event,'snoozed');
   assert.equal(historyEvents[1].eventDate,'2026-02-10');
+});
+test('readiness history API enforces membership, method and returns entries',async()=>{
+  const entries=[{day:'2026-09-01',waterDays:3.5,foodDays:7,powerDays:1.2,fuelHours:24,itemCount:12,lowStock:2,expired:1}];
+  const repository={async getMembership(){return {role:'member'};},async listReadinessHistory(){return entries;}};
+  const ok=response();
+  await createReadinessHistoryHandler(repository,()=>({userId:'user-1'}))({method:'GET',headers:{}},ok);
+  assert.equal(ok.code,200);assert.deepEqual(ok.data.entries,entries);
+
+  const denied=response();
+  await createReadinessHistoryHandler({...repository,async getMembership(){return undefined;}},()=>({userId:'user-1'}))({method:'GET',headers:{}},denied);
+  assert.equal(denied.code,403);
+
+  const unauthed=response();
+  await createReadinessHistoryHandler(repository,()=>false)({method:'GET',headers:{}},unauthed);
+  assert.equal(unauthed.code,401);
+
+  const wrongMethod=response();
+  await createReadinessHistoryHandler(repository,()=>({userId:'user-1'}))({method:'POST',headers:{}},wrongMethod);
+  assert.equal(wrongMethod.code,405);
+
+  const broken=response();
+  await createReadinessHistoryHandler({...repository,async listReadinessHistory(){throw new Error('down');}},()=>({userId:'user-1'}))({method:'GET',headers:{}},broken);
+  assert.equal(broken.code,503);
 });
 test('reminder history API enforces membership and returns entries',async()=>{
   const entries=[{reminderId:'r1',reminderTitle:'Rotate water',category:'Water Rotation',event:'completed',eventDate:'2026-02-01',createdAt:'2026-02-01T00:00:00Z',actorEmail:'a@example.com'}];

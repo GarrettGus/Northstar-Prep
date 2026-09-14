@@ -72,6 +72,13 @@ export function metricsRetentionDays() {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : 14;
 }
 
+// Readiness history is aggregate-only, so it is worth keeping far longer than request metrics:
+// its whole point is showing whether a household is more prepared than it was months ago.
+export function readinessRetentionDays() {
+  const value = Number(process.env.READINESS_HISTORY_RETENTION_DAYS);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 365;
+}
+
 async function postAlert(payload) {
   const { webhook } = alertPolicy();
   if (!webhook) return false;

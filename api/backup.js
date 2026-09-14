@@ -1,8 +1,10 @@
 import { validSession, sameOrigin } from '../server/auth.js';
-import { readState, getMembership, insertBackupRecord, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics } from '../server/db.js';
+import { readState, getMembership, insertBackupRecord, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory } from '../server/db.js';
 import { backupsConfigured, encryptBackup, decryptBackup } from '../server/backupCrypto.js';
 import { stateSchema, backupSchema } from '../shared/schema.js';
-import { beginRequest, logFailure, logIssue, metricsRetentionDays, observe } from '../server/observability.js';
+import { beginRequest, logFailure, logIssue, metricsRetentionDays, readinessRetentionDays, observe } from '../server/observability.js';
+import { computeReadiness } from '../shared/readiness.js';
+import { todayLocal } from '../shared/reminders.js';
 
 const retainCount = 30;
 
@@ -13,7 +15,7 @@ function isCronRequest(req) {
   return Boolean(secret) && req.headers.authorization === `Bearer ${secret}`;
 }
 
-export function createHandler(repository = {readState, getMembership, insertBackupRecord, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics}, authenticate = validSession) {
+export function createHandler(repository = {readState, getMembership, insertBackupRecord, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory}, authenticate = validSession) {
   return async function handler(req, res) {
     const request = beginRequest(req, res);
     res.setHeader('Cache-Control', 'no-store');
@@ -37,7 +39,21 @@ export function createHandler(repository = {readState, getMembership, insertBack
         let metricsPruned = true;
         try { await repository.pruneRequestMetrics(metricsRetentionDays()); }
         catch (error) { metricsPruned = false; logIssue(request, '/api/backup', 'metrics_prune_failure', error); }
-        return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length, metricsPruned});
+        // The same run records the day's readiness snapshot, for the same reason: the Hobby plan
+        // allows one scheduled run a day, so this is the only cron there is. A snapshot failure
+        // must never fail the backup the cron exists for, so it is logged and reported instead.
+        let readinessRecorded = true;
+        try {
+          const stats = computeReadiness(state, state.settings);
+          await repository.recordReadinessSnapshot({
+            day: todayLocal(),
+            waterDays: stats.waterDays, foodDays: stats.foodDays, powerDays: stats.powerDays,
+            fuelHours: stats.totalFuelHours, itemCount: state.inventory.length,
+            lowStock: stats.lowStock, expired: stats.expired,
+          });
+          await repository.pruneReadinessHistory(readinessRetentionDays());
+        } catch (error) { readinessRecorded = false; logIssue(request, '/api/backup', 'readiness_snapshot_failure', error); }
+        return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length, metricsPruned, readinessRecorded});
       } catch (error) {
         logFailure(request, '/api/backup', 500, error);
         return res.status(500).json({status: 'failed', error: error.message});

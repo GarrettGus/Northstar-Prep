@@ -8,8 +8,10 @@ import {
   Siren, SearchCheck, Power, Tag, Calendar, ArrowUpDown
 } from 'lucide-react';
 import { request } from './api.js';
-import { computeReadiness, computeReadinessGaps, isExpired, isRecurringDue } from '../shared/readiness.js';
+import { computeReadiness, computeReadinessGaps, isExpired, isRecurringDue, expirationQueue } from '../shared/readiness.js';
 import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
+import { simulateOutage, appliancePriorities, appliancePriorityLabels } from '../shared/outage.js';
+import { supplyTemplateCatalog, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
 import { effectiveReminderDueDate, isReminderOverdue, todayLocal, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
 import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
@@ -17,14 +19,6 @@ import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, sav
 // --- Constants ---
 const SYSTEM_ID = 'Household';
 const progressPercent = (value, goal) => goal > 0 ? (value / goal) * 100 : 0;
-
-// The emergency drill remains unavailable until an authenticated server endpoint is configured.
-// Meal planning, gap analysis and item/appliance suggestions no longer need one: gap analysis is
-// computed deterministically (see computeReadinessGaps), and the others were removed rather than
-// left as dead buttons.
-async function callGemini() {
-  throw new Error('AI is not configured.');
-}
 
 // --- Main App Component ---
 export default function App() {
@@ -42,11 +36,11 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [showSyncModal, setShowSyncModal] = useState(false);
   const [showBinder, setShowBinder] = useState(false);
-  const [aiContent, setAiContent] = useState(null);
-  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [outage, setOutage] = useState(null);
   const [globalError, setGlobalError] = useState(null);
   const [settings, setSettings] = useState(() => settingsSchema.parse({}));
   const [pendingImport, setPendingImport] = useState(null);
+  const [pendingImportSource, setPendingImportSource] = useState(null);
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
   const [online, setOnline] = useState(() => typeof navigator === 'undefined' ? true : navigator.onLine);
   const [pendingSync, setPendingSync] = useState(() => loadQueuedActions().length);
@@ -152,15 +146,32 @@ export default function App() {
       if(file.size>2_000_000)throw new Error('Backup must be smaller than 2 MB.');
       const backup=normalizeBackup(JSON.parse(await file.text()),()=>crypto.randomUUID());
       setPendingImport(backup);
+      setPendingImportSource({kind:'backup'});
       setGlobalError(null);
     } catch(error){setGlobalError(`Import failed: ${error.message}`);}
   };
+  // Starter templates go through the same non-destructive preview as a JSON backup, so nothing
+  // is written until it is confirmed and existing rows merge by ID rather than being replaced.
+  const previewTemplate = (templateId) => {
+    const template = findSupplyTemplate(templateId);
+    if (!template) return;
+    try {
+      setPendingImport(normalizeBackup(templateToBackup(template, settings), () => crypto.randomUUID()));
+      setPendingImportSource({kind:'template', label: template.label});
+      setGlobalError(null);
+    } catch(error){setGlobalError(`Template failed: ${error.message}`);}
+  };
+  const cancelImport = () => { setPendingImport(null); setPendingImportSource(null); };
   const confirmImport = async () => {
     if (!pendingImport) return false;
     if (!await mutate({type:'import',backup:pendingImport})) return false;
+    const wasTemplate = pendingImportSource?.kind === 'template';
     setPendingImport(null);
+    setPendingImportSource(null);
     setShowSyncModal(false);
-    alert('Backup imported. Existing records were merged by ID.');
+    alert(wasTemplate
+      ? 'Starter supplies added. Adjust the quantities to what your household actually keeps.'
+      : 'Backup imported. Existing records were merged by ID.');
     return true;
   };
   const restoreFromBackup = async (id) => {
@@ -172,7 +183,7 @@ export default function App() {
   };
 
   // --- Logic Helpers ---
-  const stats = useMemo(() => computeReadiness({ inventory, appliances }, settings), [inventory, appliances, settings]);
+  const stats = useMemo(() => computeReadiness({ inventory, appliances, plan }, settings), [inventory, appliances, plan, settings]);
   const gaps = useMemo(() => computeReadinessGaps(stats, settings), [stats, settings]);
   const overdueReminders = useMemo(() => reminders.filter(r => isReminderOverdue(r)), [reminders]);
   const handleUpdateSettings = (next) => mutate({ type: 'settings', settings: next });
@@ -186,18 +197,10 @@ export default function App() {
     return Promise.resolve(false);
   };
 
-  const generateDrill = async () => {
-    setIsAiLoading(true);
-    const familyNames = plan?.family?.map(f => f.name).join(', ') || "the family";
-    const shelter = plan?.shelterSpot || "basement";
-    const prompt = `Create a realistic 10-minute emergency drill scenario for a family in suburban Minnesota (Winter). Family: ${familyNames}. Safe spot: ${shelter}. Scenario: Severe blizzard with power loss or tornado siren. Give 3 immediate action steps for the household to practice.`;
-    try {
-      const result = await callGemini(prompt);
-      setAiContent({ title: "🚨 AI Emergency Drill", text: result });
-    } catch (e) {
-      setAiContent({ title: "Error", text: e.message });
-    }
-    setIsAiLoading(false);
+  // Replaces the old "Run Emergency Simulation" AI stub: the same question answered as plain
+  // arithmetic over what the household has actually recorded, so it works offline.
+  const runOutageSimulation = (hours) => {
+    setOutage(simulateOutage({inventory, appliances, plan}, settings, {hours}));
   };
 
   const handleAdd = (collection,item) => mutate({type:'add',collection,id:crypto.randomUUID(),item});
@@ -241,7 +244,7 @@ export default function App() {
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
-        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} onViewReminders={() => setActiveTab('plan')} />}
+        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} onViewReminders={() => setActiveTab('plan')} onViewRotation={() => setActiveTab('inventory')} />}
         {activeTab === 'inventory' && (
           <InventoryManager
             title="Supply Hub"
@@ -284,7 +287,7 @@ export default function App() {
         )}
         {activeTab === 'plan' && (
           <EmergencyPlan
-            plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunDrill={generateDrill} isAiLoading={isAiLoading}
+            plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunSimulation={runOutageSimulation} settings={settings}
             onOpenBinder={() => setShowBinder(true)}
             reminders={reminders} checklistChecks={checklistChecks}
             onAddReminder={(i) => handleAdd('reminders', i)}
@@ -299,20 +302,31 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
-      {aiContent && <AiModal content={aiContent} onClose={() => setAiContent(null)} />}
+      {showSyncModal && <SyncModal onClose={() => { cancelImport(); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} pendingImportSource={pendingImportSource} onConfirmImport={confirmImport} onCancelImport={cancelImport} onApplyTemplate={previewTemplate} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
+      {outage && <OutageSimulationModal result={outage} settings={settings} onClose={() => setOutage(null)} />}
     </div>
   );
 }
 
 // --- Dashboard ---
-function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueReminders = [], onViewReminders }) {
+function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueReminders = [], onViewReminders, onViewRotation }) {
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       {overdueReminders.length > 0 && (
         <button onClick={onViewReminders} className="w-full flex items-center justify-between gap-3 bg-red-50 border border-red-100 rounded-2xl px-4 py-3 text-sm text-left active:scale-95 transition-all">
           <span className="flex items-center gap-2 font-bold text-red-800"><AlertOctagon size={16}/> {overdueReminders.length} overdue maintenance {overdueReminders.length > 1 ? 'reminders' : 'reminder'}</span>
           <ChevronRight size={16} className="text-red-400"/>
+        </button>
+      )}
+      {(stats.expiringSoon > 0 || stats.expired > 0) && (
+        <button onClick={onViewRotation} className="w-full flex items-center justify-between gap-3 bg-orange-50 border border-orange-100 rounded-2xl px-4 py-3 text-sm text-left active:scale-95 transition-all">
+          <span className="flex items-center gap-2 font-bold text-orange-800">
+            <Calendar size={16}/>
+            {stats.expiringSoon > 0 && <>{stats.expiringSoon} item{stats.expiringSoon === 1 ? '' : 's'} expiring within 90 days</>}
+            {stats.expiringSoon > 0 && stats.expired > 0 && <> · </>}
+            {stats.expired > 0 && <>{stats.expired} already expired</>}
+          </span>
+          <ChevronRight size={16} className="text-orange-400"/>
         </button>
       )}
       <div className="grid grid-cols-2 gap-4">
@@ -333,9 +347,22 @@ function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueRemin
             <ProgressBar label={`Power (Goal: ${settings.powerGoalKwh} kWh)`} percent={progressPercent(stats.totalPowerKwh, settings.powerGoalKwh)} color="bg-violet-500" />
           </div>
           <p className="mt-5 text-[10px] leading-relaxed text-slate-400">
-            Assumes {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} needing {settings.caloriesPerPersonPerDay.toLocaleString()} kcal
-            and {settings.waterGallonsPerPersonPerDay} gal water per person/day ({stats.dailyCalorieNeed.toLocaleString()} kcal
-            and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household). Stored power counts {Math.round(settings.batteryUsableFraction * 100)}%
+            {stats.needsMode === 'members' ? (
+              <>
+                Adds up each household member's own needs: {stats.people} {stats.people === 1 ? 'person' : 'people'}
+                {stats.pets > 0 && <> and {stats.pets} {stats.pets === 1 ? 'pet' : 'pets'}</>} in the Family Hub
+                ({stats.dailyCalorieNeed.toLocaleString()} kcal and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household).
+                Members left blank count at {settings.caloriesPerPersonPerDay.toLocaleString()} kcal and {settings.waterGallonsPerPersonPerDay} gal;
+                a pet counts for nothing until you enter its figures. Edit members in the Family Hub.
+              </>
+            ) : (
+              <>
+                Assumes {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} needing {settings.caloriesPerPersonPerDay.toLocaleString()} kcal
+                and {settings.waterGallonsPerPersonPerDay} gal water per person/day ({stats.dailyCalorieNeed.toLocaleString()} kcal
+                and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household). Give a member their own figures in the Family Hub
+                to count everyone individually instead.
+              </>
+            )} Stored power counts {Math.round(settings.batteryUsableFraction * 100)}%
             usable capacity after a {Math.round(settings.inverterEfficiency * 100)}% efficient inverter conversion.
             Edit these in Household settings.
           </p>
@@ -343,7 +370,81 @@ function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueRemin
       </div>
 
       <ReadinessGaps gaps={gaps} onAddShortfall={onAddGapShortfall} />
+      <ReadinessTrend settings={settings} />
     </div>
+  );
+}
+
+// Progress over time, from the daily snapshot the backup cron records (see api/backup.js).
+// Aggregate figures only, so nothing here reveals what the household actually keeps.
+function ReadinessTrend({ settings }) {
+  const [entries, setEntries] = useState(null);
+  const [error, setError] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    request('readiness-history')
+      .then(data => { if (!cancelled) setEntries(data.entries || []); })
+      .catch(err => { if (!cancelled) setError(err.message); });
+    return () => { cancelled = true; };
+  }, []);
+
+  if (error) return null;
+  if (entries === null) return null;
+  if (entries.length < 2) {
+    return (
+      <section className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm">
+        <h3 className="text-[10px] font-black uppercase tracking-widest text-slate-600 mb-2">Readiness over time</h3>
+        <p className="text-xs text-slate-500 leading-relaxed">
+          A snapshot is recorded once a day. {entries.length === 0 ? 'The first one will appear after the next daily run.' : 'Come back tomorrow to see a trend.'}
+        </p>
+      </section>
+    );
+  }
+
+  const first = entries[0];
+  const latest = entries.at(-1);
+  const series = [
+    {key: 'waterDays', label: 'Water days', color: 'bg-blue-500'},
+    {key: 'foodDays', label: 'Food days', color: 'bg-emerald-500'},
+    {key: 'powerDays', label: 'Power days', color: 'bg-violet-500'},
+  ];
+  const peak = Math.max(settings.survivalGoalDays, ...entries.flatMap(entry => series.map(item => Number(entry[item.key]) || 0)));
+
+  return (
+    <section className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-4">
+      <div className="flex items-baseline justify-between gap-3">
+        <h3 className="text-[10px] font-black uppercase tracking-widest text-slate-600">Readiness over time</h3>
+        <span className="text-[10px] font-bold text-slate-500">{entries.length} days</span>
+      </div>
+      {series.map(item => {
+        const from = Number(first[item.key]) || 0;
+        const to = Number(latest[item.key]) || 0;
+        const change = to - from;
+        return (
+          <div key={item.key} className="space-y-1">
+            <div className="flex items-baseline justify-between gap-3 text-xs">
+              <span className="font-bold text-slate-700">{item.label}</span>
+              <span className="font-bold text-slate-700">
+                {to.toFixed(1)}
+                <span className={`ml-2 font-black ${change > 0.05 ? 'text-emerald-600' : change < -0.05 ? 'text-red-600' : 'text-slate-400'}`}>
+                  {change > 0.05 ? '▲' : change < -0.05 ? '▼' : '—'} {Math.abs(change).toFixed(1)}
+                </span>
+              </span>
+            </div>
+            <div className="flex items-end gap-px h-8" role="img" aria-label={`${item.label}: ${from.toFixed(1)} ${entries.length} days ago, ${to.toFixed(1)} now`}>
+              {entries.map(entry => (
+                <div key={entry.day} className="flex-1 bg-slate-100 rounded-sm flex items-end" style={{height: '100%'}}>
+                  <div className={`w-full ${item.color} rounded-sm`} style={{height: `${peak > 0 ? Math.min(100, ((Number(entry[item.key]) || 0) / peak) * 100) : 0}%`}} />
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      <p className="text-[10px] text-slate-500 leading-relaxed">
+        Recorded once a day alongside the encrypted backup. Aggregate figures only — no item details are kept in this history.
+      </p>
+    </section>
   );
 }
 
@@ -403,9 +504,9 @@ function ReadinessGaps({ gaps, onAddShortfall }) {
 function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingId, setEditingId] = useState(null);
-  const [form, setForm] = useState({ name: '', watts: '', hours: '', active: true });
+  const [form, setForm] = useState({ name: '', watts: '', hours: '', active: true, priority: 'normal' });
 
-  const reset = () => { setForm({ name: '', watts: '', hours: '', active: true }); setEditingId(null); setShowAdd(false); };
+  const reset = () => { setForm({ name: '', watts: '', hours: '', active: true, priority: 'normal' }); setEditingId(null); setShowAdd(false); };
 
   const submit = async (e) => {
     e.preventDefault();
@@ -454,6 +555,13 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
                 <div className="col-span-2"><Label>Device Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Fridge" /></div>
                 <div><Label>Watts (Running)</Label><Input val={form.watts} set={v => setForm({...form, watts: v})} type="number" placeholder="150" /></div>
                 <div><Label>Hours/Day</Label><Input val={form.hours} set={v => setForm({...form, hours: v})} type="number" placeholder="24" /></div>
+                <div className="col-span-2">
+                  <Label>Outage priority</Label>
+                  <select aria-label="Outage priority" value={form.priority || 'normal'} onChange={e => setForm({...form, priority: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold text-slate-700">
+                    {appliancePriorities.map(level => <option key={level} value={level}>{appliancePriorityLabels[level]}</option>)}
+                  </select>
+                  <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">Lowest priority loads are shed first when the outage simulator works out what to turn off.</p>
+                </div>
              </div>
              <button type="submit" className="w-full bg-violet-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl active:bg-violet-700 transition-colors mt-2">
                {editingId ? 'Update Device' : 'Add to Load'}
@@ -476,7 +584,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
                 <div onClick={() => handleEdit(app)} className="cursor-pointer">
                    <h4 className="font-black text-slate-800 leading-tight">{app.name}</h4>
                    <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
-                    {app.watts}W • {app.hours} hrs/day • {((app.watts * app.hours)/1000).toFixed(2)} kWh
+                    {app.watts}W • {app.hours} hrs/day • {((app.watts * app.hours)/1000).toFixed(2)} kWh • {appliancePriorityLabels[app.priority || 'normal']} priority
                    </p>
                 </div>
              </div>
@@ -559,6 +667,14 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
   const handleEdit = (item) => { setForm(item); setEditingItem(item); setShowAdd(true); window.scrollTo({ top: 0, behavior: 'smooth' }); };
 
   const totalShopCost = useMemo(() => items.reduce((acc, i) => acc + (Number(i.price||0) * Number(i.quantity||0)), 0), [items]);
+
+  // Supplies that have not lapsed yet but will within 90 days, soonest first. Items already on
+  // the shopping list are left out so "replace" does not queue a second copy of the same thing.
+  const rotationQueue = useMemo(() => {
+    if (isShoppingMode) return [];
+    return expirationQueue(items).filter(row => !shoppingList.some(existing =>
+      existing.category === row.item.category && String(existing.name || '').trim().toLowerCase() === String(row.item.name || '').trim().toLowerCase()));
+  }, [items, shoppingList, isShoppingMode]);
 
   const dueRecurringItems = useMemo(() => {
     if (isShoppingMode) return [];
@@ -656,6 +772,28 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
           <span className="font-bold text-amber-800">{dueRecurringItems.length} item{dueRecurringItems.length > 1 ? 's' : ''} due for restock</span>
           <button aria-label="Add due recurring items to shopping list" onClick={async () => { if (await onRestock(dueRecurringItems)) alert('Added due items to your shopping list.'); }} className="text-amber-700 font-black">Add to shopping list</button>
         </div>
+      )}
+
+      {rotationQueue.length > 0 && (
+        <section aria-labelledby="rotation-queue-heading" className="bg-orange-50 border border-orange-100 rounded-2xl px-4 py-3 mb-4 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <h3 id="rotation-queue-heading" className="text-[10px] font-black uppercase tracking-widest text-orange-800 flex items-center gap-2"><Calendar size={12}/> Rotation queue — use these first</h3>
+            <button aria-label="Add every item in the rotation queue to the shopping list" onClick={async () => { if (await onRestock(rotationQueue.map(row => row.item))) alert('Queued replacements onto your shopping list.'); }} className="text-orange-700 font-black text-[10px] uppercase">Replace all</button>
+          </div>
+          <ul className="space-y-2">
+            {rotationQueue.map(({ item, daysRemaining, window: windowDays }) => (
+              <li key={item.id} className="flex items-center justify-between gap-3 text-sm">
+                <span className="font-bold text-slate-700 truncate">
+                  {item.name}
+                  <span className="ml-2 text-[9px] font-black uppercase bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded">
+                    {daysRemaining === 0 ? 'Today' : `${daysRemaining}d`} · ≤{windowDays}d
+                  </span>
+                </span>
+                <button aria-label={`Queue a replacement for ${item.name}`} onClick={async () => { if (await onRestock([item])) alert(`Queued a replacement for ${item.name}.`); }} className="text-orange-700 font-black text-[10px] uppercase shrink-0">Replace</button>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
 
       {showAdd && (
@@ -791,32 +929,44 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
 function FamilyMembersSection({ family, isEditing, onChange }) {
   const updateMember = (i, patch) => onChange(family.map((m, idx) => idx === i ? { ...m, ...patch } : m));
   const removeMember = (i) => onChange(family.filter((_, idx) => idx !== i));
-  const addMember = () => onChange([...family, { name: '', role: '', dob: '' }]);
+  const addMember = (kind) => onChange([...family, { name: '', role: kind === 'pet' ? 'Pet' : '', dob: '', kind, caloriesPerDay: '', waterGallonsPerDay: '' }]);
   return (
     <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
       <div className="flex justify-between items-center mb-6">
         <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest">Household Tracking</h3>
-        {isEditing && <button type="button" onClick={addMember} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add member</button>}
+        {isEditing && (
+          <div className="flex items-center gap-3">
+            <button type="button" onClick={() => addMember('person')} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add person</button>
+            <button type="button" onClick={() => addMember('pet')} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add pet</button>
+          </div>
+        )}
       </div>
       {family.length === 0 && !isEditing && <p className="text-xs text-slate-500 font-bold">No household members added yet.</p>}
       <div className="space-y-4">
         {family.map((m, i) => isEditing ? (
           <div key={i} className="bg-slate-50 rounded-2xl p-4 space-y-3 border border-slate-100">
             <div className="flex justify-between items-center">
-              <span className="text-[10px] font-black uppercase text-slate-500">Member {i + 1}</span>
+              <span className="text-[10px] font-black uppercase text-slate-500">{m.kind === 'pet' ? 'Pet' : 'Person'} {i + 1}</span>
               <button type="button" aria-label={`Remove ${m.name || 'member'}`} onClick={() => removeMember(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div><Label>Name</Label><Input val={m.name} set={v => updateMember(i, { name: v })} /></div>
-              <div><Label>Role</Label><Input val={m.role} set={v => updateMember(i, { role: v })} placeholder="Adult, Child, Pet…" /></div>
-              <div className="col-span-2"><Label>Date of birth</Label><Input val={m.dob} set={v => updateMember(i, { dob: v })} type="date" /></div>
+              <div><Label>Role</Label><Input val={m.role} set={v => updateMember(i, { role: v })} placeholder={m.kind === 'pet' ? 'Dog, Cat…' : 'Adult, Child…'} /></div>
+              <div className="col-span-2"><Label>{m.kind === 'pet' ? 'Date of birth (optional)' : 'Date of birth'}</Label><Input val={m.dob} set={v => updateMember(i, { dob: v })} type="date" /></div>
+              <div><Label>Calories per day</Label><Input val={m.caloriesPerDay ?? ''} set={v => updateMember(i, { caloriesPerDay: v })} type="number" placeholder={m.kind === 'pet' ? 'e.g. 700' : 'Household default'} /></div>
+              <div><Label>Water gal per day</Label><Input val={m.waterGallonsPerDay ?? ''} set={v => updateMember(i, { waterGallonsPerDay: v })} type="number" placeholder={m.kind === 'pet' ? 'e.g. 0.25' : 'Household default'} /></div>
             </div>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              {m.kind === 'pet'
+                ? 'Enter what this animal actually eats and drinks — a pet with blank figures counts for nothing in readiness.'
+                : 'Leave blank to count this person at the household defaults from Household settings.'}
+            </p>
           </div>
         ) : (
           <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-4 last:border-0 last:pb-0">
              <div className="flex items-center gap-4">
                 <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-3xl flex items-center justify-center font-black text-xl">{m.name[0]}</div>
-                <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-600 font-bold uppercase">{m.role} • {m.dob}</div></div>
+                <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-600 font-bold uppercase">{[m.role, m.dob, m.kind === 'pet' ? 'Pet' : ''].filter(Boolean).join(' • ')}</div></div>
              </div>
              {m.role === 'Child' && <div className="bg-indigo-50 text-indigo-700 text-[9px] font-black uppercase px-3 py-1 rounded-full">Priority</div>}
           </div>
@@ -889,7 +1039,7 @@ function ContactsSection({ contacts, isEditing, onChange }) {
   );
 }
 
-function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, onOpenBinder, reminders = [], checklistChecks = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem }) {
+function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder, reminders = [], checklistChecks = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem }) {
   const [isEditing, setIsEditing] = useState(false);
   const [spot, setSpot] = useState(plan?.shelterSpot || '');
   const [family, setFamily] = useState(plan?.family || []);
@@ -910,7 +1060,14 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, onOpenBinder, 
   const cancelEditing = () => { resetFromPlan(); setSaveError(null); setIsEditing(false); };
   const saveEditing = async () => {
     setSaveError(null);
-    const cleanedFamily = family.map(m => ({ name: (m.name || '').trim(), role: (m.role || '').trim(), dob: (m.dob || '').trim() }));
+    const cleanedFamily = family.map(m => ({
+      name: (m.name || '').trim(), role: (m.role || '').trim(), dob: (m.dob || '').trim(),
+      kind: m.kind === 'pet' ? 'pet' : 'person',
+      // A blank field stays blank rather than becoming 0: it means "use the household default"
+      // for a person and "not counted yet" for a pet (see householdNeeds in shared/readiness.js).
+      caloriesPerDay: String(m.caloriesPerDay ?? '').trim() === '' ? '' : Number(m.caloriesPerDay),
+      waterGallonsPerDay: String(m.waterGallonsPerDay ?? '').trim() === '' ? '' : Number(m.waterGallonsPerDay),
+    }));
     const cleanedContacts = contacts.map(c => ({ name: (c.name || '').trim(), phone: (c.phone || '').trim(), type: (c.type || '').trim() }));
     // A row with some fields filled in but no name (family) or no name/phone (contacts) is
     // refused rather than silently dropped below — only a row nothing was ever typed into
@@ -921,7 +1078,7 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, onOpenBinder, 
       const ok = await onUpdate({
         ...plan,
         shelterSpot: spot,
-        family: cleanedFamily.filter(m => m.name || m.role || m.dob),
+        family: cleanedFamily.filter(m => m.name || m.role || m.dob || m.caloriesPerDay !== '' || m.waterGallonsPerDay !== ''),
         contacts: cleanedContacts.filter(c => c.name || c.phone || c.type),
         meetingPoints: { primary: meetingPrimary.trim(), secondary: meetingSecondary.trim() },
       });
@@ -947,10 +1104,20 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, onOpenBinder, 
       </div>
       {saveError && <p role="alert" className="text-xs font-bold text-red-600 px-1">{saveError}</p>}
 
-      <button onClick={onRunDrill} disabled={isAiLoading} className="w-full bg-indigo-50 text-indigo-700 py-4 rounded-[2.5rem] flex items-center justify-center gap-2 font-black text-xs uppercase tracking-widest border border-indigo-100 active:scale-95 transition-all">
-        {isAiLoading ? <RefreshCw className="animate-spin" size={16}/> : <Siren size={16}/>}
-        Run Emergency Simulation
-      </button>
+      <div className="bg-indigo-50 border border-indigo-100 rounded-[2.5rem] p-6 space-y-3">
+        <h3 className="text-[10px] font-black uppercase tracking-widest text-indigo-700 flex items-center gap-2"><Siren size={14}/> Outage simulator</h3>
+        <p className="text-[11px] text-slate-600 leading-relaxed">
+          Draws your stored power, heating fuel and water down over an outage of a given length, using the figures
+          you have recorded. Runs entirely on this device.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {[24, 72, settings.survivalGoalDays * 24].map(hours => (
+            <button key={hours} onClick={() => onRunSimulation(hours)} className="px-4 py-2.5 rounded-2xl bg-white border border-indigo-200 text-indigo-700 text-[10px] font-black uppercase tracking-widest active:scale-95 transition-all">
+              {hours < 48 ? `${hours} hours` : `${Math.round(hours / 24)} days`}
+            </button>
+          ))}
+        </div>
+      </div>
 
       <button onClick={onOpenBinder} className="w-full bg-slate-50 text-slate-700 py-4 rounded-[2.5rem] flex items-center justify-center gap-2 font-black text-xs uppercase tracking-widest border border-slate-200 active:scale-95 transition-all">
         <BookOpen size={16}/>
@@ -1677,7 +1844,7 @@ function ActivityPanel() {
   );
 }
 
-function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,onOpenBinder}) {
+function SyncModal({onClose,onImport,pendingImport,pendingImportSource,onConfirmImport,onCancelImport,onApplyTemplate,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,onOpenBinder}) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
@@ -1686,12 +1853,21 @@ function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImpor
       <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances and your family plan.</p>
       <button type="button" onClick={onOpenBinder} className="w-full rounded-xl p-3 bg-slate-50 border border-slate-200 text-sm font-bold flex items-center justify-center gap-2"><BookOpen size={16}/> Printable emergency binder</button>
       <label className="block text-sm font-bold">Import JSON backup<input type="file" accept=".json,application/json" onChange={onImport} className="block mt-2 w-full text-xs" /></label>
+      <StarterTemplatesPanel settings={settings} onApply={onApplyTemplate} disabled={Boolean(pendingImport)} />
       {pendingImport && <div role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-2 text-sm">
-        <p className="font-black text-amber-900">Backup ready to review</p>
+        <p className="font-black text-amber-900">{pendingImportSource?.kind === 'template' ? `${pendingImportSource.label} ready to review` : 'Backup ready to review'}</p>
         <p className="text-amber-800">{pendingImport.inventory.length} inventory items, {pendingImport.shoppingList.length} shopping items, {pendingImport.appliances.length} appliances and {pendingImport.plan ? 'a family plan' : 'no family plan'} will be merged by ID.</p>
         {pendingImport.reminders?.length > 0 && <p className="text-amber-800">{pendingImport.reminders.length} maintenance reminders will be merged.</p>}
         {pendingImport.settings && <p className="text-amber-800">Readiness assumptions are included.</p>}
-        <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">Merge backup</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
+        {pendingImportSource?.kind === 'template' && (
+          <>
+            <ul className="text-amber-800 text-xs space-y-0.5 max-h-40 overflow-y-auto">
+              {pendingImport.inventory.map(row => <li key={row.id}>{row.name} — {row.quantity} {row.unit}</li>)}
+            </ul>
+            <p className="text-amber-900 font-bold">These quantities are a starting point scaled to {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} for {settings.survivalGoalDays} days — adjust them to what your household actually keeps. They are not a recommendation to follow exactly.</p>
+          </>
+        )}
+        <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">{pendingImportSource?.kind === 'template' ? 'Add these supplies' : 'Merge backup'}</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
       </div>}
       <SettingsForm settings={settings} onSave={onUpdateSettings} />
       <ServiceHealthPanel />
@@ -1702,6 +1878,41 @@ function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImpor
       <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>
     </section>
   </div>;
+}
+
+// Starter supply templates for a household staring at an empty screen. Applying one runs through
+// the same preview-and-merge path as a JSON backup, so nothing is overwritten without confirmation.
+function StarterTemplatesPanel({ settings, onApply, disabled }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <section className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+      <button type="button" onClick={() => setOpen(value => !value)} aria-expanded={open} className="w-full flex items-center justify-between text-sm font-bold text-slate-700">
+        <span className="flex items-center gap-2"><Layers size={16}/> Starter supply templates</span>
+        <ChevronRight size={16} className={`transition-transform ${open ? 'rotate-90' : ''}`}/>
+      </button>
+      {open && (
+        <div className="space-y-3">
+          <p className="text-xs text-slate-600 leading-relaxed">
+            Quantities are scaled to {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} for {settings.survivalGoalDays} days.
+            They are a starting point to adjust, not a recommendation to follow exactly — every household's needs differ.
+            You will see exactly what gets added before anything is saved.
+          </p>
+          <ul className="space-y-2">
+            {supplyTemplateCatalog.map(template => (
+              <li key={template.id} className="bg-white border border-slate-200 rounded-xl p-3 flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-xs font-black text-slate-800">{template.label}</div>
+                  <p className="text-[11px] text-slate-600 leading-relaxed">{template.description}</p>
+                  <p className="text-[10px] text-slate-500 mt-1">{template.items.length} items</p>
+                </div>
+                <button type="button" disabled={disabled} onClick={() => onApply(template.id)} className="shrink-0 rounded-xl bg-slate-900 px-3 py-2 text-[10px] font-black uppercase text-white disabled:opacity-40">Preview</button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
 }
 
 // Operational visibility for whoever runs the deployment: API/database availability now, plus
@@ -1835,17 +2046,100 @@ function AcceptInvite({token,onJoined}) {
   </main>;
 }
 
-export function AiModal({ content, onClose }) {
+// Results of a deterministic outage simulation (shared/outage.js). This replaced the old AI
+// "Run Emergency Simulation" stub, so everything shown here is arithmetic over recorded figures.
+export function OutageSimulationModal({ result, settings, onClose }) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
+  const hours = result.hours;
+  const label = hours < 48 ? `${Math.round(hours)}-hour` : `${Math.round(hours / 24)}-day`;
+  const formatRunway = value => value === null ? 'Not consumed' : value >= 48 ? `${(value / 24).toFixed(1)} days` : `${value.toFixed(0)} hours`;
+  const units = {power: 'kWh', fuel: 'h', water: 'gal'};
+
   return (
     <div className="fixed inset-0 z-[110] bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-6 text-slate-900">
-      <div ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title" className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[80vh]">
-        <div className="flex justify-between items-center mb-6">
-          <h3 id="ai-modal-title" className="text-xl font-black text-slate-900">{content.title}</h3>
-          <button aria-label="Close AI result" onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-500"><X aria-hidden="true" size={16}/></button>
+      <div ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="outage-modal-title" className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[85vh]">
+        <div className="flex justify-between items-center mb-4">
+          <h3 id="outage-modal-title" className="text-xl font-black text-slate-900">{label} outage</h3>
+          <button aria-label="Close simulation result" onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-500"><X aria-hidden="true" size={16}/></button>
         </div>
-        <div className="overflow-y-auto text-sm text-slate-600 leading-relaxed whitespace-pre-wrap flex-1">{content.text}</div>
+
+        <div className="overflow-y-auto flex-1 space-y-5 text-sm text-slate-600">
+          <p className={`font-bold ${result.survives ? 'text-emerald-700' : 'text-red-700'}`}>
+            {result.survives
+              ? `Nothing you track runs out within ${label.toLowerCase().replace('-', ' ')}.`
+              : `${result.firstExhausted.label} runs out first, after ${formatRunway(result.firstExhausted.runwayHours)}.`}
+          </p>
+
+          <section>
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">How long each lasts</h4>
+            <ul className="space-y-1">
+              {result.runways.map(resource => (
+                <li key={resource.key} className="flex justify-between gap-3">
+                  <span className="font-bold text-slate-700">{resource.label}</span>
+                  <span className={resource.runwayHours !== null && resource.runwayHours < hours ? 'text-red-700 font-bold' : ''}>{formatRunway(resource.runwayHours)}</span>
+                </li>
+              ))}
+              {result.runways.length === 0 && <li className="text-slate-500">Nothing recorded is being consumed — add appliances, water and fuel to see a drawdown.</li>}
+            </ul>
+          </section>
+
+          <section>
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">Drawdown</h4>
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px]">
+                <thead>
+                  <tr className="text-slate-500 text-left">
+                    <th scope="col" className="font-black uppercase py-1">Hour</th>
+                    <th scope="col" className="font-black uppercase py-1 text-right">Power</th>
+                    <th scope="col" className="font-black uppercase py-1 text-right">Fuel</th>
+                    <th scope="col" className="font-black uppercase py-1 text-right">Water</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.timeline.map(point => (
+                    <tr key={point.hour} className="border-t border-slate-100">
+                      <td className="py-1 font-bold text-slate-700">{Math.round(point.hour)}h</td>
+                      <td className="py-1 text-right">{point.power.toFixed(1)} {units.power}</td>
+                      <td className="py-1 text-right">{point.fuel.toFixed(0)} {units.fuel}</td>
+                      <td className="py-1 text-right">{point.water.toFixed(1)} {units.water}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section>
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">Loads to shed</h4>
+            {result.shedding.shed.length === 0 ? (
+              <p>{result.resources.dailyLoadKwh > 0
+                ? 'Stored power already lasts the whole outage with every active appliance running.'
+                : 'No active appliances are recorded, so there is nothing to shed.'}</p>
+            ) : (
+              <>
+                <p className="mb-2">Turn these off, lowest priority first, so stored power lasts the full {label.toLowerCase().replace('-', ' ')}:</p>
+                <ol className="space-y-1 list-decimal list-inside">
+                  {result.shedding.shed.map(appliance => (
+                    <li key={appliance.id} className="font-bold text-slate-700">
+                      {appliance.name} <span className="font-normal text-slate-500">({appliancePriorityLabels[appliance.priority || 'normal']} priority, {(((appliance.watts || 0) * (appliance.hours || 0)) / 1000).toFixed(2)} kWh/day)</span>
+                    </li>
+                  ))}
+                </ol>
+                {result.shedding.shedsCritical && (
+                  <p className="mt-2 text-red-700 font-bold">Reaching the full duration means turning off loads you marked critical.</p>
+                )}
+              </>
+            )}
+          </section>
+
+          <p className="text-[10px] leading-relaxed text-slate-500">
+            Stored power counts {Math.round(settings.batteryUsableFraction * 100)}% usable capacity after a {Math.round(settings.inverterEfficiency * 100)}% efficient
+            inverter conversion. Heating fuel is drawn down at one recorded hour per hour. Water uses the same daily
+            need as the Dashboard. Expired water is excluded; fuel is counted whatever its date.
+          </p>
+        </div>
+
         <button onClick={onClose} className="mt-6 w-full bg-slate-900 text-white py-4 rounded-2xl font-black">Close</button>
       </div>
     </div>

@@ -15,9 +15,9 @@ test('inventory row controls are labelled and the input has a visible-name label
   await expect(page.getByRole('button', { name: 'Move Water Jug to inventory' })).toBeVisible();
 });
 
-test('AI modal close controls are labelled', async ({ page }) => {
-  await page.getByTestId('open-ai-modal').click();
-  const dialog = page.getByRole('dialog', { name: 'Meal Plan' });
+test('outage simulation modal close controls are labelled', async ({ page }) => {
+  await page.getByTestId('open-simulation-modal').click();
+  const dialog = page.getByRole('dialog', { name: '3-day outage' });
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole('button', { name: 'Close AI result' })).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Close simulation result' })).toBeVisible();
 });

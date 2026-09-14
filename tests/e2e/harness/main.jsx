@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Header, InventoryItem, AiModal } from '../../../src/App.jsx';
+import { Header, InventoryItem, OutageSimulationModal } from '../../../src/App.jsx';
+import { simulateOutage } from '../../../shared/outage.js';
+import { settingsSchema } from '../../../shared/schema.js';
 
 // Renders the real, shared components straight from src/App.jsx (no mocks/copies) so
 // Playwright specs under tests/e2e/specs exercise the exact accessibility behavior
@@ -11,9 +13,16 @@ function Harness() {
   const [editCount, setEditCount] = useState(0);
   const [buyCount, setBuyCount] = useState(0);
   const [selected, setSelected] = useState(false);
-  const [showAiModal, setShowAiModal] = useState(false);
+  const [showSimulation, setShowSimulation] = useState(false);
 
   const item = { id: 'water-1', name: 'Water Jug', quantity: 4, unit: 'gal', category: 'Water' };
+  // A fixed scenario so the dialog's accessible name and contents are deterministic.
+  const settings = settingsSchema.parse({});
+  const simulation = simulateOutage({
+    inventory: [item, { id: 'battery-1', name: 'Battery', category: 'Power', quantity: 1, capacityPerUnit: 2 }],
+    appliances: [{ id: 'fridge', name: 'Fridge', watts: 150, hours: 24, active: true, priority: 'normal' }],
+    plan: null,
+  }, settings, { hours: 72 });
 
   return (
     <div>
@@ -52,12 +61,13 @@ function Harness() {
         </section>
 
         <section>
-          <h3>AI modal</h3>
-          <button data-testid="open-ai-modal" onClick={() => setShowAiModal(true)}>Open AI Modal</button>
-          {showAiModal && (
-            <AiModal
-              content={{ title: 'Meal Plan', text: 'Suggested meals for the week.' }}
-              onClose={() => setShowAiModal(false)}
+          <h3>Outage simulation modal</h3>
+          <button data-testid="open-simulation-modal" onClick={() => setShowSimulation(true)}>Open Simulation</button>
+          {showSimulation && (
+            <OutageSimulationModal
+              result={simulation}
+              settings={settings}
+              onClose={() => setShowSimulation(false)}
             />
           )}
         </section>

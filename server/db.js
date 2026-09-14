@@ -14,7 +14,7 @@ export const householdId = 1;
 // rows that actually changed, inside one transaction guarded by the household's version.
 export async function readState() {
   const sql = database();
-  const [households, inventory, shoppingList, appliances, planRows, familyRows, contactRows, settingsRows] = await Promise.all([
+  const [households, inventory, shoppingList, appliances, reminders, checklistChecks, planRows, familyRows, contactRows, settingsRows] = await Promise.all([
     sql`SELECT version FROM northstar_household WHERE id = ${householdId}`,
     sql`SELECT id, name, quantity, unit, category,
           calories_per_unit AS "caloriesPerUnit", hours_per_unit AS "hoursPerUnit", capacity_per_unit AS "capacityPerUnit",
@@ -29,6 +29,10 @@ export async function readState() {
           barcode, recurring_days AS "recurringDays"
         FROM northstar_shopping_items WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, name, watts, hours, active FROM northstar_appliances WHERE household_id = ${householdId} ORDER BY seq`,
+    sql`SELECT id, title, category, recurring_days AS "recurringDays", notes, start_date AS "startDate",
+          last_completed_date AS "lastCompletedDate", snoozed_until AS "snoozedUntil"
+        FROM northstar_reminders WHERE household_id = ${householdId} ORDER BY seq`,
+    sql`SELECT id, completed_at AS "completedAt" FROM northstar_checklist_checks WHERE household_id = ${householdId}`,
     sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary"
         FROM northstar_plan WHERE household_id = ${householdId}`,
     sql`SELECT name, role, dob FROM northstar_family_members WHERE household_id = ${householdId} ORDER BY position`,
@@ -47,7 +51,7 @@ export async function readState() {
     contacts: contactRows,
     meetingPoints: {primary: planRow.meetingPrimary, secondary: planRow.meetingSecondary},
   } : null;
-  const data = stateSchema.parse({inventory, shoppingList, appliances, plan, settings: settingsRows[0]});
+  const data = stateSchema.parse({inventory, shoppingList, appliances, reminders, checklistChecks, plan, settings: settingsRows[0]});
   return {data, version: households[0].version};
 }
 
@@ -81,12 +85,29 @@ function upsertShoppingItem(tx, item, guard) {
       purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days`;
 }
 
+function upsertReminder(tx, reminder, guard) {
+  return tx`INSERT INTO northstar_reminders (household_id, id, title, category, recurring_days, notes, start_date, last_completed_date, snoozed_until)
+    SELECT ${householdId}, ${reminder.id}, ${reminder.title}, ${reminder.category}, ${reminder.recurringDays}, ${reminder.notes}, ${reminder.startDate}, ${reminder.lastCompletedDate}, ${reminder.snoozedUntil}
+    WHERE ${guard}
+    ON CONFLICT (household_id, id) DO UPDATE SET
+      title = EXCLUDED.title, category = EXCLUDED.category, recurring_days = EXCLUDED.recurring_days, notes = EXCLUDED.notes,
+      start_date = EXCLUDED.start_date, last_completed_date = EXCLUDED.last_completed_date, snoozed_until = EXCLUDED.snoozed_until`;
+}
+function upsertChecklistCheck(tx, check, guard) {
+  return tx`INSERT INTO northstar_checklist_checks (household_id, id, completed_at)
+    SELECT ${householdId}, ${check.id}, ${check.completedAt}
+    WHERE ${guard}
+    ON CONFLICT (household_id, id) DO UPDATE SET completed_at = EXCLUDED.completed_at`;
+}
+
 export async function compareAndSave(version, next, current = emptyState()) {
   const sql = database();
   const targetVersion = version + 1;
   const inventoryDiff = diffById(current.inventory, next.inventory);
   const shoppingDiff = diffById(current.shoppingList, next.shoppingList);
   const applianceDiff = diffById(current.appliances, next.appliances);
+  const reminderDiff = diffById(current.reminders, next.reminders);
+  const checklistDiff = diffById(current.checklistChecks, next.checklistChecks);
   const planChanged = JSON.stringify(current.plan) !== JSON.stringify(next.plan);
   const settingsChanged = JSON.stringify(current.settings) !== JSON.stringify(next.settings);
 
@@ -104,6 +125,10 @@ export async function compareAndSave(version, next, current = emptyState()) {
       SELECT ${householdId}, ${appliance.id}, ${appliance.name}, ${appliance.watts}, ${appliance.hours}, ${appliance.active}
       WHERE ${guard}
       ON CONFLICT (household_id, id) DO UPDATE SET name = EXCLUDED.name, watts = EXCLUDED.watts, hours = EXCLUDED.hours, active = EXCLUDED.active`);
+    for (const id of reminderDiff.toDelete) statements.push(tx`DELETE FROM northstar_reminders WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
+    for (const reminder of reminderDiff.toUpsert) statements.push(upsertReminder(tx, reminder, guard));
+    for (const id of checklistDiff.toDelete) statements.push(tx`DELETE FROM northstar_checklist_checks WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
+    for (const check of checklistDiff.toUpsert) statements.push(upsertChecklistCheck(tx, check, guard));
 
     if (planChanged) {
       if (next.plan === null) {
@@ -239,6 +264,20 @@ export async function listAuditLog(householdId = 1, limit = 50) {
   return sql`SELECT a.action, a.collection, a.item_id, a.item_name, a.created_at, u.email AS actor_email
     FROM northstar_audit_log a LEFT JOIN northstar_users u ON u.id = a.user_id
     WHERE a.household_id = ${householdId} ORDER BY a.created_at DESC LIMIT ${limit}`;
+}
+
+// --- Reminder completion/snooze history, so recurring maintenance checks can be verified over time. ---
+export async function insertReminderHistory({householdId = 1, reminderId, reminderTitle, category, event, eventDate, userId}) {
+  const sql = database();
+  await sql`INSERT INTO northstar_reminder_history (household_id, reminder_id, reminder_title, category, event, event_date, user_id)
+    VALUES (${householdId}, ${reminderId}, ${reminderTitle}, ${category}, ${event}, ${eventDate}, ${userId})`;
+}
+export async function listReminderHistory(householdId = 1, limit = 100) {
+  const sql = database();
+  return sql`SELECT r.reminder_id AS "reminderId", r.reminder_title AS "reminderTitle", r.category, r.event,
+        r.event_date AS "eventDate", r.created_at AS "createdAt", u.email AS "actorEmail"
+    FROM northstar_reminder_history r LEFT JOIN northstar_users u ON u.id = r.user_id
+    WHERE r.household_id = ${householdId} ORDER BY r.created_at DESC LIMIT ${limit}`;
 }
 
 // --- Encrypted household backups. Ciphertext/IV/auth tag never leave insertBackupRecord/getBackupRecord. ---

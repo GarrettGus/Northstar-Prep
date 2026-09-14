@@ -1,5 +1,5 @@
 import { validSession, sameOrigin } from '../server/auth.js';
-import { readState, compareAndSave, insertAuditLog, householdId } from '../server/db.js';
+import { readState, compareAndSave, insertAuditLog, insertReminderHistory, householdId } from '../server/db.js';
 import { applyAction, collectionKey, idSchema } from '../shared/schema.js';
 import { beginRequest, logFailure, logIssue, observe } from '../server/observability.js';
 import { storeImage, deleteImage, isDataUrlImage, isManagedImageUrl } from '../server/imageStore.js';
@@ -64,7 +64,24 @@ async function cleanupOrphanedImages(previousState, nextState, remove) {
   await Promise.allSettled(orphaned.map(url => remove(url, householdId)));
 }
 
-export function createHandler(repository = {readState, compareAndSave, logAudit: insertAuditLog}, authenticate = validSession, imageStore = {store: storeImage, remove: deleteImage}) {
+// Diffs reminders by ID so a "mark complete" or "snooze" edit is recorded as history, distinct
+// from an ordinary field edit, without the client having to send a separate action type.
+function reminderHistoryEvents(previousState, nextState) {
+  const previousById = new Map((previousState?.reminders ?? []).map(row => [row.id, row]));
+  const events = [];
+  for (const reminder of nextState.reminders) {
+    const before = previousById.get(reminder.id);
+    if (reminder.lastCompletedDate && reminder.lastCompletedDate !== before?.lastCompletedDate) {
+      events.push({reminderId: reminder.id, reminderTitle: reminder.title, category: reminder.category, event: 'completed', eventDate: reminder.lastCompletedDate});
+    }
+    if (reminder.snoozedUntil && reminder.snoozedUntil !== before?.snoozedUntil) {
+      events.push({reminderId: reminder.id, reminderTitle: reminder.title, category: reminder.category, event: 'snoozed', eventDate: reminder.snoozedUntil});
+    }
+  }
+  return events;
+}
+
+export function createHandler(repository = {readState, compareAndSave, logAudit: insertAuditLog, logReminderHistory: insertReminderHistory}, authenticate = validSession, imageStore = {store: storeImage, remove: deleteImage}) {
   return async (req,res) => {
     const request = beginRequest(req, res);
     res.setHeader('Cache-Control','no-store');
@@ -89,6 +106,8 @@ export function createHandler(repository = {readState, compareAndSave, logAudit:
           catch (error) { logIssue(request, '/api/hub', 'audit_log_failure', error); }
           try { await cleanupOrphanedImages(current.data, next, imageStore.remove); }
           catch (error) { logIssue(request, '/api/hub', 'image_cleanup_failure', error); }
+          try { for (const event of reminderHistoryEvents(current.data, next)) await repository.logReminderHistory({...event, userId: session.userId}); }
+          catch (error) { logIssue(request, '/api/hub', 'reminder_history_failure', error); }
           return res.status(200).json({data:next,version});
         }
       }

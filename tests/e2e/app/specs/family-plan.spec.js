@@ -8,7 +8,7 @@ test('editing family members, contacts, meeting points and the shelter spot pers
   await page.getByRole('button', {name: 'Edit', exact: true}).click();
 
   const familySection = sectionByHeading(page, 'Household Tracking');
-  await page.getByRole('button', {name: 'Add member'}).click();
+  await page.getByRole('button', {name: 'Add person'}).click();
   await fieldIn(familySection, 'Name').fill('Jamie Rivera');
   await fieldIn(familySection, 'Role').fill('Adult');
   await fieldIn(familySection, 'Date of birth').fill('1990-05-01');
@@ -56,7 +56,7 @@ test('removing a member or contact while editing drops it on save', async ({page
   await openTab(page, 'Family');
 
   await page.getByRole('button', {name: 'Edit', exact: true}).click();
-  await page.getByRole('button', {name: 'Add member'}).click();
+  await page.getByRole('button', {name: 'Add person'}).click();
   await fieldIn(sectionByHeading(page, 'Household Tracking'), 'Name').fill('Temporary Person');
   await page.getByRole('button', {name: 'Remove Temporary Person'}).click();
   await page.getByRole('button', {name: 'Save', exact: true}).click();
@@ -71,7 +71,7 @@ test('a household member with other fields filled in but no name is refused, not
   await openTab(page, 'Family');
 
   await page.getByRole('button', {name: 'Edit', exact: true}).click();
-  await page.getByRole('button', {name: 'Add member'}).click();
+  await page.getByRole('button', {name: 'Add person'}).click();
   await fieldIn(sectionByHeading(page, 'Household Tracking'), 'Role').fill('Dog');
   await page.getByRole('button', {name: 'Save', exact: true}).click();
 
@@ -80,6 +80,29 @@ test('a household member with other fields filled in but no name is refused, not
   await expect(fieldIn(sectionByHeading(page, 'Household Tracking'), 'Role')).toHaveValue('Dog');
   const family = await query('SELECT name FROM northstar_family_members WHERE household_id = 1');
   expect(family).toEqual([]);
+});
+
+test('a pet with its own consumption figures persists and switches readiness to per-member mode', async ({page}) => {
+  await signedInHome(page);
+  await openTab(page, 'Family');
+
+  await page.getByRole('button', {name: 'Edit', exact: true}).click();
+  const familySection = sectionByHeading(page, 'Household Tracking');
+  await page.getByRole('button', {name: 'Add pet'}).click();
+  await fieldIn(familySection, 'Name').fill('Rex');
+  await fieldIn(familySection, 'Role').fill('Dog');
+  await fieldIn(familySection, 'Calories per day').fill('700');
+  await fieldIn(familySection, 'Water gal per day').fill('0.25');
+  await page.getByRole('button', {name: 'Save', exact: true}).click();
+  await expect(page.getByRole('button', {name: 'Edit', exact: true})).toBeVisible();
+
+  const family = await query('SELECT name, kind, calories_per_day, water_gallons_per_day FROM northstar_family_members WHERE household_id = 1 ORDER BY position');
+  expect(family).toEqual([{name: 'Rex', kind: 'pet', calories_per_day: '700', water_gallons_per_day: '0.25'}]);
+
+  // Adding a pet opts the household into per-member readiness, which the Dashboard states.
+  await openTab(page, 'Status');
+  await expect(page.getByText(/Adds up each household member's own needs/)).toBeVisible();
+  await expect(page.getByText(/1 pet/)).toBeVisible();
 });
 
 test('canceling an edit discards unsaved changes', async ({page}) => {

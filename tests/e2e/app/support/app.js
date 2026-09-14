@@ -20,6 +20,16 @@ export function selectField(page, label) {
 }
 export function itemRow(page, name) { return page.getByRole('heading', {name, level: 4}); }
 
+// Family Hub sections (household members, contacts, meeting points) render label/input pairs
+// outside a <form>, scoped by their own <section>; find the section by its heading, then the
+// field within it, the same way `field` finds one within the item form.
+export function sectionByHeading(page, heading) {
+  return page.locator('section').filter({ has: page.getByRole('heading', { name: heading }) });
+}
+export function fieldIn(container, label) {
+  return container.locator(`label:text-is("${label}")`).locator('xpath=following-sibling::input[1]');
+}
+
 export async function openTab(page, label) {
   await page.getByRole('button', {name: label, exact: true}).click();
 }

@@ -314,7 +314,7 @@ test('invite API validates tokens, enforces the invited email, and rejects accou
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',email:'invitee@example.com',password:'longenoughpw'}},success);
   assert.equal(success.code,200);assert.equal(success.data.user.id,'new-user-id');assert.match(success.headers['Set-Cookie'],/northstar=/);
 });
-import { waterGallons, isExpired, computeReadiness, isRecurringDue, nextRecurringDate } from '../shared/readiness.js';
+import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate } from '../shared/readiness.js';
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{
   assert.equal(waterGallons({quantity:3.785411784,unit:'liters'}),1);
   assert.equal(waterGallons({quantity:10,unit:'bottles'}),0);
@@ -366,6 +366,38 @@ test('fuel hours are grouped by fuel type for explainability',()=>{
   const stats=computeReadiness({inventory,appliances:[]},settingsSchema.parse({}));
   assert.equal(stats.totalFuelHours,30);
   assert.deepEqual(stats.fuelByType,{Propane:20,Gasoline:6,Other:4});
+});
+
+test('readiness gaps report a shortfall and a shopping suggestion for each unmet goal',()=>{
+  const settings=settingsSchema.parse({householdSize:1,caloriesPerPersonPerDay:2000,waterGallonsPerPersonPerDay:1,survivalGoalDays:14,heatGoalHours:36,powerGoalKwh:20,batteryUsableFraction:0.9,inverterEfficiency:0.9});
+  const stats=computeReadiness({inventory:[],appliances:[]},settings);
+  const gaps=computeReadinessGaps(stats,settings);
+  const byKey=Object.fromEntries(gaps.map(g=>[g.key,g]));
+  assert.equal(byKey.water.met,false);
+  assert.equal(byKey.water.shortfallDays,14);
+  assert.equal(byKey.water.suggestedQuantity,14);
+  assert.equal(byKey.food.met,false);
+  assert.equal(byKey.food.shortfallDays,14);
+  assert.equal(byKey.food.suggestedCalories,28000);
+  assert.equal(byKey.heat.met,false);
+  assert.equal(byKey.heat.shortfallHours,36);
+  assert.equal(byKey.power.met,false);
+  assert.equal(byKey.power.shortfallKwh,20);
+  // Raw stored capacity needed is larger than the usable shortfall, since it still has to survive
+  // battery/inverter derating (see computeReadiness's usablePowerKwh).
+  assert.equal(byKey.power.suggestedRawKwh,Math.ceil(20/(0.9*0.9)));
+});
+test('a fully stocked household reports every readiness gap as met',()=>{
+  const inventory=[
+    {category:'Water',quantity:20,unit:'gal',name:'Water'},
+    {category:'Food',quantity:20,caloriesPerUnit:2000,name:'Rice'},
+    {category:'Fuel',quantity:10,hoursPerUnit:10,name:'Propane'},
+    {category:'Power',quantity:10,capacityPerUnit:10,name:'Battery bank'},
+  ];
+  const settings=settingsSchema.parse({householdSize:1,survivalGoalDays:5,heatGoalHours:10,powerGoalKwh:5});
+  const stats=computeReadiness({inventory,appliances:[]},settings);
+  const gaps=computeReadinessGaps(stats,settings);
+  assert.ok(gaps.every(g=>g.met));
 });
 
 // --- Reminders and seasonal checklists ---

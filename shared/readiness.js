@@ -88,3 +88,41 @@ export function computeReadiness({inventory=[],appliances=[]},settings) {
     dailyCalorieNeed,dailyWaterNeed,
   };
 }
+
+// Deterministic replacement for the old AI "gap analysis": the shortfall against each readiness
+// goal, in days for water/food (whose goal is survivalGoalDays) and in the pillar's own unit for
+// heat/power (whose goals are heatGoalHours/powerGoalKwh), plus a suggested shopping quantity so
+// a shortfall can be queued onto the shopping list with one tap. Never negative; met=true once a
+// goal is reached or exceeded.
+export function computeReadinessGaps(stats,settings) {
+  const waterShortfallDays=Math.max(0,settings.survivalGoalDays-stats.waterDays);
+  const foodShortfallDays=Math.max(0,settings.survivalGoalDays-stats.foodDays);
+  const heatShortfallHours=Math.max(0,settings.heatGoalHours-stats.totalFuelHours);
+  const powerShortfallKwh=Math.max(0,settings.powerGoalKwh-stats.totalPowerKwh);
+  // Usable power is derated by battery depth-of-discharge and inverter loss (see computeReadiness
+  // above); invert that to say how much raw stored capacity would close the usable shortfall.
+  const dischargeFactor=settings.batteryUsableFraction*settings.inverterEfficiency;
+
+  return [
+    {
+      key:'water',label:'Water',met:waterShortfallDays<=0,
+      shortfallDays:waterShortfallDays,
+      suggestedQuantity:Math.ceil(waterShortfallDays*stats.dailyWaterNeed),
+      suggestedUnit:'gal',
+    },
+    {
+      key:'food',label:'Food',met:foodShortfallDays<=0,
+      shortfallDays:foodShortfallDays,
+      suggestedCalories:Math.ceil(foodShortfallDays*stats.dailyCalorieNeed),
+    },
+    {
+      key:'heat',label:'Heat',met:heatShortfallHours<=0,
+      shortfallHours:heatShortfallHours,
+    },
+    {
+      key:'power',label:'Power',met:powerShortfallKwh<=0,
+      shortfallKwh:powerShortfallKwh,
+      suggestedRawKwh:dischargeFactor>0?Math.ceil(powerShortfallKwh/dischargeFactor):0,
+    },
+  ];
+}

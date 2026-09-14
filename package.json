@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test",
+    "test:e2e": "playwright test --config tests/e2e/playwright.config.js",
     "db:migrate": "node --env-file-if-exists=.env.local scripts/migrate.js",
     "db:migrate-images": "node --env-file-if-exists=.env.local scripts/migrate-images.js"
   },
@@ -20,6 +21,8 @@
     "zod": "^4.6.2"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
+    "@playwright/test": "^1.63.0",
     "@tailwindcss/vite": "^4.0.0",
     "tailwindcss": "^4.0.0",
     "vite": "^7.0.0"

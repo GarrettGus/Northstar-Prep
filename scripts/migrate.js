@@ -158,8 +158,17 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_family_members (
   name text NOT NULL DEFAULT '',
   role text NOT NULL DEFAULT '',
   dob text NOT NULL DEFAULT '',
+  kind text NOT NULL DEFAULT 'person',
+  calories_per_day numeric,
+  water_gallons_per_day numeric,
   PRIMARY KEY (household_id, position)
 )`;
+// Existing deployments created this table before per-member consumption figures existed. A NULL
+// override means "use the configured per-person default"; pets default to counting for nothing
+// until their own figures are entered (see householdNeeds in shared/readiness.js).
+await sql`ALTER TABLE northstar_family_members ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'person'`;
+await sql`ALTER TABLE northstar_family_members ADD COLUMN IF NOT EXISTS calories_per_day numeric`;
+await sql`ALTER TABLE northstar_family_members ADD COLUMN IF NOT EXISTS water_gallons_per_day numeric`;
 await sql`CREATE TABLE IF NOT EXISTS northstar_contacts (
   household_id integer NOT NULL REFERENCES northstar_household(id),
   position integer NOT NULL,

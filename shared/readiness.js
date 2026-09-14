@@ -24,10 +24,38 @@ export function isRecurringDue(item,now=new Date()) {
   const local=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
   return next<=local;
 }
+// A household opts into per-member readiness by giving at least one member an explicit calorie or
+// water figure, or by adding a pet. Until then the flat householdSize x per-person defaults are
+// used exactly as before, so a household that has only ever recorded names and roles sees no
+// change to its numbers. Once opted in, a person with no override still counts at the configured
+// per-person default; a pet with no figures counts for nothing, because the app has no honest
+// basis for guessing what a given animal consumes.
+export function householdNeeds(plan,settings) {
+  const members=plan?.family??[];
+  const optedIn=members.some(member=>member.kind==='pet'||member.caloriesPerDay!==''||member.waterGallonsPerDay!=='');
+  if(!optedIn) {
+    return {
+      mode:'household',people:settings.householdSize,pets:0,
+      dailyCalorieNeed:settings.householdSize*settings.caloriesPerPersonPerDay,
+      dailyWaterNeed:settings.householdSize*settings.waterGallonsPerPersonPerDay,
+    };
+  }
+  let dailyCalorieNeed=0,dailyWaterNeed=0,people=0,pets=0;
+  for(const member of members) {
+    const isPet=member.kind==='pet';
+    if(isPet)pets++;else people++;
+    const calorieDefault=isPet?0:settings.caloriesPerPersonPerDay;
+    const waterDefault=isPet?0:settings.waterGallonsPerPersonPerDay;
+    dailyCalorieNeed+=member.caloriesPerDay===''?calorieDefault:Number(member.caloriesPerDay);
+    dailyWaterNeed+=member.waterGallonsPerDay===''?waterDefault:Number(member.waterGallonsPerDay);
+  }
+  return {mode:'members',people,pets,dailyCalorieNeed,dailyWaterNeed};
+}
+
 const nameBuckets=['Water','Pasta','Rice','Beans','Energy Bars'];
-export function computeReadiness({inventory=[],appliances=[]},settings) {
-  const dailyCalorieNeed=settings.householdSize*settings.caloriesPerPersonPerDay;
-  const dailyWaterNeed=settings.householdSize*settings.waterGallonsPerPersonPerDay;
+export function computeReadiness({inventory=[],appliances=[],plan=null},settings) {
+  const needs=householdNeeds(plan,settings);
+  const {dailyCalorieNeed,dailyWaterNeed}=needs;
   let waterQty=0,totalCals=0,fuelHours=0,storedPowerKwh=0,lowStock=0,expired=0,totalValue=0;
   const fuelByType={};
   const buckets=Object.fromEntries(nameBuckets.map(name=>[name,0]));
@@ -86,6 +114,7 @@ export function computeReadiness({inventory=[],appliances=[]},settings) {
     totalPowerKwh:usablePowerKwh,rawPowerKwh:storedPowerKwh,totalCalories:totalCals,totalValue,
     lowStock,expired,coreStatus,dailyLoadKwh,powerDays,
     dailyCalorieNeed,dailyWaterNeed,
+    needsMode:needs.mode,people:needs.people,pets:needs.pets,
   };
 }
 

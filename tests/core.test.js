@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema } from '../shared/schema.js';
+import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema, planSchema } from '../shared/schema.js';
 import { nextReminderDueDate, effectiveReminderDueDate, isReminderOverdue, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
 import { token, validSession, hashPassword, verifyPassword, hashToken, randomToken, cookie, sameOrigin } from '../server/auth.js';
@@ -314,7 +314,7 @@ test('invite API validates tokens, enforces the invited email, and rejects accou
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',email:'invitee@example.com',password:'longenoughpw'}},success);
   assert.equal(success.code,200);assert.equal(success.data.user.id,'new-user-id');assert.match(success.headers['Set-Cookie'],/northstar=/);
 });
-import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate } from '../shared/readiness.js';
+import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds } from '../shared/readiness.js';
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{
   assert.equal(waterGallons({quantity:3.785411784,unit:'liters'}),1);
   assert.equal(waterGallons({quantity:10,unit:'bottles'}),0);
@@ -342,6 +342,65 @@ test('readiness needs scale with configurable household size and per-person rate
   assert.equal(solo.foodDays,10);assert.equal(family.foodDays,2.5);
   assert.equal(solo.dailyWaterNeed,1);assert.equal(family.dailyWaterNeed,4);
   assert.equal(solo.waterDays,8);assert.equal(family.waterDays,2);
+});
+test('readiness falls back to household size until a member opts in',()=>{
+  const settings=settingsSchema.parse({householdSize:4});
+  const plan=planSchema.parse({family:[{name:'Ada',role:'Adult',dob:''},{name:'Baz',role:'Child',dob:''}]});
+  // Two members recorded but no figures given: the flat householdSize math still applies, so an
+  // existing household that only ever wrote down names sees no change to its numbers.
+  const needs=householdNeeds(plan,settings);
+  assert.equal(needs.mode,'household');
+  assert.equal(needs.dailyCalorieNeed,8000);
+  assert.equal(needs.dailyWaterNeed,4);
+  assert.deepEqual(householdNeeds(null,settings),needs);
+  const inventory=[{category:'Food',quantity:10,caloriesPerUnit:2000,name:'Rice'}];
+  assert.equal(computeReadiness({inventory,appliances:[],plan},settings).foodDays,2.5);
+});
+test('readiness sums per-member and pet needs once any member carries its own figures',()=>{
+  const settings=settingsSchema.parse({householdSize:4});
+  const plan=planSchema.parse({family:[
+    {name:'Ada',role:'Adult',dob:'',caloriesPerDay:2400,waterGallonsPerDay:1.5},
+    {name:'Baz',role:'Toddler',dob:'',caloriesPerDay:1200},
+    {name:'Cy',role:'Adult',dob:''},
+    {name:'Rex',role:'Dog',dob:'',kind:'pet',caloriesPerDay:700,waterGallonsPerDay:0.25},
+  ]});
+  const needs=householdNeeds(plan,settings);
+  assert.equal(needs.mode,'members');
+  assert.equal(needs.people,3);
+  assert.equal(needs.pets,1);
+  // Ada 2400 + Baz 1200 + Cy at the 2000 default + Rex 700; householdSize 4 is ignored entirely.
+  assert.equal(needs.dailyCalorieNeed,6300);
+  // Ada 1.5 + Baz at the 1 gal default + Cy 1 + Rex 0.25.
+  assert.equal(needs.dailyWaterNeed,3.75);
+  const stats=computeReadiness({inventory:[],appliances:[],plan},settings);
+  assert.equal(stats.needsMode,'members');
+  assert.equal(stats.dailyCalorieNeed,6300);
+});
+test('a pet with no figures counts for nothing but still switches on per-member mode',()=>{
+  const settings=settingsSchema.parse({householdSize:2});
+  const plan=planSchema.parse({family:[{name:'Ada',role:'Adult',dob:''},{name:'Rex',role:'Dog',dob:'',kind:'pet'}]});
+  const needs=householdNeeds(plan,settings);
+  assert.equal(needs.mode,'members');
+  // One person at the defaults; the pet contributes nothing until its own figures are entered.
+  assert.equal(needs.dailyCalorieNeed,2000);
+  assert.equal(needs.dailyWaterNeed,1);
+});
+test('member figures round-trip blank, zero and null distinctly',()=>{
+  const parsed=planSchema.parse({family:[
+    {name:'Ada',role:'',dob:''},
+    {name:'Baz',role:'',dob:'',caloriesPerDay:0,waterGallonsPerDay:0},
+    {name:'Cy',role:'',dob:'',caloriesPerDay:null,waterGallonsPerDay:null},
+  ]});
+  assert.equal(parsed.family[0].caloriesPerDay,'');
+  assert.equal(parsed.family[0].kind,'person');
+  // An explicit zero is a real figure and must not collapse back into "use the default".
+  assert.equal(parsed.family[1].caloriesPerDay,0);
+  // A NULL database column reads back as blank, not as zero.
+  assert.equal(parsed.family[2].caloriesPerDay,'');
+  const settings=settingsSchema.parse({householdSize:3});
+  assert.equal(householdNeeds(parsed,settings).dailyCalorieNeed,2000+0+2000);
+  assert.throws(()=>planSchema.parse({family:[{name:'A',role:'',dob:'',kind:'robot'}]}));
+  assert.throws(()=>planSchema.parse({family:[{name:'A',role:'',dob:'',caloriesPerDay:-5}]}));
 });
 test('readiness guards against divide-by-zero when per-person needs are zero',()=>{
   const inventory=[{category:'Food',quantity:5,caloriesPerUnit:500,name:'Bar'}];

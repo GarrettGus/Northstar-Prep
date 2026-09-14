@@ -80,9 +80,24 @@ export const reminderSchema = z.object({
 // One row per checked seasonal checklist item; id is `${season}__${itemId}` from shared/checklists.js.
 // Unchecking an item deletes its row instead of storing a false flag.
 export const checklistCheckSchema = z.object({ id: idSchema, completedAt: date });
+// A blank override means "use the configured per-person default" for a person, and "counts for
+// nothing" for a pet — the app has no business inventing how much a given animal eats or drinks,
+// so a pet contributes to readiness only once its figures are actually entered. Null is accepted
+// so a nullable database column round-trips back to blank.
+const memberNeed = max => z.preprocess(
+  value => value === null || value === undefined ? '' : value,
+  z.union([z.literal(''), z.coerce.number().finite().nonnegative().max(max)]),
+);
+export const memberKinds = ['person', 'pet'];
+export const familyMemberSchema = z.object({
+  name: z.string().max(100), role: z.string().max(100), dob: z.string().max(30),
+  kind: z.enum(memberKinds).default('person'),
+  caloriesPerDay: memberNeed(20000),
+  waterGallonsPerDay: memberNeed(50),
+});
 export const planSchema = z.object({
   shelterSpot: z.string().max(3000).default(''),
-  family: z.array(z.object({name: z.string().max(100), role: z.string().max(100), dob: z.string().max(30)})).max(30).default([]),
+  family: z.array(familyMemberSchema).max(30).default([]),
   contacts: z.array(z.object({name: text, phone: z.string().max(80), type: text.default('')})).max(50).default([]),
   meetingPoints: z.object({primary: text.default(''), secondary: text.default('')}).default({primary:'',secondary:''}),
 });

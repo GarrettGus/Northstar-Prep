@@ -172,7 +172,7 @@ export default function App() {
   };
 
   // --- Logic Helpers ---
-  const stats = useMemo(() => computeReadiness({ inventory, appliances }, settings), [inventory, appliances, settings]);
+  const stats = useMemo(() => computeReadiness({ inventory, appliances, plan }, settings), [inventory, appliances, plan, settings]);
   const gaps = useMemo(() => computeReadinessGaps(stats, settings), [stats, settings]);
   const overdueReminders = useMemo(() => reminders.filter(r => isReminderOverdue(r)), [reminders]);
   const handleUpdateSettings = (next) => mutate({ type: 'settings', settings: next });
@@ -333,9 +333,22 @@ function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueRemin
             <ProgressBar label={`Power (Goal: ${settings.powerGoalKwh} kWh)`} percent={progressPercent(stats.totalPowerKwh, settings.powerGoalKwh)} color="bg-violet-500" />
           </div>
           <p className="mt-5 text-[10px] leading-relaxed text-slate-400">
-            Assumes {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} needing {settings.caloriesPerPersonPerDay.toLocaleString()} kcal
-            and {settings.waterGallonsPerPersonPerDay} gal water per person/day ({stats.dailyCalorieNeed.toLocaleString()} kcal
-            and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household). Stored power counts {Math.round(settings.batteryUsableFraction * 100)}%
+            {stats.needsMode === 'members' ? (
+              <>
+                Adds up each household member's own needs: {stats.people} {stats.people === 1 ? 'person' : 'people'}
+                {stats.pets > 0 && <> and {stats.pets} {stats.pets === 1 ? 'pet' : 'pets'}</>} in the Family Hub
+                ({stats.dailyCalorieNeed.toLocaleString()} kcal and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household).
+                Members left blank count at {settings.caloriesPerPersonPerDay.toLocaleString()} kcal and {settings.waterGallonsPerPersonPerDay} gal;
+                a pet counts for nothing until you enter its figures. Edit members in the Family Hub.
+              </>
+            ) : (
+              <>
+                Assumes {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} needing {settings.caloriesPerPersonPerDay.toLocaleString()} kcal
+                and {settings.waterGallonsPerPersonPerDay} gal water per person/day ({stats.dailyCalorieNeed.toLocaleString()} kcal
+                and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household). Give a member their own figures in the Family Hub
+                to count everyone individually instead.
+              </>
+            )} Stored power counts {Math.round(settings.batteryUsableFraction * 100)}%
             usable capacity after a {Math.round(settings.inverterEfficiency * 100)}% efficient inverter conversion.
             Edit these in Household settings.
           </p>
@@ -791,32 +804,44 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
 function FamilyMembersSection({ family, isEditing, onChange }) {
   const updateMember = (i, patch) => onChange(family.map((m, idx) => idx === i ? { ...m, ...patch } : m));
   const removeMember = (i) => onChange(family.filter((_, idx) => idx !== i));
-  const addMember = () => onChange([...family, { name: '', role: '', dob: '' }]);
+  const addMember = (kind) => onChange([...family, { name: '', role: kind === 'pet' ? 'Pet' : '', dob: '', kind, caloriesPerDay: '', waterGallonsPerDay: '' }]);
   return (
     <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
       <div className="flex justify-between items-center mb-6">
         <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest">Household Tracking</h3>
-        {isEditing && <button type="button" onClick={addMember} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add member</button>}
+        {isEditing && (
+          <div className="flex items-center gap-3">
+            <button type="button" onClick={() => addMember('person')} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add person</button>
+            <button type="button" onClick={() => addMember('pet')} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add pet</button>
+          </div>
+        )}
       </div>
       {family.length === 0 && !isEditing && <p className="text-xs text-slate-500 font-bold">No household members added yet.</p>}
       <div className="space-y-4">
         {family.map((m, i) => isEditing ? (
           <div key={i} className="bg-slate-50 rounded-2xl p-4 space-y-3 border border-slate-100">
             <div className="flex justify-between items-center">
-              <span className="text-[10px] font-black uppercase text-slate-500">Member {i + 1}</span>
+              <span className="text-[10px] font-black uppercase text-slate-500">{m.kind === 'pet' ? 'Pet' : 'Person'} {i + 1}</span>
               <button type="button" aria-label={`Remove ${m.name || 'member'}`} onClick={() => removeMember(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div><Label>Name</Label><Input val={m.name} set={v => updateMember(i, { name: v })} /></div>
-              <div><Label>Role</Label><Input val={m.role} set={v => updateMember(i, { role: v })} placeholder="Adult, Child, Pet…" /></div>
-              <div className="col-span-2"><Label>Date of birth</Label><Input val={m.dob} set={v => updateMember(i, { dob: v })} type="date" /></div>
+              <div><Label>Role</Label><Input val={m.role} set={v => updateMember(i, { role: v })} placeholder={m.kind === 'pet' ? 'Dog, Cat…' : 'Adult, Child…'} /></div>
+              <div className="col-span-2"><Label>{m.kind === 'pet' ? 'Date of birth (optional)' : 'Date of birth'}</Label><Input val={m.dob} set={v => updateMember(i, { dob: v })} type="date" /></div>
+              <div><Label>Calories per day</Label><Input val={m.caloriesPerDay ?? ''} set={v => updateMember(i, { caloriesPerDay: v })} type="number" placeholder={m.kind === 'pet' ? 'e.g. 700' : 'Household default'} /></div>
+              <div><Label>Water gal per day</Label><Input val={m.waterGallonsPerDay ?? ''} set={v => updateMember(i, { waterGallonsPerDay: v })} type="number" placeholder={m.kind === 'pet' ? 'e.g. 0.25' : 'Household default'} /></div>
             </div>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              {m.kind === 'pet'
+                ? 'Enter what this animal actually eats and drinks — a pet with blank figures counts for nothing in readiness.'
+                : 'Leave blank to count this person at the household defaults from Household settings.'}
+            </p>
           </div>
         ) : (
           <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-4 last:border-0 last:pb-0">
              <div className="flex items-center gap-4">
                 <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-3xl flex items-center justify-center font-black text-xl">{m.name[0]}</div>
-                <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-600 font-bold uppercase">{m.role} • {m.dob}</div></div>
+                <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-600 font-bold uppercase">{[m.role, m.dob, m.kind === 'pet' ? 'Pet' : ''].filter(Boolean).join(' • ')}</div></div>
              </div>
              {m.role === 'Child' && <div className="bg-indigo-50 text-indigo-700 text-[9px] font-black uppercase px-3 py-1 rounded-full">Priority</div>}
           </div>
@@ -910,7 +935,14 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, onOpenBinder, 
   const cancelEditing = () => { resetFromPlan(); setSaveError(null); setIsEditing(false); };
   const saveEditing = async () => {
     setSaveError(null);
-    const cleanedFamily = family.map(m => ({ name: (m.name || '').trim(), role: (m.role || '').trim(), dob: (m.dob || '').trim() }));
+    const cleanedFamily = family.map(m => ({
+      name: (m.name || '').trim(), role: (m.role || '').trim(), dob: (m.dob || '').trim(),
+      kind: m.kind === 'pet' ? 'pet' : 'person',
+      // A blank field stays blank rather than becoming 0: it means "use the household default"
+      // for a person and "not counted yet" for a pet (see householdNeeds in shared/readiness.js).
+      caloriesPerDay: String(m.caloriesPerDay ?? '').trim() === '' ? '' : Number(m.caloriesPerDay),
+      waterGallonsPerDay: String(m.waterGallonsPerDay ?? '').trim() === '' ? '' : Number(m.waterGallonsPerDay),
+    }));
     const cleanedContacts = contacts.map(c => ({ name: (c.name || '').trim(), phone: (c.phone || '').trim(), type: (c.type || '').trim() }));
     // A row with some fields filled in but no name (family) or no name/phone (contacts) is
     // refused rather than silently dropped below — only a row nothing was ever typed into
@@ -921,7 +953,7 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, onOpenBinder, 
       const ok = await onUpdate({
         ...plan,
         shelterSpot: spot,
-        family: cleanedFamily.filter(m => m.name || m.role || m.dob),
+        family: cleanedFamily.filter(m => m.name || m.role || m.dob || m.caloriesPerDay !== '' || m.waterGallonsPerDay !== ''),
         contacts: cleanedContacts.filter(c => c.name || c.phone || c.type),
         meetingPoints: { primary: meetingPrimary.trim(), secondary: meetingSecondary.trim() },
       });

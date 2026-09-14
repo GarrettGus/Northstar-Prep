@@ -35,7 +35,8 @@ export async function readState() {
     sql`SELECT id, completed_at AS "completedAt" FROM northstar_checklist_checks WHERE household_id = ${householdId}`,
     sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary"
         FROM northstar_plan WHERE household_id = ${householdId}`,
-    sql`SELECT name, role, dob FROM northstar_family_members WHERE household_id = ${householdId} ORDER BY position`,
+    sql`SELECT name, role, dob, kind, calories_per_day AS "caloriesPerDay", water_gallons_per_day AS "waterGallonsPerDay"
+        FROM northstar_family_members WHERE household_id = ${householdId} ORDER BY position`,
     sql`SELECT name, phone, type FROM northstar_contacts WHERE household_id = ${householdId} ORDER BY position`,
     sql`SELECT household_size AS "householdSize", calories_per_person_per_day AS "caloriesPerPersonPerDay",
           water_gallons_per_person_per_day AS "waterGallonsPerPersonPerDay", survival_goal_days AS "survivalGoalDays",
@@ -147,8 +148,12 @@ export async function compareAndSave(version, next, current = emptyState()) {
         statements.push(tx`DELETE FROM northstar_family_members WHERE household_id = ${householdId} AND ${guard}`);
         for (let position = 0; position < next.plan.family.length; position++) {
           const member = next.plan.family[position];
-          statements.push(tx`INSERT INTO northstar_family_members (household_id, position, name, role, dob)
-            SELECT ${householdId}, ${position}, ${member.name}, ${member.role}, ${member.dob} WHERE ${guard}`);
+          // A blank per-member override is stored as NULL so it round-trips back to '' (see
+          // familyMemberSchema), keeping "use the default" distinct from an explicit zero.
+          const calories = member.caloriesPerDay === '' ? null : member.caloriesPerDay;
+          const water = member.waterGallonsPerDay === '' ? null : member.waterGallonsPerDay;
+          statements.push(tx`INSERT INTO northstar_family_members (household_id, position, name, role, dob, kind, calories_per_day, water_gallons_per_day)
+            SELECT ${householdId}, ${position}, ${member.name}, ${member.role}, ${member.dob}, ${member.kind}, ${calories}, ${water} WHERE ${guard}`);
         }
         statements.push(tx`DELETE FROM northstar_contacts WHERE household_id = ${householdId} AND ${guard}`);
         for (let position = 0; position < next.plan.contacts.length; position++) {

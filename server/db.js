@@ -303,3 +303,50 @@ export async function pruneBackups(householdId = 1, keep = 30) {
     SELECT id FROM northstar_backups WHERE household_id = ${householdId} ORDER BY created_at DESC LIMIT ${keep}
   )`;
 }
+
+// --- Request metrics and alert state. ---
+// Rows are per-minute aggregates keyed by route/outcome/status only: no household contents,
+// user IDs, emails, IP addresses or request bodies are stored, so the operational history is
+// safe to read and to retain independently of the data it protects.
+export async function recordRequestMetric({route, outcome, status, latencyMs, at = new Date()}) {
+  const sql = database();
+  const bucket = new Date(Math.floor(at.getTime() / 60000) * 60000).toISOString();
+  const latency = Math.max(0, Math.round(latencyMs));
+  await sql`INSERT INTO northstar_request_metrics (bucket, route, outcome, status, requests, latency_ms_total, latency_ms_max)
+    VALUES (${bucket}, ${route}, ${outcome}, ${status}, 1, ${latency}, ${latency})
+    ON CONFLICT (bucket, route, outcome, status) DO UPDATE SET
+      requests = northstar_request_metrics.requests + 1,
+      latency_ms_total = northstar_request_metrics.latency_ms_total + EXCLUDED.latency_ms_total,
+      latency_ms_max = GREATEST(northstar_request_metrics.latency_ms_max, EXCLUDED.latency_ms_max)`;
+}
+export async function countRecentFailures(route, windowMinutes = 15) {
+  const sql = database();
+  const rows = await sql`SELECT coalesce(sum(requests), 0)::int AS failures FROM northstar_request_metrics
+    WHERE route = ${route} AND outcome IN ('write_failure', 'server_error')
+      AND bucket > now() - make_interval(mins => ${Math.round(windowMinutes)})`;
+  return rows[0].failures;
+}
+export async function summarizeRequestMetrics(windowMinutes = 1440) {
+  const sql = database();
+  return sql`SELECT route, outcome, sum(requests)::int AS requests,
+      (sum(latency_ms_total) / nullif(sum(requests), 0))::int AS average_latency_ms,
+      max(latency_ms_max)::int AS max_latency_ms, max(bucket) AS last_seen
+    FROM northstar_request_metrics
+    WHERE bucket > now() - make_interval(mins => ${Math.round(windowMinutes)})
+    GROUP BY route, outcome ORDER BY route, outcome`;
+}
+export async function pruneRequestMetrics(retentionDays = 14) {
+  const sql = database();
+  await sql`DELETE FROM northstar_request_metrics WHERE bucket < now() - make_interval(days => ${Math.round(retentionDays)})`;
+  await sql`DELETE FROM northstar_alert_state WHERE last_sent_at < now() - make_interval(days => ${Math.round(retentionDays)})`;
+}
+// Returns true only for the caller that wins the row, so concurrent instances hitting the
+// same failure burst send one alert between them rather than one each.
+export async function claimAlert(key, cooldownMinutes = 60) {
+  const sql = database();
+  const rows = await sql`INSERT INTO northstar_alert_state (key, last_sent_at) VALUES (${key}, now())
+    ON CONFLICT (key) DO UPDATE SET last_sent_at = now()
+    WHERE northstar_alert_state.last_sent_at < now() - make_interval(mins => ${Math.round(cooldownMinutes)})
+    RETURNING key`;
+  return Boolean(rows[0]);
+}

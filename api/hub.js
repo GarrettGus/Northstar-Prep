@@ -1,7 +1,7 @@
 import { validSession, sameOrigin } from '../server/auth.js';
 import { readState, compareAndSave, insertAuditLog, insertReminderHistory, householdId } from '../server/db.js';
 import { applyAction, collectionKey, idSchema } from '../shared/schema.js';
-import { beginRequest, logFailure } from '../server/observability.js';
+import { beginRequest, logFailure, logIssue, observe } from '../server/observability.js';
 import { storeImage, deleteImage, isDataUrlImage, isManagedImageUrl } from '../server/imageStore.js';
 
 function summarizeAction(action, previousState) {
@@ -103,11 +103,11 @@ export function createHandler(repository = {readState, compareAndSave, logAudit:
         const version = await repository.compareAndSave(current.version,next,current.data);
         if (version !== undefined) {
           try { await repository.logAudit({userId: session.userId, action: action.type, ...summarizeAction(action, current.data)}); }
-          catch (error) { console.error(JSON.stringify({event:'audit_log_failure', requestId:request.id, error: error instanceof Error ? error.name : 'UnknownError'})); }
+          catch (error) { logIssue(request, '/api/hub', 'audit_log_failure', error); }
           try { await cleanupOrphanedImages(current.data, next, imageStore.remove); }
-          catch (error) { console.error(JSON.stringify({event:'image_cleanup_failure', requestId:request.id, error: error instanceof Error ? error.name : 'UnknownError'})); }
+          catch (error) { logIssue(request, '/api/hub', 'image_cleanup_failure', error); }
           try { for (const event of reminderHistoryEvents(current.data, next)) await repository.logReminderHistory({...event, userId: session.userId}); }
-          catch (error) { console.error(JSON.stringify({event:'reminder_history_failure', requestId:request.id, error: error instanceof Error ? error.name : 'UnknownError'})); }
+          catch (error) { logIssue(request, '/api/hub', 'reminder_history_failure', error); }
           return res.status(200).json({data:next,version});
         }
       }
@@ -115,4 +115,4 @@ export function createHandler(repository = {readState, compareAndSave, logAudit:
     } catch (error) { logFailure(request, '/api/hub', 503, error); return res.status(503).json({error:'Database unavailable. Your changes were not confirmed; refresh before retrying.'}); }
   };
 }
-export default createHandler();
+export default observe('/api/hub', createHandler());

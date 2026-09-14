@@ -1,6 +1,6 @@
 import { getMembership, listReminderHistory } from '../server/db.js';
 import { validSession } from '../server/auth.js';
-import { beginRequest, logFailure } from '../server/observability.js';
+import { beginRequest, logFailure, observe } from '../server/observability.js';
 
 export function createHandler(repository = {getMembership, listReminderHistory}, authenticate = validSession) {
   return async function handler(req, res) {
@@ -17,4 +17,4 @@ export function createHandler(repository = {getMembership, listReminderHistory},
     } catch (error) { logFailure(request, '/api/reminder-history', 503, error); return res.status(503).json({error: 'Reminder history is unavailable.'}); }
   };
 }
-export default createHandler();
+export default observe('/api/reminder-history', createHandler());

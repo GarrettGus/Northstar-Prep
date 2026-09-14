@@ -1,8 +1,8 @@
 import { validSession, sameOrigin } from '../server/auth.js';
-import { readState, getMembership, insertBackupRecord, listBackupRecords, getBackupRecord, pruneBackups } from '../server/db.js';
+import { readState, getMembership, insertBackupRecord, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics } from '../server/db.js';
 import { backupsConfigured, encryptBackup, decryptBackup } from '../server/backupCrypto.js';
 import { stateSchema, backupSchema } from '../shared/schema.js';
-import { beginRequest, logFailure } from '../server/observability.js';
+import { beginRequest, logFailure, logIssue, metricsRetentionDays, observe } from '../server/observability.js';
 
 const retainCount = 30;
 
@@ -13,7 +13,7 @@ function isCronRequest(req) {
   return Boolean(secret) && req.headers.authorization === `Bearer ${secret}`;
 }
 
-export function createHandler(repository = {readState, getMembership, insertBackupRecord, listBackupRecords, getBackupRecord, pruneBackups}, authenticate = validSession) {
+export function createHandler(repository = {readState, getMembership, insertBackupRecord, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics}, authenticate = validSession) {
   return async function handler(req, res) {
     const request = beginRequest(req, res);
     res.setHeader('Cache-Control', 'no-store');
@@ -32,7 +32,12 @@ export function createHandler(repository = {readState, getMembership, insertBack
           iv, authTag, ciphertext,
         });
         await repository.pruneBackups(1, retainCount);
-        return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length});
+        // The daily cron doubles as the maintenance run for request metrics, so operational
+        // history stays bounded without a second scheduled job (Vercel Hobby allows one).
+        let metricsPruned = true;
+        try { await repository.pruneRequestMetrics(metricsRetentionDays()); }
+        catch (error) { metricsPruned = false; logIssue(request, '/api/backup', 'metrics_prune_failure', error); }
+        return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length, metricsPruned});
       } catch (error) {
         logFailure(request, '/api/backup', 500, error);
         return res.status(500).json({status: 'failed', error: error.message});
@@ -69,4 +74,4 @@ export function createHandler(repository = {readState, getMembership, insertBack
     }
   };
 }
-export default createHandler();
+export default observe('/api/backup', createHandler());

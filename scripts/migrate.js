@@ -198,6 +198,26 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_backups (
 )`;
 await sql`CREATE INDEX IF NOT EXISTS northstar_backups_household_idx ON northstar_backups (household_id, created_at DESC)`;
 
+// --- Production monitoring: per-minute request metrics and alert de-duplication state. ---
+// Deliberately content-free (route, outcome, status, latency only) so operational history can
+// be retained and read without exposing household data. Pruned by the daily maintenance cron.
+await sql`CREATE TABLE IF NOT EXISTS northstar_request_metrics (
+  bucket timestamptz NOT NULL,
+  route text NOT NULL,
+  outcome text NOT NULL,
+  status integer NOT NULL,
+  requests integer NOT NULL DEFAULT 0,
+  latency_ms_total bigint NOT NULL DEFAULT 0,
+  latency_ms_max integer NOT NULL DEFAULT 0,
+  PRIMARY KEY (bucket, route, outcome, status)
+)`;
+await sql`CREATE INDEX IF NOT EXISTS northstar_request_metrics_recent_idx ON northstar_request_metrics (bucket DESC)`;
+await sql`CREATE INDEX IF NOT EXISTS northstar_request_metrics_route_idx ON northstar_request_metrics (route, outcome, bucket DESC)`;
+await sql`CREATE TABLE IF NOT EXISTS northstar_alert_state (
+  key text PRIMARY KEY,
+  last_sent_at timestamptz NOT NULL DEFAULT now()
+)`;
+
 // One-time backfill: copy the existing JSONB row into the new relational tables. Only runs while
 // the relational tables are still empty, so it's safe to leave in place and re-run this script.
 const [{count: inventoryRows}] = await sql`SELECT count(*)::int AS count FROM northstar_inventory`;

@@ -36,9 +36,43 @@ Earlier versions of this app used one `HOUSEHOLD_PASSWORD` shared by everyone. T
 Target repository: [GarrettGus/Northstar-Prep](https://github.com/GarrettGus/Northstar-Prep).
 Target Vercel project: `garrettgus-projects/northstar-prep`.
 
-Use the Vite preset, `npm run build`, output directory `dist`, and Node 22 or newer. Vercel discovers the `/api` functions automatically. Run the database migration before the first login, and re-run `npm run db:migrate` before deploying an upgrade — this release adds a `writer_token` column that `/api/hub` writes on every save, so saves fail with a 503 until the migration has run. Configure separate Neon branches/databases and environment variables for development, preview and production so preview builds cannot write household production data. Without configuration the app shows a setup message and denies data access.
+Use the Vite preset, `npm run build`, output directory `dist`, and Node 22 or newer. Vercel discovers the `/api` functions automatically. Run the database migration before the first login, and re-run `npm run db:migrate` before deploying an upgrade — this release adds a `writer_token` column that `/api/hub` writes on every save, so saves fail with a 503 until the migration has run.
 
 `npm run preview` previews the compiled frontend only; use `npm run dev` or a Vercel deployment to exercise API functionality.
+
+### Environments
+
+Preview builds must never write to production household data. Give each Vercel deployment target its own database and its own environment variables:
+
+| Vercel target | Purpose | Database |
+| --- | --- | --- |
+| Production | The live `main` deployment | The production Neon branch/database |
+| Preview | Every PR and non-`main` branch deployment | The [Neon Vercel integration](https://neon.tech/docs/guides/vercel) creates and tears down an isolated Neon branch per preview deployment automatically, seeded from production's schema (not its data unless you configure that) |
+| Development | `vercel env pull` / local work | A separate long-lived Neon branch, never production |
+
+Set every server-only variable from [Setup](#setup) (`DATABASE_URL`, `DATABASE_URL_UNPOOLED`, `SESSION_SECRET`, `BACKUP_ENCRYPTION_KEY`, `CRON_SECRET`, `BLOB_READ_WRITE_TOKEN`, etc.) per target in **Vercel → Project → Settings → Environment Variables**, scoping each to Production, Preview or Development rather than "All Environments". If you use the Neon integration, it manages `DATABASE_URL`/`DATABASE_URL_UNPOOLED` for Preview automatically; set the Production and Development values yourself, pointing at their own Neon branches. `HOUSEHOLD_OWNER_EMAIL`/`HOUSEHOLD_PASSWORD` and `CRON_SECRET` should differ per target so a preview deployment cannot bootstrap or trigger backups against production. Without a `DATABASE_URL` configured for a given target, the app shows a setup message and denies data access rather than falling back to another database.
+
+For a persistent staging environment (a fixed URL to demo against before promoting to production, distinct from ephemeral per-PR previews), add a dedicated branch (e.g. `staging`) as a second Vercel "Production" domain is not appropriate here — instead deploy it as a standing Preview deployment (Vercel keeps the latest deployment of a given branch reachable at a stable branch URL) with its own Preview-scoped overrides for that branch, and its own Neon branch, in **Settings → Git → Environment Variable overrides**.
+
+### Migrations in CI
+
+`scripts/migrate.js` connects with `DATABASE_URL_UNPOOLED` (falling back to `DATABASE_URL`) because Neon's pooled connection does not support the session state some migration statements need. Run it from CI against each target's own database using that target's own connection string as a workflow secret — never share one migration run across environments. `.github/workflows/ci.yml`'s `verify` job proves `scripts/migrate.js` applies cleanly and is re-runnable (against a disposable database, never a deployed one) before you run it for real; see [Before a production migration](#before-a-production-migration).
+
+### Staging smoke test
+
+`npm run smoke-test -- <url>` (`scripts/smoketest.js`) polls `<url>/api/health` until it reports `{"status":"ok","database":"ok"}`, retrying with backoff (`SMOKE_TEST_ATTEMPTS`, `SMOKE_TEST_DELAY_MS`) since a fresh deployment can take a moment to become reachable. The `staging-smoke-test` job in `.github/workflows/ci.yml` runs it automatically against every non-Production deployment Vercel reports (via the `deployment_status` event), so a preview or staging deployment that cannot reach its own database is caught before anyone promotes it to production. Run it manually against the staging URL as a final check before promoting.
+
+### Rollback and recovery
+
+**Application rollback:** Vercel keeps every deployment. From the project's **Deployments** tab, use **Instant Rollback** (or "Promote to Production" on an older deployment) to point the production domain at a previous, known-good build immediately — no rebuild or redeploy needed. This reverts code only, not the database.
+
+**Database rollback (household data):**
+1. First choice — the app's own backups: **Household settings** lists automatic encrypted daily backups (`/api/backup`, see [Backups and migration](#backups-and-migration)) and the manual JSON export/import. Restoring either previews the merge before anything is applied, so a bad write can be undone without touching the database directly.
+2. Schema rollback — `scripts/migrate.js` only adds tables/columns (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`) and never drops or renames one, so there is nothing destructive to roll back after running it; if a migration is ever added that changes existing columns, write and test its down-migration in the same PR.
+3. Point-in-time recovery — for corruption or data loss beyond what an application backup covers, use [Neon's branch restore](https://neon.tech/docs/guides/branch-restore) to create a new branch from a timestamp before the incident, verify its contents, then repoint the affected Vercel environment's `DATABASE_URL`/`DATABASE_URL_UNPOOLED` at it (or restore the original branch in place, per Neon's docs) and redeploy.
+4. Never restore a preview or staging database from a production backup or branch without stripping household PII first — see the single-household privacy note above.
+
+Practice both paths (Instant Rollback and a backup restore) against a preview deployment periodically so the first real incident isn't the first time either has been exercised.
 
 ## Inventory management
 

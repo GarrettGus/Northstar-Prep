@@ -11,7 +11,8 @@
     "test:e2e": "playwright test --config tests/e2e/playwright.config.js",
     "test:e2e:app": "playwright test --config tests/e2e/app.config.js",
     "db:migrate": "node --env-file-if-exists=.env.local scripts/migrate.js",
-    "db:migrate-images": "node --env-file-if-exists=.env.local scripts/migrate-images.js"
+    "db:migrate-images": "node --env-file-if-exists=.env.local scripts/migrate-images.js",
+    "smoke-test": "node scripts/smoketest.js"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",

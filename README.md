@@ -25,7 +25,7 @@ Database updates use compare-and-swap revisions and bounded retries. Shopping pu
 3. Copy `.env.example` to `.env.local` for local development, or pull the project's development variables using Vercel CLI. Never commit credentials. No `VITE_` variables are needed. Use `DATABASE_URL_UNPOOLED` for migrations when Neon provides it; the app uses pooled `DATABASE_URL` for request traffic.
 4. Run `npm ci` and `npm run db:migrate`. The migration creates the tables (household state, accounts, membership, invitations, audit history) without overwriting existing records, and creates the first owner account from `HOUSEHOLD_OWNER_EMAIL`/`HOUSEHOLD_PASSWORD` the first time it runs with no accounts yet. If upgrading a deployment that already has inventory images stored as base64 in Postgres (from before object storage was added), run `npm run db:migrate-images` once `BLOB_READ_WRITE_TOKEN` is set to move them to object storage; it's safe to re-run and leaves already-migrated rows untouched.
 5. Run `npm run dev` for the frontend and API at `http://127.0.0.1:5173`. Check `GET /api/health` for an API and database health signal, and **Household settings → Service health** once signed in for failure counts and database latency. Sign in with the owner email and password from step 4, then invite other household members from **Household settings**.
-6. Run `npm test` and `npm run build`. Pull requests also run both checks through `.github/workflows/ci.yml`.
+6. Run `npm test` and `npm run build`, plus the browser suites described under [Testing](#testing). Pull requests run all of them through `.github/workflows/ci.yml`.
 
 ### Migrating from the shared household password
 
@@ -36,7 +36,7 @@ Earlier versions of this app used one `HOUSEHOLD_PASSWORD` shared by everyone. T
 Target repository: [GarrettGus/Northstar-Prep](https://github.com/GarrettGus/Northstar-Prep).
 Target Vercel project: `garrettgus-projects/northstar-prep`.
 
-Use the Vite preset, `npm run build`, output directory `dist`, and Node 22 or newer. Vercel discovers the `/api` functions automatically. Run the database migration before the first login. Configure separate Neon branches/databases and environment variables for development, preview and production so preview builds cannot write household production data. Without configuration the app shows a setup message and denies data access.
+Use the Vite preset, `npm run build`, output directory `dist`, and Node 22 or newer. Vercel discovers the `/api` functions automatically. Run the database migration before the first login, and re-run `npm run db:migrate` before deploying an upgrade — this release adds a `writer_token` column that `/api/hub` writes on every save, so saves fail with a 503 until the migration has run. Configure separate Neon branches/databases and environment variables for development, preview and production so preview builds cannot write household production data. Without configuration the app shows a setup message and denies data access.
 
 `npm run preview` previews the compiled frontend only; use `npm run dev` or a Vercel deployment to exercise API functionality.
 
@@ -55,6 +55,30 @@ In addition to manual export/import, `/api/backup` is called on a schedule (see 
 No data is retrieved automatically from the previous provider. Its cloud database is not altered or deleted. Keep the original backup until you have verified the import. The app caches the latest authenticated state locally and queues up to 100 edits while offline; queued writes sync after reconnecting and remain subject to server conflict checks.
 
 Water units convert from US gallons, liters, mL or fluid ounces. Bottles/cases require a gallons-per-unit value; unknown units otherwise count as zero. Expired food and water do not count toward readiness. Power and food estimates still use simplified household assumptions.
+
+## Testing
+
+| Command | Covers | Needs Postgres |
+| --- | --- | --- |
+| `npm test` | Validation, API behavior, readiness math, monitoring, contrast, and the migration suite | Optional (migration tests skip without it) |
+| `npm run test:e2e` | Accessibility regressions against an isolated component harness | No |
+| `npm run test:e2e:app` | The full signed-in app: login, add/edit/delete, shopping purchases, backup restore, two-device conflicts, offline and reconnect | Yes |
+| `npm run build` | The production frontend compiles | No |
+
+The two database-backed suites never touch a deployed database. Each one creates a uniquely named throwaway database on the server given by `TEST_DATABASE_URL` (default `postgres://postgres:postgres@127.0.0.1:5432/postgres`, matching the `postgres:16` service CI starts), runs the real `scripts/migrate.js` against it, and drops it afterwards. `npm run test:e2e:app` additionally starts the real dev server (Vite plus the `/api` handlers) on port 5183 and drives it with Chromium.
+
+Locally, any Postgres you can create databases on will do:
+
+```sh
+docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres --name northstar-test-db postgres:16
+npm test && npm run test:e2e && npm run test:e2e:app
+```
+
+The serverless Neon driver normally speaks SQL over HTTP to Neon. For tests only, `tests/support/neonOverPostgres.js` swaps the driver's fetch function for one backed by a local Postgres connection. Nothing in `api/`, `server/` or `scripts/` knows about it, so the suites exercise the shipping code unmodified — the same migration script, the same `server/db.js` queries and the same API handlers a deployment runs.
+
+### Before a production migration
+
+Run the workflow (`Actions → Verify NorthStar Prep → Run workflow`, or rely on the run for the commit you are deploying) before running `npm run db:migrate` against production. The migration suite applies `scripts/migrate.js` to an empty database, re-applies it to prove it is re-runnable, backfills a pre-relational deployment from the old JSONB row, and then reads and writes household state through `server/db.js` — so a migration that does not apply, is not idempotent, or drifts from the columns the app queries fails in CI rather than against live household data.
 
 ## Monitoring and alerts
 

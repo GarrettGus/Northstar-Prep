@@ -8,6 +8,7 @@ import invite from '../api/invite.js';
 import audit from '../api/audit.js';
 import backup from '../api/backup.js';
 import reminderHistory from '../api/reminder-history.js';
+const port = Number(process.env.PORT) || 5173;
 const vite = await createViteServer({server:{middlewareMode:true},appType:'spa'});
 createServer(async(req,res)=>{
   const path = new URL(req.url,'http://localhost').pathname;
@@ -22,4 +23,4 @@ createServer(async(req,res)=>{
     if(body) req.body=JSON.parse(body);
     await handler(req,res);
   } catch {res.status(400).json({error:'Invalid request.'});}
-}).listen(5173,'127.0.0.1',()=>console.log('NorthStar Prep: http://127.0.0.1:5173'));
+}).listen(port,'127.0.0.1',()=>console.log(`NorthStar Prep: http://127.0.0.1:${port}`));

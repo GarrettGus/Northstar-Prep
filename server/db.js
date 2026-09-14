@@ -103,6 +103,7 @@ function upsertChecklistCheck(tx, check, guard) {
 export async function compareAndSave(version, next, current = emptyState()) {
   const sql = database();
   const targetVersion = version + 1;
+  const writerToken = randomUUID();
   const inventoryDiff = diffById(current.inventory, next.inventory);
   const shoppingDiff = diffById(current.shoppingList, next.shoppingList);
   const applianceDiff = diffById(current.appliances, next.appliances);
@@ -112,8 +113,11 @@ export async function compareAndSave(version, next, current = emptyState()) {
   const settingsChanged = JSON.stringify(current.settings) !== JSON.stringify(next.settings);
 
   const results = await sql.transaction(tx => {
-    const statements = [tx`UPDATE northstar_household SET version = ${targetVersion} WHERE id = ${householdId} AND version = ${version} RETURNING version`];
-    const guard = tx`EXISTS (SELECT 1 FROM northstar_household WHERE id = ${householdId} AND version = ${targetVersion})`;
+    const statements = [tx`UPDATE northstar_household SET version = ${targetVersion}, writer_token = ${writerToken} WHERE id = ${householdId} AND version = ${version} RETURNING version`];
+    // The guard must match the token this save wrote, not just the target version: a save that
+    // lost the compare-and-swap to a concurrent writer sees that writer's version and would
+    // otherwise still apply its own (stale) row writes on top of the edit that won.
+    const guard = tx`EXISTS (SELECT 1 FROM northstar_household WHERE id = ${householdId} AND version = ${targetVersion} AND writer_token = ${writerToken})`;
 
     for (const id of inventoryDiff.toDelete) statements.push(tx`DELETE FROM northstar_inventory WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
     for (const item of inventoryDiff.toUpsert) statements.push(upsertInventoryItem(tx, item, guard));
@@ -293,7 +297,7 @@ export async function listBackupRecords(householdId = 1, limit = 20) {
 }
 export async function getBackupRecord(id, householdId = 1) {
   const sql = database();
-  const rows = await sql`SELECT id, created_at, checksum, iv, auth_tag, ciphertext
+  const rows = await sql`SELECT id, created_at, checksum, iv, auth_tag AS "authTag", ciphertext
     FROM northstar_backups WHERE id = ${id} AND household_id = ${householdId} AND status = 'success'`;
   return rows[0];
 }

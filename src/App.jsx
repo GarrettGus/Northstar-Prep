@@ -2,13 +2,13 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Shield, Package, Map, Link as LinkIcon, AlertTriangle, CheckCircle, Plus, Trash2, Home,
   Droplets, Thermometer, Wind, Phone, Navigation, RefreshCw, Settings, Link2, ChevronRight,
-  ClipboardList, Sparkles, Zap, BookOpen, X, Flame, Edit2, Save, History, Utensils,
+  ClipboardList, Zap, BookOpen, X, Flame, Edit2, Save, History, Utensils,
   Database, UploadCloud, Battery, AlertOctagon, Smartphone, FileJson, Download, Upload,
-  Plug, DollarSign, ShoppingCart, Store, ArrowRight, Image as ImageIcon, Layers,
+  Plug, DollarSign, ShoppingCart, Store, ArrowRight, Layers,
   Siren, SearchCheck, Power, Tag, Calendar, ArrowUpDown
 } from 'lucide-react';
 import { request } from './api.js';
-import { computeReadiness, isExpired, isRecurringDue } from '../shared/readiness.js';
+import { computeReadiness, computeReadinessGaps, isExpired, isRecurringDue } from '../shared/readiness.js';
 import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
 import { effectiveReminderDueDate, isReminderOverdue, todayLocal, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
@@ -18,20 +18,13 @@ import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, sav
 const SYSTEM_ID = 'Household';
 const progressPercent = (value, goal) => goal > 0 ? (value / goal) * 100 : 0;
 
-// AI remains unavailable until an authenticated server endpoint is configured.
+// The emergency drill remains unavailable until an authenticated server endpoint is configured.
+// Meal planning, gap analysis and item/appliance suggestions no longer need one: gap analysis is
+// computed deterministically (see computeReadinessGaps), and the others were removed rather than
+// left as dead buttons.
 async function callGemini() {
   throw new Error('AI is not configured.');
 }
-async function callImagen() {
-  alert('AI icons are not configured yet.');
-  return null;
-}
-async function smartSuggestItem() {
-  alert('AI suggestions are not configured yet. Please enter the item manually.');
-  return null;
-}
-const smartSuggestAppliance = smartSuggestItem;
-const resizeBase64 = async (value) => `data:image/png;base64,${value}`;
 
 // --- Main App Component ---
 export default function App() {
@@ -48,6 +41,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
   const [showSyncModal, setShowSyncModal] = useState(false);
+  const [showBinder, setShowBinder] = useState(false);
   const [aiContent, setAiContent] = useState(null);
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [globalError, setGlobalError] = useState(null);
@@ -179,33 +173,17 @@ export default function App() {
 
   // --- Logic Helpers ---
   const stats = useMemo(() => computeReadiness({ inventory, appliances }, settings), [inventory, appliances, settings]);
+  const gaps = useMemo(() => computeReadinessGaps(stats, settings), [stats, settings]);
   const overdueReminders = useMemo(() => reminders.filter(r => isReminderOverdue(r)), [reminders]);
   const handleUpdateSettings = (next) => mutate({ type: 'settings', settings: next });
 
-  const generateMealPlan = async () => {
-    setIsAiLoading(true);
-    const inventoryText = inventory.map(i => `${i.name}: ${i.quantity} ${i.unit}`).join(', ');
-    const prompt = `Based on this survival inventory: ${inventoryText}, create a 3-day meal plan for a family of 4 in a power outage. Daily calorie target 8,000. Provide concise daily summaries.`;
-    try {
-      const result = await callGemini(prompt);
-      setAiContent({ title: "AI Survival Meal Plan ✨", text: result });
-    } catch (e) {
-      setAiContent({ title: "Error", text: e.message });
-    }
-    setIsAiLoading(false);
-  };
-
-  const analyzeInventory = async () => {
-    setIsAiLoading(true);
-    const inventoryText = inventory.map(i => `${i.name}: ${i.quantity} ${i.unit} (${i.category})`).join(', ');
-    const prompt = `Analyze this survival inventory list for a family of 4 in a winter climate: ${inventoryText}. Identify 3 critical gaps or missing categories to reach 14 days self-sufficiency. Be specific and concise.`;
-    try {
-      const result = await callGemini(prompt);
-      setAiContent({ title: "AI Gap Analysis ✨", text: result });
-    } catch (e) {
-      setAiContent({ title: "Error", text: e.message });
-    }
-    setIsAiLoading(false);
+  // Queues a generic supply representing a readiness shortfall onto the shopping list; the
+  // household edits it afterward (specific product, price, store) like any other item.
+  const handleAddGapShortfall = (gap) => {
+    if (gap.key === 'water') return handleAdd('shopping_list', { name: 'Drinking water (readiness shortfall)', category: 'Water', quantity: gap.suggestedQuantity, unit: 'gal', gallonsPerUnit: 1 });
+    if (gap.key === 'food') return handleAdd('shopping_list', { name: 'Emergency food (readiness shortfall)', category: 'Food', quantity: 1, unit: 'servings', caloriesPerUnit: gap.suggestedCalories });
+    if (gap.key === 'power') return handleAdd('shopping_list', { name: 'Backup power storage (readiness shortfall)', category: 'Power', quantity: 1, unit: 'units', capacityPerUnit: gap.suggestedRawKwh });
+    return Promise.resolve(false);
   };
 
   const generateDrill = async () => {
@@ -254,6 +232,7 @@ export default function App() {
     return <Login configured={configured} error={globalError} onLogin={handleAuthenticated} />;
   }
   if (loading && !inventory.length && !globalError) return <LoadingScreen />;
+  if (showBinder) return <EmergencyBinder plan={plan} inventory={inventory} stats={stats} settings={settings} checklistChecks={checklistChecks} onClose={() => setShowBinder(false)} />;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans select-none">
@@ -262,7 +241,7 @@ export default function App() {
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
-        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} onGeneratePlan={generateMealPlan} onAnalyzeGaps={analyzeInventory} isAiLoading={isAiLoading} overdueReminders={overdueReminders} onViewReminders={() => setActiveTab('plan')} />}
+        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} onViewReminders={() => setActiveTab('plan')} />}
         {activeTab === 'inventory' && (
           <InventoryManager
             title="Supply Hub"
@@ -276,8 +255,6 @@ export default function App() {
             onBulkDelete={(ids) => handleBulkDelete('inventory', ids)}
             onBulkUpdate={(ids, changes) => handleBulkUpdate('inventory', ids, changes)}
             onRestock={handleRestockRecurring}
-            onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)}
-            isAiLoading={isAiLoading}
           />
         )}
         {activeTab === 'shopping' && (
@@ -293,8 +270,6 @@ export default function App() {
             onBulkDelete={(ids) => handleBulkDelete('shopping_list', ids)}
             onBulkUpdate={(ids, changes) => handleBulkUpdate('shopping_list', ids, changes)}
             onBuy={handleBuyItem}
-            onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)}
-            isAiLoading={isAiLoading}
           />
         )}
         {activeTab === 'power' && (
@@ -305,13 +280,12 @@ export default function App() {
             onAdd={(i) => handleAdd('appliances', i)}
             onUpdate={(id, i) => handleUpdate('appliances', id, i)}
             onDelete={(id) => handleDelete('appliances', id)}
-            onSmartSuggest={(txt) => smartSuggestAppliance(txt, setIsAiLoading)}
-            isAiLoading={isAiLoading}
           />
         )}
         {activeTab === 'plan' && (
           <EmergencyPlan
             plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunDrill={generateDrill} isAiLoading={isAiLoading}
+            onOpenBinder={() => setShowBinder(true)}
             reminders={reminders} checklistChecks={checklistChecks}
             onAddReminder={(i) => handleAdd('reminders', i)}
             onUpdateReminder={(id, i) => handleUpdate('reminders', id, i)}
@@ -325,14 +299,14 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} />}
+      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
       {aiContent && <AiModal content={aiContent} onClose={() => setAiContent(null)} />}
     </div>
   );
 }
 
 // --- Dashboard ---
-function Dashboard({ stats, settings, onGeneratePlan, onAnalyzeGaps, isAiLoading, overdueReminders = [], onViewReminders }) {
+function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueReminders = [], onViewReminders }) {
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       {overdueReminders.length > 0 && (
@@ -368,25 +342,67 @@ function Dashboard({ stats, settings, onGeneratePlan, onAnalyzeGaps, isAiLoading
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
-          <button aria-label="Generate meal plan" onClick={onGeneratePlan} disabled={isAiLoading} className="bg-emerald-50 text-emerald-700 py-4 rounded-[2rem] flex flex-col items-center justify-center gap-1 font-black text-[10px] uppercase tracking-widest border border-emerald-100 shadow-sm active:scale-95 transition-all disabled:opacity-50">
-          {isAiLoading ? <RefreshCw className="animate-spin" size={20}/> : <Sparkles size={20}/>}
-          Meal Plan
-        </button>
-        <button aria-label="Analyze inventory gaps" onClick={onAnalyzeGaps} disabled={isAiLoading} className="bg-blue-50 text-blue-700 py-4 rounded-[2rem] flex flex-col items-center justify-center gap-1 font-black text-[10px] uppercase tracking-widest border border-blue-100 shadow-sm active:scale-95 transition-all disabled:opacity-50">
-          {isAiLoading ? <RefreshCw className="animate-spin" size={20}/> : <SearchCheck size={20}/>}
-          Analyze Gaps
-        </button>
-      </div>
+      <ReadinessGaps gaps={gaps} onAddShortfall={onAddGapShortfall} />
+    </div>
+  );
+}
+
+// Deterministic gap analysis: what each readiness goal is short by, and a one-tap way to queue
+// a generic replacement item for it onto the shopping list. Replaces the old AI "Analyze Gaps".
+function ReadinessGaps({ gaps, onAddShortfall }) {
+  const [addingKey, setAddingKey] = useState(null);
+  const shortfalls = gaps.filter(gap => !gap.met);
+  const addableKeys = new Set(['water', 'food', 'power']);
+
+  const describe = (gap) => {
+    if (gap.key === 'water') return `${gap.shortfallDays.toFixed(1)} days short of goal — about ${gap.suggestedQuantity.toLocaleString()} more gallons needed.`;
+    if (gap.key === 'food') return `${gap.shortfallDays.toFixed(1)} days short of goal — about ${gap.suggestedCalories.toLocaleString()} more kcal needed.`;
+    if (gap.key === 'heat') return `${gap.shortfallHours.toFixed(0)} more heat hours needed to reach the goal.`;
+    if (gap.key === 'power') return `${gap.shortfallKwh.toFixed(1)} more usable kWh needed (about ${gap.suggestedRawKwh.toLocaleString()} kWh of stored capacity).`;
+    return '';
+  };
+
+  const addShortfall = async (gap) => {
+    setAddingKey(gap.key);
+    await onAddShortfall(gap);
+    setAddingKey(null);
+  };
+
+  return (
+    <div className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-4">
+      <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest flex items-center gap-2"><SearchCheck size={14}/> Readiness Gaps</h3>
+      {shortfalls.length === 0 ? (
+        <p className="text-sm font-bold text-emerald-600">Every readiness goal is currently met.</p>
+      ) : (
+        <div className="space-y-3">
+          {shortfalls.map(gap => (
+            <div key={gap.key} className="flex items-start justify-between gap-3 bg-slate-50 rounded-2xl p-4">
+              <div>
+                <div className="font-black text-slate-800 text-sm">{gap.label}</div>
+                <div className="text-xs text-slate-600 font-bold">{describe(gap)}</div>
+              </div>
+              {addableKeys.has(gap.key) && (
+                <button
+                  aria-label={`Add ${gap.label.toLowerCase()} shortfall to shopping list`}
+                  onClick={() => addShortfall(gap)}
+                  disabled={addingKey === gap.key}
+                  className="shrink-0 text-[10px] font-black px-3 py-2.5 rounded-full bg-blue-600 text-white uppercase tracking-widest active:scale-95 transition-all disabled:opacity-50"
+                >
+                  {addingKey === gap.key ? <RefreshCw className="animate-spin" size={14}/> : 'Add to list'}
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
 // --- Appliance Manager ---
-function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmartSuggest, isAiLoading }) {
+function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingId, setEditingId] = useState(null);
-  const [smartText, setSmartText] = useState('');
   const [form, setForm] = useState({ name: '', watts: '', hours: '', active: true });
 
   const reset = () => { setForm({ name: '', watts: '', hours: '', active: true }); setEditingId(null); setShowAdd(false); };
@@ -400,7 +416,6 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
   };
 
   const handleEdit = (item) => { setForm(item); setEditingId(item.id); setShowAdd(true); window.scrollTo({ top: 0, behavior: 'smooth' }); };
-  const runSmart = async () => { const res = await onSmartSuggest(smartText); if (res) { setForm(prev => ({...prev, ...res})); setSmartText(''); } };
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
@@ -430,14 +445,6 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
 
       {showAdd && (
         <div className="space-y-4 mb-6 animate-in slide-in-from-top-4 duration-300">
-          {!editingId && (
-            <div className="bg-indigo-50 p-4 rounded-[2rem] border border-indigo-100 flex gap-2">
-              <input className="flex-1 bg-white border border-indigo-100 rounded-xl px-4 py-2 text-sm outline-none" placeholder="e.g. 'Standard Fridge' or 'CPAP'" value={smartText} onChange={e => setSmartText(e.target.value)} />
-              <button onClick={runSmart} disabled={isAiLoading} className="p-3 bg-indigo-600 text-white rounded-xl shadow-lg active:scale-95 disabled:opacity-50">
-                {isAiLoading ? <RefreshCw size={16} className="animate-spin" /> : <Zap size={16}/>}
-              </button>
-            </div>
-          )}
           <form onSubmit={submit} className="bg-white border-2 border-violet-100 rounded-[2.5rem] p-7 shadow-2xl space-y-4">
              <div className="flex justify-between items-center mb-2">
                 <h3 className="text-xs font-black uppercase text-violet-600 tracking-widest">{editingId ? 'Edit Device' : 'New Appliance'}</h3>
@@ -487,11 +494,9 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
 }
 
 // --- Inventory Manager (Reused for Shop) ---
-function InventoryManager({ title, items, shoppingList = [], stats, settings, onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onBuy, onSmartSuggest, isAiLoading, isShoppingMode }) {
+function InventoryManager({ title, items, shoppingList = [], stats, settings, onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onBuy, isShoppingMode }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
-  const [smartText, setSmartText] = useState('');
-  const [isImgLoading, setIsImgLoading] = useState(false);
   const [sortBy, setSortBy] = useState(''); // 'expiry', 'calories', 'date'
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
@@ -552,18 +557,6 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
   };
 
   const handleEdit = (item) => { setForm(item); setEditingItem(item); setShowAdd(true); window.scrollTo({ top: 0, behavior: 'smooth' }); };
-  const runSmart = async () => { const res = await onSmartSuggest(smartText); if (res) { setForm(prev => ({...prev, ...res})); setSmartText(''); } };
-
-  const handleGenerateImage = async () => {
-    if (!form.name) return;
-    setIsImgLoading(true);
-    const base64 = await callImagen(form.name);
-    if (base64) {
-       const resized = await resizeBase64(base64);
-       setForm(prev => ({ ...prev, image: resized }));
-    }
-    setIsImgLoading(false);
-  };
 
   const totalShopCost = useMemo(() => items.reduce((acc, i) => acc + (Number(i.price||0) * Number(i.quantity||0)), 0), [items]);
 
@@ -667,14 +660,6 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
 
       {showAdd && (
         <div className="space-y-4 mb-6 animate-in slide-in-from-top-4 duration-300">
-          {!editingItem && (
-            <div className="bg-indigo-50 p-4 rounded-[2rem] border border-indigo-100 flex gap-2">
-              <input className="flex-1 bg-white border border-indigo-100 rounded-xl px-4 py-2 text-sm outline-none" placeholder="e.g. '5lbs of rice at Costco'" value={smartText} onChange={e => setSmartText(e.target.value)} />
-              <button onClick={runSmart} disabled={isAiLoading} className="p-3 bg-indigo-600 text-white rounded-xl shadow-lg active:scale-95 disabled:opacity-50">
-                {isAiLoading ? <RefreshCw size={16} className="animate-spin" /> : <Zap size={16}/>}
-              </button>
-            </div>
-          )}
           <form onSubmit={submit} className="bg-white border-2 border-blue-100 rounded-[2.5rem] p-6 shadow-2xl space-y-4">
             <div className="flex justify-between mb-2">
               <h3 className="text-xs font-black uppercase text-blue-600">{editingItem ? 'Edit Item' : 'New Supply'}</h3>
@@ -686,9 +671,6 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
                  {form.image ? <img src={form.image} alt="icon" className="w-full h-full object-cover"/> : <span className="text-3xl">{form.emoji || '📦'}</span>}
                </div>
             </div>
-            <button type="button" onClick={handleGenerateImage} disabled={isImgLoading} className="w-full py-2 bg-slate-50 text-slate-500 text-xs font-bold rounded-xl mb-4 flex items-center justify-center gap-2 hover:bg-slate-100">
-               {isImgLoading ? <RefreshCw size={12} className="animate-spin"/> : <ImageIcon size={12}/>} Generate AI Icon
-            </button>
 
             <div className="grid grid-cols-2 gap-4">
               <div className="col-span-2"><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} /></div>
@@ -806,38 +788,177 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
 }
 
 // --- Emergency Plan ---
-function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, reminders = [], checklistChecks = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem }) {
+function FamilyMembersSection({ family, isEditing, onChange }) {
+  const updateMember = (i, patch) => onChange(family.map((m, idx) => idx === i ? { ...m, ...patch } : m));
+  const removeMember = (i) => onChange(family.filter((_, idx) => idx !== i));
+  const addMember = () => onChange([...family, { name: '', role: '', dob: '' }]);
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <div className="flex justify-between items-center mb-6">
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest">Household Tracking</h3>
+        {isEditing && <button type="button" onClick={addMember} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add member</button>}
+      </div>
+      {family.length === 0 && !isEditing && <p className="text-xs text-slate-500 font-bold">No household members added yet.</p>}
+      <div className="space-y-4">
+        {family.map((m, i) => isEditing ? (
+          <div key={i} className="bg-slate-50 rounded-2xl p-4 space-y-3 border border-slate-100">
+            <div className="flex justify-between items-center">
+              <span className="text-[10px] font-black uppercase text-slate-500">Member {i + 1}</span>
+              <button type="button" aria-label={`Remove ${m.name || 'member'}`} onClick={() => removeMember(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><Label>Name</Label><Input val={m.name} set={v => updateMember(i, { name: v })} /></div>
+              <div><Label>Role</Label><Input val={m.role} set={v => updateMember(i, { role: v })} placeholder="Adult, Child, Pet…" /></div>
+              <div className="col-span-2"><Label>Date of birth</Label><Input val={m.dob} set={v => updateMember(i, { dob: v })} type="date" /></div>
+            </div>
+          </div>
+        ) : (
+          <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-4 last:border-0 last:pb-0">
+             <div className="flex items-center gap-4">
+                <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-3xl flex items-center justify-center font-black text-xl">{m.name[0]}</div>
+                <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-600 font-bold uppercase">{m.role} • {m.dob}</div></div>
+             </div>
+             {m.role === 'Child' && <div className="bg-indigo-50 text-indigo-700 text-[9px] font-black uppercase px-3 py-1 rounded-full">Priority</div>}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MeetingPointsSection({ primary, secondary, isEditing, onPrimaryChange, onSecondaryChange }) {
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Meeting Points</h3>
+      {isEditing ? (
+        <div className="grid grid-cols-1 gap-4">
+          <div><Label>Primary</Label><Input val={primary} set={onPrimaryChange} placeholder="e.g. End of the driveway" /></div>
+          <div><Label>Secondary (out of neighborhood)</Label><Input val={secondary} set={onSecondaryChange} placeholder="e.g. Community center on Main St" /></div>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div className="p-4 bg-slate-50 rounded-2xl">
+            <div className="text-[10px] font-black uppercase text-slate-500">Primary</div>
+            <div className="font-black text-slate-800 text-sm">{primary || 'Not set'}</div>
+          </div>
+          <div className="p-4 bg-slate-50 rounded-2xl">
+            <div className="text-[10px] font-black uppercase text-slate-500">Secondary</div>
+            <div className="font-black text-slate-800 text-sm">{secondary || 'Not set'}</div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ContactsSection({ contacts, isEditing, onChange }) {
+  const updateContact = (i, patch) => onChange(contacts.map((c, idx) => idx === i ? { ...c, ...patch } : c));
+  const removeContact = (i) => onChange(contacts.filter((_, idx) => idx !== i));
+  const addContact = () => onChange([...contacts, { name: '', phone: '', type: '' }]);
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <div className="flex justify-between items-center mb-6">
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest">Emergency Contacts</h3>
+        {isEditing && <button type="button" onClick={addContact} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add contact</button>}
+      </div>
+      {contacts.length === 0 && !isEditing && <p className="text-xs text-slate-500 font-bold">No emergency contacts added yet.</p>}
+      <div className="space-y-4">
+        {contacts.map((c, i) => isEditing ? (
+          <div key={i} className="bg-slate-50 rounded-2xl p-4 space-y-3 border border-slate-100">
+            <div className="flex justify-between items-center">
+              <span className="text-[10px] font-black uppercase text-slate-500">Contact {i + 1}</span>
+              <button type="button" aria-label={`Remove ${c.name || 'contact'}`} onClick={() => removeContact(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><Label>Name</Label><Input val={c.name} set={v => updateContact(i, { name: v })} /></div>
+              <div><Label>Phone</Label><Input val={c.phone} set={v => updateContact(i, { phone: v })} type="tel" /></div>
+              <div className="col-span-2"><Label>Type</Label><Input val={c.type} set={v => updateContact(i, { type: v })} placeholder="Out-of-area, Neighbor, Doctor…" /></div>
+            </div>
+          </div>
+        ) : (
+          <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-4 last:border-0 last:pb-0">
+             <div>
+               <div className="font-black text-slate-800">{c.name}</div>
+               <div className="text-[10px] text-slate-600 font-bold uppercase">{[c.type, c.phone].filter(Boolean).join(' • ')}</div>
+             </div>
+             {c.phone && <a aria-label={`Call ${c.name || c.phone}`} href={`tel:${c.phone.replace(/[^0-9+]/g, '')}`} className="p-2 text-blue-500"><Phone size={16}/></a>}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, onOpenBinder, reminders = [], checklistChecks = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem }) {
   const [isEditing, setIsEditing] = useState(false);
   const [spot, setSpot] = useState(plan?.shelterSpot || '');
-  useEffect(() => { if (!isEditing) setSpot(plan?.shelterSpot || ''); }, [plan, isEditing]);
+  const [family, setFamily] = useState(plan?.family || []);
+  const [contacts, setContacts] = useState(plan?.contacts || []);
+  const [meetingPrimary, setMeetingPrimary] = useState(plan?.meetingPoints?.primary || '');
+  const [meetingSecondary, setMeetingSecondary] = useState(plan?.meetingPoints?.secondary || '');
+  const [saveError, setSaveError] = useState(null);
+  const resetFromPlan = () => {
+    setSpot(plan?.shelterSpot || '');
+    setFamily(plan?.family || []);
+    setContacts(plan?.contacts || []);
+    setMeetingPrimary(plan?.meetingPoints?.primary || '');
+    setMeetingSecondary(plan?.meetingPoints?.secondary || '');
+  };
+  useEffect(() => { if (!isEditing) resetFromPlan(); }, [plan, isEditing]);
+
+  const startEditing = () => setIsEditing(true);
+  const cancelEditing = () => { resetFromPlan(); setSaveError(null); setIsEditing(false); };
+  const saveEditing = async () => {
+    setSaveError(null);
+    const cleanedFamily = family.map(m => ({ name: (m.name || '').trim(), role: (m.role || '').trim(), dob: (m.dob || '').trim() }));
+    const cleanedContacts = contacts.map(c => ({ name: (c.name || '').trim(), phone: (c.phone || '').trim(), type: (c.type || '').trim() }));
+    // A row with some fields filled in but no name (family) or no name/phone (contacts) is
+    // refused rather than silently dropped below — only a row nothing was ever typed into
+    // (e.g. "Add member" clicked but never filled in) is safe to discard without telling anyone.
+    if (cleanedFamily.some(m => !m.name && (m.role || m.dob))) { setSaveError('Give each household member a name, or remove the empty row, before saving.'); return; }
+    if (cleanedContacts.some(c => !c.name && !c.phone && c.type)) { setSaveError('Give each contact a name or phone number, or remove the empty row, before saving.'); return; }
+    try {
+      const ok = await onUpdate({
+        ...plan,
+        shelterSpot: spot,
+        family: cleanedFamily.filter(m => m.name || m.role || m.dob),
+        contacts: cleanedContacts.filter(c => c.name || c.phone || c.type),
+        meetingPoints: { primary: meetingPrimary.trim(), secondary: meetingSecondary.trim() },
+      });
+      if (!ok) { setSaveError('Could not save plan. Please retry.'); return; }
+      setIsEditing(false);
+    } catch { setSaveError('Could not save plan. Please retry.'); }
+  };
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       <div className="flex justify-between items-center px-1">
         <h2 className="text-xl font-black text-slate-800">Family Hub</h2>
-        <button onClick={async () => { try { if(isEditing && !await onUpdate({...plan, shelterSpot: spot})) return; setIsEditing(!isEditing); } catch { alert("Could not save plan. Please retry."); } }} className="text-[10px] font-black px-6 py-2.5 rounded-full bg-blue-50 text-blue-600 uppercase tracking-widest">
-          {isEditing ? "Save" : "Edit"}
-        </button>
+        <div className="flex items-center gap-2">
+          {isEditing && (
+            <button onClick={cancelEditing} className="text-[10px] font-black px-5 py-2.5 rounded-full bg-slate-100 text-slate-600 uppercase tracking-widest">
+              Cancel
+            </button>
+          )}
+          <button onClick={isEditing ? saveEditing : startEditing} className="text-[10px] font-black px-6 py-2.5 rounded-full bg-blue-50 text-blue-600 uppercase tracking-widest">
+            {isEditing ? "Save" : "Edit"}
+          </button>
+        </div>
       </div>
+      {saveError && <p role="alert" className="text-xs font-bold text-red-600 px-1">{saveError}</p>}
 
       <button onClick={onRunDrill} disabled={isAiLoading} className="w-full bg-indigo-50 text-indigo-700 py-4 rounded-[2.5rem] flex items-center justify-center gap-2 font-black text-xs uppercase tracking-widest border border-indigo-100 active:scale-95 transition-all">
         {isAiLoading ? <RefreshCw className="animate-spin" size={16}/> : <Siren size={16}/>}
         Run Emergency Simulation
       </button>
 
-      <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
-        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-6">Household Tracking</h3>
-        <div className="space-y-5">
-          {plan?.family?.map((m, i) => (
-            <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-4 last:border-0 last:pb-0">
-               <div className="flex items-center gap-4">
-                  <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-3xl flex items-center justify-center font-black text-xl">{m.name[0]}</div>
-                  <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-600 font-bold uppercase">{m.role} • {m.dob}</div></div>
-               </div>
-               {m.role === 'Child' && <div className="bg-indigo-50 text-indigo-700 text-[9px] font-black uppercase px-3 py-1 rounded-full">Priority</div>}
-            </div>
-          ))}
-        </div>
-      </section>
+      <button onClick={onOpenBinder} className="w-full bg-slate-50 text-slate-700 py-4 rounded-[2.5rem] flex items-center justify-center gap-2 font-black text-xs uppercase tracking-widest border border-slate-200 active:scale-95 transition-all">
+        <BookOpen size={16}/>
+        Printable Emergency Binder
+      </button>
+
+      <FamilyMembersSection family={isEditing ? family : (plan?.family || [])} isEditing={isEditing} onChange={setFamily} />
+
       <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
         <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Storm Point</h3>
         {isEditing ? (
@@ -846,6 +967,16 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, reminders = []
           <div className="p-5 bg-orange-50 rounded-3xl border border-orange-100 font-black text-slate-700 italic text-sm">"{plan?.shelterSpot}"</div>
         )}
       </section>
+
+      <MeetingPointsSection
+        primary={isEditing ? meetingPrimary : (plan?.meetingPoints?.primary || '')}
+        secondary={isEditing ? meetingSecondary : (plan?.meetingPoints?.secondary || '')}
+        isEditing={isEditing}
+        onPrimaryChange={setMeetingPrimary}
+        onSecondaryChange={setMeetingSecondary}
+      />
+
+      <ContactsSection contacts={isEditing ? contacts : (plan?.contacts || [])} isEditing={isEditing} onChange={setContacts} />
 
       <RemindersSection reminders={reminders} onAdd={onAddReminder} onUpdate={onUpdateReminder} onDelete={onDeleteReminder} onComplete={onCompleteReminder} onSnooze={onSnoozeReminder} />
       <ChecklistsSection checklistChecks={checklistChecks} onToggle={onToggleChecklistItem} />
@@ -1215,6 +1346,104 @@ function formatRelativeTime(timestamp) {
   return `Saved ${minutes}m ago`;
 }
 
+// Printable/offline fallback for when the app itself is unreachable (dead phone, no network):
+// everything a household would need on paper, rendered from the same state already held in
+// memory (which itself came from the local cache when offline), with nothing fetched here.
+// Replaces the normal app shell entirely while open, so printing needs no print stylesheet to
+// hide anything else — this is the only content on the page.
+export function EmergencyBinder({ plan, inventory = [], stats, settings, checklistChecks = [], onClose }) {
+  const checkedIds = useMemo(() => new Set(checklistChecks.map(c => c.id)), [checklistChecks]);
+  const categoryCounts = useMemo(() => {
+    const counts = {};
+    inventory.forEach(item => { const cat = item.category || 'Uncategorized'; counts[cat] = (counts[cat] || 0) + 1; });
+    return counts;
+  }, [inventory]);
+  const family = plan?.family || [];
+  const contacts = plan?.contacts || [];
+  const generatedAt = new Date().toLocaleString();
+
+  return (
+    <div className="min-h-screen bg-white text-slate-900 p-6 max-w-2xl mx-auto font-sans print:p-0">
+      <div className="print:hidden flex justify-between items-center gap-3 mb-8">
+        <h1 className="text-lg font-black">Emergency Binder</h1>
+        <div className="flex gap-2">
+          <button onClick={() => window.print()} className="px-5 py-2.5 rounded-full bg-blue-600 text-white text-xs font-black uppercase tracking-widest">Print</button>
+          <button onClick={onClose} className="px-5 py-2.5 rounded-full bg-slate-100 text-slate-600 text-xs font-black uppercase tracking-widest">Close</button>
+        </div>
+      </div>
+      <div className="hidden print:block mb-6">
+        <h1 className="text-2xl font-black">NorthStar Prep — Emergency Binder</h1>
+        <p className="text-xs text-slate-500">Generated {generatedAt}. Keep a copy where power and network aren't required to read it.</p>
+      </div>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Shelter spot</h2>
+        <p className="text-sm">{plan?.shelterSpot || 'Not set.'}</p>
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Meeting points</h2>
+        <p className="text-sm"><strong>Primary:</strong> {plan?.meetingPoints?.primary || 'Not set'}</p>
+        <p className="text-sm"><strong>Secondary:</strong> {plan?.meetingPoints?.secondary || 'Not set'}</p>
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Household members</h2>
+        {family.length === 0 ? <p className="text-sm text-slate-500">None recorded.</p> : (
+          <ul className="text-sm space-y-1">
+            {family.map((m, i) => <li key={i}>{m.name} — {m.role || 'Household member'}{m.dob ? `, born ${m.dob}` : ''}</li>)}
+          </ul>
+        )}
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Emergency contacts</h2>
+        {contacts.length === 0 ? <p className="text-sm text-slate-500">None recorded.</p> : (
+          <ul className="text-sm space-y-1">
+            {contacts.map((c, i) => <li key={i}>{c.name}{c.type ? ` (${c.type})` : ''} — {c.phone || 'no phone on file'}</li>)}
+          </ul>
+        )}
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Readiness summary</h2>
+        <ul className="text-sm space-y-1">
+          <li>Water: {stats.waterDays.toFixed(1)} of {settings.survivalGoalDays} goal days</li>
+          <li>Food: {stats.foodDays.toFixed(1)} of {settings.survivalGoalDays} goal days</li>
+          <li>Heat: {stats.totalFuelHours.toFixed(0)} of {settings.heatGoalHours} goal hours</li>
+          <li>Power: {stats.totalPowerKwh.toFixed(1)} of {settings.powerGoalKwh} goal kWh</li>
+          <li>{stats.lowStock} item{stats.lowStock === 1 ? '' : 's'} low stock, {stats.expired} item{stats.expired === 1 ? '' : 's'} expired</li>
+        </ul>
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Inventory summary</h2>
+        {Object.keys(categoryCounts).length === 0 ? <p className="text-sm text-slate-500">No supplies recorded.</p> : (
+          <ul className="text-sm space-y-1">
+            {Object.entries(categoryCounts).map(([cat, count]) => <li key={cat}>{cat}: {count} item{count === 1 ? '' : 's'}</li>)}
+          </ul>
+        )}
+      </section>
+
+      <section className="break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Seasonal checklists</h2>
+        <div className="space-y-4">
+          {checklistCatalog.map(season => (
+            <div key={season.season}>
+              <h3 className="text-xs font-black uppercase text-slate-600 mb-1">{season.label}</h3>
+              <ul className="text-sm space-y-0.5">
+                {season.items.map(item => (
+                  <li key={item.id}>{checkedIds.has(`${season.season}__${item.id}`) ? '☑' : '☐'} {item.text}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 export function Header({ hubId, isSyncing, online, pendingSync, lastSyncedAt, onSyncClick, error, onDownload }) {
   return (
     <header className="bg-slate-900 text-white p-4 sticky top-0 z-50 shadow-xl border-b border-white/5">
@@ -1448,13 +1677,14 @@ function ActivityPanel() {
   );
 }
 
-function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId}) {
+function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,onOpenBinder}) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
     <section ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="settings-title" className="bg-white w-full max-w-sm rounded-3xl p-8 space-y-5 max-h-[85vh] overflow-y-auto">
       <h2 id="settings-title" className="text-xl font-black">Household settings</h2>
       <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances and your family plan.</p>
+      <button type="button" onClick={onOpenBinder} className="w-full rounded-xl p-3 bg-slate-50 border border-slate-200 text-sm font-bold flex items-center justify-center gap-2"><BookOpen size={16}/> Printable emergency binder</button>
       <label className="block text-sm font-bold">Import JSON backup<input type="file" accept=".json,application/json" onChange={onImport} className="block mt-2 w-full text-xs" /></label>
       {pendingImport && <div role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-2 text-sm">
         <p className="font-black text-amber-900">Backup ready to review</p>

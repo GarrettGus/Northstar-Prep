@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema, planSchema } from '../shared/schema.js';
 import { nextReminderDueDate, effectiveReminderDueDate, isReminderOverdue, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
+import { categories } from '../shared/schema.js';
 import { token, validSession, hashPassword, verifyPassword, hashToken, randomToken, cookie, sameOrigin } from '../server/auth.js';
 import { createHandler } from '../api/hub.js';
 import { createHandler as createSessionHandler } from '../api/session.js';
@@ -342,6 +343,69 @@ test('readiness needs scale with configurable household size and per-person rate
   assert.equal(solo.foodDays,10);assert.equal(family.foodDays,2.5);
   assert.equal(solo.dailyWaterNeed,1);assert.equal(family.dailyWaterNeed,4);
   assert.equal(solo.waterDays,8);assert.equal(family.waterDays,2);
+});
+import { supplyTemplateCatalog, templateScales, scaleTemplateQuantity, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
+test('starter template catalog has unique IDs and valid, scalable items throughout',()=>{
+  const ids=supplyTemplateCatalog.map(t=>t.id);
+  assert.ok(ids.length>0);
+  assert.equal(new Set(ids).size,ids.length);
+  for (const template of supplyTemplateCatalog) {
+    assert.ok(template.label&&template.description);
+    assert.ok(template.items.length>0);
+    assert.equal(new Set(template.items.map(i=>i.id)).size,template.items.length);
+    for (const item of template.items) {
+      assert.ok(templateScales.includes(item.scale),`${item.id} has scale ${item.scale}`);
+      assert.ok(categories.includes(item.category),`${item.id} has category ${item.category}`);
+      assert.ok(Number(item.quantity)>0);
+    }
+  }
+});
+test('every starter template produces rows the item schema accepts',()=>{
+  const settings=settingsSchema.parse({householdSize:3,survivalGoalDays:7});
+  for (const template of supplyTemplateCatalog) {
+    const backup=normalizeBackup(templateToBackup(template,settings),()=>'unused');
+    assert.equal(backup.inventory.length,template.items.length);
+    for (const row of backup.inventory) assert.doesNotThrow(()=>itemSchema.parse(row));
+  }
+});
+test('template quantities scale by household size and survival goal, and round up',()=>{
+  const small=settingsSchema.parse({householdSize:1,survivalGoalDays:3});
+  const large=settingsSchema.parse({householdSize:4,survivalGoalDays:14});
+  const perPersonPerDay={scale:'perPersonPerDay',quantity:1};
+  assert.equal(scaleTemplateQuantity(perPersonPerDay,small),3);
+  assert.equal(scaleTemplateQuantity(perPersonPerDay,large),56);
+  const perPerson={scale:'perPerson',quantity:2};
+  assert.equal(scaleTemplateQuantity(perPerson,small),2);
+  assert.equal(scaleTemplateQuantity(perPerson,large),8);
+  // A fixed line is one per household however large, and the survival goal does not touch it.
+  const fixed={scale:'fixed',quantity:1};
+  assert.equal(scaleTemplateQuantity(fixed,small),1);
+  assert.equal(scaleTemplateQuantity(fixed,large),1);
+  // Fractional lines round up rather than down, and never below one.
+  assert.equal(scaleTemplateQuantity({scale:'perPersonPerDay',quantity:0.15},large),9);
+  assert.equal(scaleTemplateQuantity({scale:'perPersonPerDay',quantity:0.01},small),1);
+});
+test('applying a starter template is non-destructive and repeatable',()=>{
+  const settings=settingsSchema.parse({householdSize:2,survivalGoalDays:7});
+  const template=findSupplyTemplate('water-and-food');
+  assert.ok(template);
+  assert.equal(findSupplyTemplate('no-such-template'),null);
+  let state=applyAction(emptyState(),{type:'add',collection:'inventory',id:'mine',item:{name:'My own rice',quantity:5,category:'Food'}});
+  const backup=normalizeBackup(templateToBackup(template,settings),()=>'unused');
+  const once=applyAction(state,{type:'import',backup});
+  // The household's own row survives untouched alongside the template's rows.
+  assert.equal(once.inventory.find(row=>row.id==='mine').quantity,5);
+  assert.equal(once.inventory.length,1+template.items.length);
+  // Applying the same template again merges by ID instead of duplicating every line.
+  const twice=applyAction(once,{type:'import',backup});
+  assert.deepEqual(twice,once);
+});
+test('a template seeds its restock target so new rows do not read as low stock',()=>{
+  const settings=settingsSchema.parse({householdSize:2,survivalGoalDays:7});
+  const backup=templateToBackup(findSupplyTemplate('first-aid'),settings);
+  for (const row of backup.inventory) assert.equal(row.target,row.quantity);
+  const stats=computeReadiness({inventory:normalizeBackup(backup,()=>'x').inventory,appliances:[]},settings);
+  assert.equal(stats.lowStock,0);
 });
 import { simulateOutage, outageResources, appliancePriorities } from '../shared/outage.js';
 const outageState={

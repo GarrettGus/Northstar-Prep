@@ -11,6 +11,7 @@ import { request } from './api.js';
 import { computeReadiness, computeReadinessGaps, isExpired, isRecurringDue, expirationQueue } from '../shared/readiness.js';
 import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
 import { simulateOutage, appliancePriorities, appliancePriorityLabels } from '../shared/outage.js';
+import { supplyTemplateCatalog, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
 import { effectiveReminderDueDate, isReminderOverdue, todayLocal, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
 import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
@@ -39,6 +40,7 @@ export default function App() {
   const [globalError, setGlobalError] = useState(null);
   const [settings, setSettings] = useState(() => settingsSchema.parse({}));
   const [pendingImport, setPendingImport] = useState(null);
+  const [pendingImportSource, setPendingImportSource] = useState(null);
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
   const [online, setOnline] = useState(() => typeof navigator === 'undefined' ? true : navigator.onLine);
   const [pendingSync, setPendingSync] = useState(() => loadQueuedActions().length);
@@ -144,15 +146,32 @@ export default function App() {
       if(file.size>2_000_000)throw new Error('Backup must be smaller than 2 MB.');
       const backup=normalizeBackup(JSON.parse(await file.text()),()=>crypto.randomUUID());
       setPendingImport(backup);
+      setPendingImportSource({kind:'backup'});
       setGlobalError(null);
     } catch(error){setGlobalError(`Import failed: ${error.message}`);}
   };
+  // Starter templates go through the same non-destructive preview as a JSON backup, so nothing
+  // is written until it is confirmed and existing rows merge by ID rather than being replaced.
+  const previewTemplate = (templateId) => {
+    const template = findSupplyTemplate(templateId);
+    if (!template) return;
+    try {
+      setPendingImport(normalizeBackup(templateToBackup(template, settings), () => crypto.randomUUID()));
+      setPendingImportSource({kind:'template', label: template.label});
+      setGlobalError(null);
+    } catch(error){setGlobalError(`Template failed: ${error.message}`);}
+  };
+  const cancelImport = () => { setPendingImport(null); setPendingImportSource(null); };
   const confirmImport = async () => {
     if (!pendingImport) return false;
     if (!await mutate({type:'import',backup:pendingImport})) return false;
+    const wasTemplate = pendingImportSource?.kind === 'template';
     setPendingImport(null);
+    setPendingImportSource(null);
     setShowSyncModal(false);
-    alert('Backup imported. Existing records were merged by ID.');
+    alert(wasTemplate
+      ? 'Starter supplies added. Adjust the quantities to what your household actually keeps.'
+      : 'Backup imported. Existing records were merged by ID.');
     return true;
   };
   const restoreFromBackup = async (id) => {
@@ -283,7 +302,7 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
+      {showSyncModal && <SyncModal onClose={() => { cancelImport(); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} pendingImportSource={pendingImportSource} onConfirmImport={confirmImport} onCancelImport={cancelImport} onApplyTemplate={previewTemplate} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
       {outage && <OutageSimulationModal result={outage} settings={settings} onClose={() => setOutage(null)} />}
     </div>
   );
@@ -1751,7 +1770,7 @@ function ActivityPanel() {
   );
 }
 
-function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,onOpenBinder}) {
+function SyncModal({onClose,onImport,pendingImport,pendingImportSource,onConfirmImport,onCancelImport,onApplyTemplate,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,onOpenBinder}) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
@@ -1760,12 +1779,21 @@ function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImpor
       <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances and your family plan.</p>
       <button type="button" onClick={onOpenBinder} className="w-full rounded-xl p-3 bg-slate-50 border border-slate-200 text-sm font-bold flex items-center justify-center gap-2"><BookOpen size={16}/> Printable emergency binder</button>
       <label className="block text-sm font-bold">Import JSON backup<input type="file" accept=".json,application/json" onChange={onImport} className="block mt-2 w-full text-xs" /></label>
+      <StarterTemplatesPanel settings={settings} onApply={onApplyTemplate} disabled={Boolean(pendingImport)} />
       {pendingImport && <div role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-2 text-sm">
-        <p className="font-black text-amber-900">Backup ready to review</p>
+        <p className="font-black text-amber-900">{pendingImportSource?.kind === 'template' ? `${pendingImportSource.label} ready to review` : 'Backup ready to review'}</p>
         <p className="text-amber-800">{pendingImport.inventory.length} inventory items, {pendingImport.shoppingList.length} shopping items, {pendingImport.appliances.length} appliances and {pendingImport.plan ? 'a family plan' : 'no family plan'} will be merged by ID.</p>
         {pendingImport.reminders?.length > 0 && <p className="text-amber-800">{pendingImport.reminders.length} maintenance reminders will be merged.</p>}
         {pendingImport.settings && <p className="text-amber-800">Readiness assumptions are included.</p>}
-        <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">Merge backup</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
+        {pendingImportSource?.kind === 'template' && (
+          <>
+            <ul className="text-amber-800 text-xs space-y-0.5 max-h-40 overflow-y-auto">
+              {pendingImport.inventory.map(row => <li key={row.id}>{row.name} — {row.quantity} {row.unit}</li>)}
+            </ul>
+            <p className="text-amber-900 font-bold">These quantities are a starting point scaled to {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} for {settings.survivalGoalDays} days — adjust them to what your household actually keeps. They are not a recommendation to follow exactly.</p>
+          </>
+        )}
+        <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">{pendingImportSource?.kind === 'template' ? 'Add these supplies' : 'Merge backup'}</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
       </div>}
       <SettingsForm settings={settings} onSave={onUpdateSettings} />
       <ServiceHealthPanel />
@@ -1776,6 +1804,41 @@ function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImpor
       <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>
     </section>
   </div>;
+}
+
+// Starter supply templates for a household staring at an empty screen. Applying one runs through
+// the same preview-and-merge path as a JSON backup, so nothing is overwritten without confirmation.
+function StarterTemplatesPanel({ settings, onApply, disabled }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <section className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+      <button type="button" onClick={() => setOpen(value => !value)} aria-expanded={open} className="w-full flex items-center justify-between text-sm font-bold text-slate-700">
+        <span className="flex items-center gap-2"><Layers size={16}/> Starter supply templates</span>
+        <ChevronRight size={16} className={`transition-transform ${open ? 'rotate-90' : ''}`}/>
+      </button>
+      {open && (
+        <div className="space-y-3">
+          <p className="text-xs text-slate-600 leading-relaxed">
+            Quantities are scaled to {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} for {settings.survivalGoalDays} days.
+            They are a starting point to adjust, not a recommendation to follow exactly — every household's needs differ.
+            You will see exactly what gets added before anything is saved.
+          </p>
+          <ul className="space-y-2">
+            {supplyTemplateCatalog.map(template => (
+              <li key={template.id} className="bg-white border border-slate-200 rounded-xl p-3 flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-xs font-black text-slate-800">{template.label}</div>
+                  <p className="text-[11px] text-slate-600 leading-relaxed">{template.description}</p>
+                  <p className="text-[10px] text-slate-500 mt-1">{template.items.length} items</p>
+                </div>
+                <button type="button" disabled={disabled} onClick={() => onApply(template.id)} className="shrink-0 rounded-xl bg-slate-900 px-3 py-2 text-[10px] font-black uppercase text-white disabled:opacity-40">Preview</button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
 }
 
 // Operational visibility for whoever runs the deployment: API/database availability now, plus

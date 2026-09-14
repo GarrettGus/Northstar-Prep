@@ -10,6 +10,20 @@ export function isExpired(date,now=new Date()) {
   const local=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
   return date<local;
 }
+// Recurring items replenish every recurringDays from purchaseDate; 0/unset means it doesn't recur.
+export function nextRecurringDate(item) {
+  if(!item.recurringDays||!item.purchaseDate)return null;
+  const [y,m,d]=item.purchaseDate.split('-').map(Number);
+  if(!y||!m||!d)return null;
+  const next=new Date(y,m-1,d+Number(item.recurringDays));
+  return `${next.getFullYear()}-${String(next.getMonth()+1).padStart(2,'0')}-${String(next.getDate()).padStart(2,'0')}`;
+}
+export function isRecurringDue(item,now=new Date()) {
+  const next=nextRecurringDate(item);
+  if(!next)return false;
+  const local=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+  return next<=local;
+}
 const nameBuckets=['Water','Pasta','Rice','Beans','Energy Bars'];
 export function computeReadiness({inventory=[],appliances=[]},settings) {
   const dailyCalorieNeed=settings.householdSize*settings.caloriesPerPersonPerDay;

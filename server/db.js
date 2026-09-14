@@ -19,12 +19,14 @@ export async function readState() {
     sql`SELECT id, name, quantity, unit, category,
           calories_per_unit AS "caloriesPerUnit", hours_per_unit AS "hoursPerUnit", capacity_per_unit AS "capacityPerUnit",
           price, gallons_per_unit AS "gallonsPerUnit", target, store, emoji, image,
-          macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate"
+          macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate",
+          barcode, recurring_days AS "recurringDays"
         FROM northstar_inventory WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, name, quantity, unit, category,
           calories_per_unit AS "caloriesPerUnit", hours_per_unit AS "hoursPerUnit", capacity_per_unit AS "capacityPerUnit",
           price, gallons_per_unit AS "gallonsPerUnit", target, store, emoji, image,
-          macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate"
+          macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate",
+          barcode, recurring_days AS "recurringDays"
         FROM northstar_shopping_items WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, name, watts, hours, active FROM northstar_appliances WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary"
@@ -57,26 +59,26 @@ function diffById(currentRows, nextRows) {
   return {toDelete, toUpsert};
 }
 function upsertInventoryItem(tx, item, guard) {
-  return tx`INSERT INTO northstar_inventory (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date)
-    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}
+  return tx`INSERT INTO northstar_inventory (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date, barcode, recurring_days)
+    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}, ${item.barcode}, ${item.recurringDays}
     WHERE ${guard}
     ON CONFLICT (household_id, id) DO UPDATE SET
       name = EXCLUDED.name, quantity = EXCLUDED.quantity, unit = EXCLUDED.unit, category = EXCLUDED.category,
       calories_per_unit = EXCLUDED.calories_per_unit, hours_per_unit = EXCLUDED.hours_per_unit, capacity_per_unit = EXCLUDED.capacity_per_unit,
       price = EXCLUDED.price, gallons_per_unit = EXCLUDED.gallons_per_unit, target = EXCLUDED.target, store = EXCLUDED.store,
       emoji = EXCLUDED.emoji, image = EXCLUDED.image, macro_tag = EXCLUDED.macro_tag, fuel_type = EXCLUDED.fuel_type,
-      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date`;
+      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days`;
 }
 function upsertShoppingItem(tx, item, guard) {
-  return tx`INSERT INTO northstar_shopping_items (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date)
-    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}
+  return tx`INSERT INTO northstar_shopping_items (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date, barcode, recurring_days)
+    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}, ${item.barcode}, ${item.recurringDays}
     WHERE ${guard}
     ON CONFLICT (household_id, id) DO UPDATE SET
       name = EXCLUDED.name, quantity = EXCLUDED.quantity, unit = EXCLUDED.unit, category = EXCLUDED.category,
       calories_per_unit = EXCLUDED.calories_per_unit, hours_per_unit = EXCLUDED.hours_per_unit, capacity_per_unit = EXCLUDED.capacity_per_unit,
       price = EXCLUDED.price, gallons_per_unit = EXCLUDED.gallons_per_unit, target = EXCLUDED.target, store = EXCLUDED.store,
       emoji = EXCLUDED.emoji, image = EXCLUDED.image, macro_tag = EXCLUDED.macro_tag, fuel_type = EXCLUDED.fuel_type,
-      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date`;
+      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days`;
 }
 
 export async function compareAndSave(version, next, current = emptyState()) {

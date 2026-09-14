@@ -15,6 +15,8 @@ function summarizeAction(action, previousState) {
       return {collection: 'shopping_list', itemId: action.id, itemName: nameOf('shoppingList', action.id)};
     case 'bulk_delete':
       return {collection: action.collection, itemId: null, itemName: `${Array.isArray(action.ids) ? action.ids.length : 0} items`};
+    case 'bulk_update':
+      return {collection: action.collection, itemId: null, itemName: `${Array.isArray(action.ids) ? action.ids.length : 0} items`};
     case 'plan': return {collection: 'plan', itemId: null, itemName: null};
     case 'settings': return {collection: 'settings', itemId: null, itemName: null};
     default: return {collection: null, itemId: null, itemName: null};

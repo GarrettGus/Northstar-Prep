@@ -8,8 +8,8 @@ import {
   Siren, SearchCheck, Power, Tag, Calendar, ArrowUpDown
 } from 'lucide-react';
 import { request } from './api.js';
-import { computeReadiness, isExpired } from '../shared/readiness.js';
-import { applyAction, normalizeBackup, settingsSchema, fuelTypes } from '../shared/schema.js';
+import { computeReadiness, isExpired, isRecurringDue } from '../shared/readiness.js';
+import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories } from '../shared/schema.js';
 import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
 
 // --- Constants ---
@@ -220,7 +220,15 @@ export default function App() {
   const handleUpdate = (collection,id,item) => mutate({type:'update',collection,id,item});
   const handleDelete = (collection,id) => mutate({type:'delete',collection,id});
   const handleBulkDelete = (collection, ids) => mutate({type:'bulk_delete',collection,ids});
+  const handleBulkUpdate = (collection, ids, changes) => mutate({type:'bulk_update',collection,ids,...changes});
   const handleBuyItem = item => mutate({type:'buy',id:item.id});
+  const handleRestockRecurring = async (dueItems) => {
+    for (const item of dueItems) {
+      const {id, purchaseDate, expiryDate, quantity, target, ...rest} = item;
+      if (!await handleAdd('shopping_list', {...rest, quantity: target || quantity || 1, purchaseDate: '', expiryDate: ''})) return false;
+    }
+    return true;
+  };
 
   const handleAuthenticated = (profile) => {
     epoch.current++;revision.current=-1;setLoading(true);setUser(profile);setGlobalError(null);
@@ -247,12 +255,15 @@ export default function App() {
           <InventoryManager
             title="Supply Hub"
             items={inventory}
+            shoppingList={shoppingList}
             stats={stats}
             settings={settings}
             onAdd={(i) => handleAdd('inventory', i)}
             onUpdate={(id, i) => handleUpdate('inventory', id, i)}
             onDelete={(id) => handleDelete('inventory', id)}
             onBulkDelete={(ids) => handleBulkDelete('inventory', ids)}
+            onBulkUpdate={(ids, changes) => handleBulkUpdate('inventory', ids, changes)}
+            onRestock={handleRestockRecurring}
             onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)}
             isAiLoading={isAiLoading}
           />
@@ -268,6 +279,7 @@ export default function App() {
             onUpdate={(id, i) => handleUpdate('shopping_list', id, i)}
             onDelete={(id) => handleDelete('shopping_list', id)}
             onBulkDelete={(ids) => handleBulkDelete('shopping_list', ids)}
+            onBulkUpdate={(ids, changes) => handleBulkUpdate('shopping_list', ids, changes)}
             onBuy={handleBuyItem}
             onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)}
             isAiLoading={isAiLoading}
@@ -446,7 +458,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
 }
 
 // --- Inventory Manager (Reused for Shop) ---
-function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDelete, onBulkDelete, onBuy, onSmartSuggest, isAiLoading, isShoppingMode }) {
+function InventoryManager({ title, items, shoppingList = [], stats, settings, onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onBuy, onSmartSuggest, isAiLoading, isShoppingMode }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
   const [smartText, setSmartText] = useState('');
@@ -456,13 +468,16 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [formError, setFormError] = useState(null);
+  const [bulkCategory, setBulkCategory] = useState('');
+  const [bulkQuantityMode, setBulkQuantityMode] = useState('set');
+  const [bulkQuantityValue, setBulkQuantityValue] = useState('');
 
   const [form, setForm] = useState({
-    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: ''
+    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: ''
   });
 
   const reset = () => {
-    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '' });
+    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '' });
     setEditingItem(null);
     setShowAdd(false);
     setFormError(null);
@@ -472,9 +487,13 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
     e.preventDefault();
     setFormError(null);
     const normalizedName = String(form.name || '').trim().toLowerCase();
-    const duplicate = items.some(item => item.id !== editingItem?.id && item.category === form.category && String(item.name || '').trim().toLowerCase() === normalizedName);
+    const normalizedBarcode = String(form.barcode || '').trim();
+    const duplicate = items.some(item => item.id !== editingItem?.id && (
+      (item.category === form.category && String(item.name || '').trim().toLowerCase() === normalizedName) ||
+      (normalizedBarcode && item.barcode === normalizedBarcode)
+    ));
     if (duplicate) {
-      setFormError('An item with this name and category already exists. Edit the existing item or choose a different name.');
+      setFormError('An item with this name and category, or this barcode, already exists. Edit the existing item or choose a different one.');
       return;
     }
     const payload = {
@@ -484,11 +503,23 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
       hoursPerUnit: Number(form.hoursPerUnit),
       capacityPerUnit: Number(form.capacityPerUnit),
       gallonsPerUnit: Number(form.gallonsPerUnit || 0),
-      price: Number(form.price)
+      price: Number(form.price),
+      barcode: normalizedBarcode,
+      recurringDays: Number(form.recurringDays || 0),
     };
     if (editingItem) { if (!await onUpdate(editingItem.id, payload)) return; }
     else if (!await onAdd(payload)) return;
     reset();
+  };
+
+  const applyBulkCategory = async () => {
+    if (!bulkCategory) return;
+    if (await onBulkUpdate([...selectedIds], {category: bulkCategory})) setBulkCategory('');
+  };
+  const applyBulkQuantity = async () => {
+    const value = Number(bulkQuantityValue);
+    if (!Number.isFinite(value)) return;
+    if (await onBulkUpdate([...selectedIds], {quantity: {mode: bulkQuantityMode, value}})) setBulkQuantityValue('');
   };
 
   const handleEdit = (item) => { setForm(item); setEditingItem(item); setShowAdd(true); window.scrollTo({ top: 0, behavior: 'smooth' }); };
@@ -506,6 +537,11 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
   };
 
   const totalShopCost = useMemo(() => items.reduce((acc, i) => acc + (Number(i.price||0) * Number(i.quantity||0)), 0), [items]);
+
+  const dueRecurringItems = useMemo(() => {
+    if (isShoppingMode) return [];
+    return items.filter(item => isRecurringDue(item) && !shoppingList.some(row => row.category === item.category && String(row.name || '').trim().toLowerCase() === String(item.name || '').trim().toLowerCase()));
+  }, [items, shoppingList, isShoppingMode]);
 
   useEffect(() => {
     setSelectedIds(previous => new Set([...previous].filter(id => items.some(item => item.id === id))));
@@ -569,7 +605,36 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
           <option value="all">All</option><option value="low">Low stock</option><option value="expiring">Expiring</option><option value="expired">Expired</option>
         </select>
       </div>
-      {selectedIds.size > 0 && <div className="flex items-center justify-between gap-3 bg-blue-50 border border-blue-100 rounded-2xl px-4 py-3 text-sm"><span className="font-bold text-blue-800">{selectedIds.size} selected</span><button aria-label="Delete selected items" onClick={async () => { if (await onBulkDelete([...selectedIds])) setSelectedIds(new Set()); }} className="text-red-700 font-black">Delete selected</button></div>}
+      {selectedIds.size > 0 && (
+        <div className="bg-blue-50 border border-blue-100 rounded-2xl px-4 py-3 text-sm space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <span className="font-bold text-blue-800">{selectedIds.size} selected</span>
+            <button aria-label="Delete selected items" onClick={async () => { if (await onBulkDelete([...selectedIds])) setSelectedIds(new Set()); }} className="text-red-700 font-black">Delete selected</button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <select aria-label="Set category for selected items" value={bulkCategory} onChange={e => setBulkCategory(e.target.value)} className="bg-white border border-blue-200 rounded-xl px-3 py-2 text-xs font-bold">
+              <option value="">Set category…</option>
+              {categories.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <button aria-label="Apply category to selected items" onClick={applyBulkCategory} disabled={!bulkCategory} className="px-3 py-2 bg-blue-600 text-white rounded-xl text-xs font-black disabled:opacity-40">Apply</button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <select aria-label="Bulk quantity mode" value={bulkQuantityMode} onChange={e => setBulkQuantityMode(e.target.value)} className="bg-white border border-blue-200 rounded-xl px-3 py-2 text-xs font-bold">
+              <option value="set">Set quantity to</option>
+              <option value="delta">Adjust quantity by</option>
+            </select>
+            <input aria-label="Bulk quantity value" type="number" step="any" value={bulkQuantityValue} onChange={e => setBulkQuantityValue(e.target.value)} placeholder="0" className="w-20 bg-white border border-blue-200 rounded-xl px-3 py-2 text-xs font-bold" />
+            <button aria-label="Apply quantity change to selected items" onClick={applyBulkQuantity} disabled={bulkQuantityValue === ''} className="px-3 py-2 bg-blue-600 text-white rounded-xl text-xs font-black disabled:opacity-40">Apply</button>
+          </div>
+        </div>
+      )}
+
+      {dueRecurringItems.length > 0 && (
+        <div className="flex items-center justify-between gap-3 bg-amber-50 border border-amber-100 rounded-2xl px-4 py-3 text-sm">
+          <span className="font-bold text-amber-800">{dueRecurringItems.length} item{dueRecurringItems.length > 1 ? 's' : ''} due for restock</span>
+          <button aria-label="Add due recurring items to shopping list" onClick={async () => { if (await onRestock(dueRecurringItems)) alert('Added due items to your shopping list.'); }} className="text-amber-700 font-black">Add to shopping list</button>
+        </div>
+      )}
 
       {showAdd && (
         <div className="space-y-4 mb-6 animate-in slide-in-from-top-4 duration-300">
@@ -605,9 +670,21 @@ function InventoryManager({ title, items, stats, settings, onAdd, onUpdate, onDe
               <div><Label>Expiry Date</Label><Input val={form.expiryDate} set={v => setForm({...form, expiryDate: v})} type="date" /></div>
 
               <div><Label>Price ($/Unit)</Label><Input val={form.price} set={v => setForm({...form, price: v})} type="number" placeholder="0.00" /></div>
-              <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={["Food", "Water", "Medical", "Gear", "Fuel", "Power"]} /></div>
+              <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={categories} /></div>
 
               {isShoppingMode && <div className="col-span-2"><Label>Store</Label><Input val={form.store} set={v => setForm({...form, store: v})} placeholder="e.g. Costco" /></div>}
+
+              <div className="col-span-2">
+                <Label>Barcode (optional)</Label>
+                <div className="flex gap-2">
+                  <div className="flex-1"><Input val={form.barcode} set={v => setForm({...form, barcode: v})} placeholder="Scan or type a barcode" /></div>
+                  <BarcodeScanButton onDetected={code => setForm(prev => ({...prev, barcode: code}))} />
+                </div>
+              </div>
+              <div className="col-span-2">
+                <Label>Restock every N days (0 = never)</Label>
+                <Input val={form.recurringDays} set={v => setForm({...form, recurringDays: v})} type="number" placeholder="e.g. 30" />
+              </div>
 
               {form.category === 'Food' && (
                 <>
@@ -769,6 +846,63 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
 const Label = ({ children }) => <label className="text-[10px] font-black uppercase text-slate-600 mb-1 block">{children}</label>;
 const Input = ({ val, set, type="text", placeholder }) => <input type={type} min={type === "number" ? 0 : undefined} step={type === "number" ? "any" : undefined} className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none focus:bg-white focus:border-blue-400 border border-transparent transition-all" value={val ?? ""} onChange={e => set(e.target.value)} placeholder={placeholder} />;
 const Select = ({ val, set, opts }) => <select className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none border border-transparent" value={val ?? ""} onChange={e => set(e.target.value)}>{opts.map(o => <option key={o} value={o}>{o}</option>)}</select>;
+
+// Barcode scanning is progressive enhancement: browsers without BarcodeDetector (e.g. Safari)
+// just get the manual text input above, which is the required fallback.
+function BarcodeScanButton({ onDetected }) {
+  const [scanning, setScanning] = useState(false);
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const frameRef = useRef(null);
+  const supported = typeof window !== 'undefined' && 'BarcodeDetector' in window;
+
+  const stop = () => {
+    if (frameRef.current) cancelAnimationFrame(frameRef.current);
+    frameRef.current = null;
+    if (streamRef.current) { streamRef.current.getTracks().forEach(track => track.stop()); streamRef.current = null; }
+    setScanning(false);
+  };
+
+  useEffect(() => () => stop(), []);
+
+  const start = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      streamRef.current = stream;
+      setScanning(true);
+      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
+      const detector = new window.BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'qr_code'] });
+      const tick = async () => {
+        if (!videoRef.current) return;
+        try {
+          const results = await detector.detect(videoRef.current);
+          if (results.length) { onDetected(results[0].rawValue); stop(); return; }
+        } catch { /* keep trying past transient decode errors */ }
+        frameRef.current = requestAnimationFrame(tick);
+      };
+      frameRef.current = requestAnimationFrame(tick);
+    } catch {
+      alert('Could not access the camera. Enter the barcode manually.');
+      stop();
+    }
+  };
+
+  if (!supported) return null;
+
+  return (
+    <>
+      <button type="button" aria-label="Scan barcode" onClick={start} className="px-4 bg-slate-50 text-slate-600 rounded-2xl text-[10px] font-black uppercase flex items-center gap-1 shrink-0">
+        <Tag size={14}/> Scan
+      </button>
+      {scanning && (
+        <div role="dialog" aria-modal="true" aria-label="Scan barcode" className="fixed inset-0 bg-black/80 z-50 flex flex-col items-center justify-center p-6">
+          <video ref={videoRef} className="w-full max-w-sm rounded-2xl" muted playsInline />
+          <button type="button" onClick={stop} className="mt-4 px-6 py-3 bg-white text-slate-900 rounded-2xl font-black text-sm">Cancel</button>
+        </div>
+      )}
+    </>
+  );
+}
 
 function SummaryCard({ icon, color, label, value, unit, pct }) {
   const colors = { blue: 'bg-blue-50 text-blue-600 bg-blue-500', emerald: 'bg-emerald-50 text-emerald-600 bg-emerald-500', amber: 'bg-amber-50 text-amber-600 bg-amber-500', violet: 'bg-violet-50 text-violet-600 bg-violet-500' };

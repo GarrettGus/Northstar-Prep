@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema } from '../shared/schema.js';
+import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema } from '../shared/schema.js';
 import { token, validSession, hashPassword, verifyPassword, hashToken, randomToken, cookie, sameOrigin } from '../server/auth.js';
 import { createHandler } from '../api/hub.js';
 import { createHandler as createSessionHandler } from '../api/session.js';
@@ -36,6 +36,15 @@ test('settings are validated, persisted and used by imports',()=>{
   assert.equal(merged.settings.survivalGoalDays,30);
   assert.throws(()=>applyAction(emptyState(),{type:'settings',settings:{householdSize:0}}));
 });
+test('item schema validates barcode and recurringDays, defaulting both when absent',()=>{
+  const base={id:'x',name:'Rice'};
+  assert.equal(itemSchema.parse(base).barcode,'');
+  assert.equal(itemSchema.parse(base).recurringDays,0);
+  assert.equal(itemSchema.parse({...base,barcode:' 012345678905 '}).barcode,'012345678905');
+  assert.equal(itemSchema.parse({...base,recurringDays:'30'}).recurringDays,30);
+  assert.throws(()=>itemSchema.parse({...base,barcode:'not valid!'}));
+  assert.throws(()=>itemSchema.parse({...base,recurringDays:-1}));
+});
 test('bulk delete removes only validated IDs from one collection',()=>{
   let state=emptyState();
   state=applyAction(state,{type:'add',collection:'inventory',id:'a',item:{name:'A'}});
@@ -45,6 +54,27 @@ test('bulk delete removes only validated IDs from one collection',()=>{
   assert.deepEqual(next.inventory.map(row=>row.id),['b']);
   assert.equal(next.shoppingList.length,1);
   assert.throws(()=>applyAction(state,{type:'bulk_delete',collection:'inventory',ids:['bad.id']}));
+});
+test('bulk update can set category and set/adjust quantity for only the selected items',()=>{
+  let state=emptyState();
+  state=applyAction(state,{type:'add',collection:'inventory',id:'a',item:{name:'A',category:'Food',quantity:5}});
+  state=applyAction(state,{type:'add',collection:'inventory',id:'b',item:{name:'B',category:'Food',quantity:5}});
+  const categorized=applyAction(state,{type:'bulk_update',collection:'inventory',ids:['a'],category:'Gear'});
+  assert.equal(categorized.inventory.find(r=>r.id==='a').category,'Gear');
+  assert.equal(categorized.inventory.find(r=>r.id==='b').category,'Food');
+
+  const set=applyAction(state,{type:'bulk_update',collection:'inventory',ids:['a','b'],quantity:{mode:'set',value:9}});
+  assert.equal(set.inventory.find(r=>r.id==='a').quantity,9);
+  assert.equal(set.inventory.find(r=>r.id==='b').quantity,9);
+
+  const adjusted=applyAction(state,{type:'bulk_update',collection:'inventory',ids:['a'],quantity:{mode:'delta',value:-3}});
+  assert.equal(adjusted.inventory.find(r=>r.id==='a').quantity,2);
+  const floored=applyAction(state,{type:'bulk_update',collection:'inventory',ids:['a'],quantity:{mode:'delta',value:-100}});
+  assert.equal(floored.inventory.find(r=>r.id==='a').quantity,0);
+
+  assert.throws(()=>applyAction(state,{type:'bulk_update',collection:'inventory',ids:['a']}));
+  assert.throws(()=>applyAction(state,{type:'bulk_update',collection:'appliances',ids:['a'],category:'Gear'}));
+  assert.throws(()=>applyAction(state,{type:'bulk_update',collection:'inventory',ids:['a'],category:'NotACategory'}));
 });
 test('buy is atomic and idempotent; ID collisions never overwrite stock',()=>{
   const state=applyAction(emptyState(),{type:'add',collection:'shopping_list',id:item.id,item});
@@ -281,7 +311,7 @@ test('invite API validates tokens, enforces the invited email, and rejects accou
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',email:'invitee@example.com',password:'longenoughpw'}},success);
   assert.equal(success.code,200);assert.equal(success.data.user.id,'new-user-id');assert.match(success.headers['Set-Cookie'],/northstar=/);
 });
-import { waterGallons, isExpired, computeReadiness } from '../shared/readiness.js';
+import { waterGallons, isExpired, computeReadiness, isRecurringDue, nextRecurringDate } from '../shared/readiness.js';
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{
   assert.equal(waterGallons({quantity:3.785411784,unit:'liters'}),1);
   assert.equal(waterGallons({quantity:10,unit:'bottles'}),0);
@@ -291,6 +321,15 @@ test('expiration uses local calendar date and includes expiry day',()=>{
   const today=new Date(2026,8,12,19,30);
   assert.equal(isExpired('2026-09-12',today),false);
   assert.equal(isExpired('2026-09-11',today),true);
+});
+test('recurring items become due exactly recurringDays after purchaseDate',()=>{
+  const today=new Date(2026,8,12,9,0);
+  assert.equal(nextRecurringDate({purchaseDate:'2026-08-13',recurringDays:30}),'2026-09-12');
+  assert.equal(nextRecurringDate({purchaseDate:'2026-08-13',recurringDays:0}),null);
+  assert.equal(nextRecurringDate({purchaseDate:'',recurringDays:30}),null);
+  assert.equal(isRecurringDue({purchaseDate:'2026-08-13',recurringDays:30},today),true);
+  assert.equal(isRecurringDue({purchaseDate:'2026-08-14',recurringDays:30},today),false);
+  assert.equal(isRecurringDue({purchaseDate:'2026-08-13',recurringDays:0},today),false);
 });
 test('readiness needs scale with configurable household size and per-person rates',()=>{
   const inventory=[{category:'Food',quantity:10,caloriesPerUnit:2000,name:'Rice'},{category:'Water',quantity:8,unit:'gal',name:'Water'}];

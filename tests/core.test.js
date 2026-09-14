@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema } from '../shared/schema.js';
+import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema } from '../shared/schema.js';
+import { nextReminderDueDate, effectiveReminderDueDate, isReminderOverdue, addDaysISO } from '../shared/reminders.js';
+import { checklistCatalog } from '../shared/checklists.js';
 import { token, validSession, hashPassword, verifyPassword, hashToken, randomToken, cookie, sameOrigin } from '../server/auth.js';
 import { createHandler } from '../api/hub.js';
 import { createHandler as createSessionHandler } from '../api/session.js';
 import { createHandler as createMembersHandler } from '../api/members.js';
 import { createHandler as createInviteHandler } from '../api/invite.js';
+import { createHandler as createReminderHistoryHandler } from '../api/reminder-history.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
 process.env.DATABASE_URL='postgres://test-only/db';
 const item={id:'rice',name:'Rice',quantity:2,category:'Food'};
@@ -93,7 +96,7 @@ test('settings action validates and applies configurable readiness assumptions',
   assert.throws(()=>applyAction(state,{type:'settings',settings:{batteryUsableFraction:1.5}}));
 });
 test('legacy state without stored settings gets defaulted values, and backup import leaves settings untouched',()=>{
-  const legacy=stateSchema.parse({inventory:[],shoppingList:[],appliances:[],plan:null});
+  const legacy=stateSchema.parse({inventory:[],shoppingList:[],appliances:[],reminders:[],checklistChecks:[],plan:null});
   assert.deepEqual(legacy.settings,settingsSchema.parse({}));
   const configured=applyAction(emptyState(),{type:'settings',settings:{householdSize:2}});
   const backup=normalizeBackup({inventory:[item]},()=>'id');
@@ -363,4 +366,105 @@ test('fuel hours are grouped by fuel type for explainability',()=>{
   const stats=computeReadiness({inventory,appliances:[]},settingsSchema.parse({}));
   assert.equal(stats.totalFuelHours,30);
   assert.deepEqual(stats.fuelByType,{Propane:20,Gasoline:6,Other:4});
+});
+
+// --- Reminders and seasonal checklists ---
+test('reminder schema validates recurringDays and category, defaulting optional fields',()=>{
+  const base={id:'r1',title:'Rotate water'};
+  assert.equal(reminderSchema.parse(base).category,'Other');
+  assert.equal(reminderSchema.parse(base).recurringDays,90);
+  assert.equal(reminderSchema.parse({...base,category:'Water Rotation',recurringDays:'180'}).recurringDays,180);
+  assert.throws(()=>reminderSchema.parse({...base,category:'Not A Category'}));
+  assert.throws(()=>reminderSchema.parse({...base,recurringDays:0}));
+});
+test('reminders and checklist checks go through the generic add/update/delete collection actions',()=>{
+  let state=emptyState();
+  state=applyAction(state,{type:'add',collection:'reminders',id:'r1',item:{title:'Test generator',category:'Generator Test',recurringDays:30,startDate:'2026-01-01'}});
+  assert.equal(state.reminders[0].title,'Test generator');
+  state=applyAction(state,{type:'update',collection:'reminders',id:'r1',item:{lastCompletedDate:'2026-02-01'}});
+  assert.equal(state.reminders[0].lastCompletedDate,'2026-02-01');
+  state=applyAction(state,{type:'delete',collection:'reminders',id:'r1'});
+  assert.equal(state.reminders.length,0);
+
+  state=applyAction(state,{type:'add',collection:'checklist',id:'winter__insulate-pipes',item:{completedAt:'2026-01-05'}});
+  assert.equal(state.checklistChecks[0].id,'winter__insulate-pipes');
+  state=applyAction(state,{type:'delete',collection:'checklist',id:'winter__insulate-pipes'});
+  assert.equal(state.checklistChecks.length,0);
+});
+test('reminders and checklist checks round-trip through backup export/import',()=>{
+  const backup=normalizeBackup({reminders:[{title:'Rotate water',category:'Water Rotation',recurringDays:90}],checklistChecks:[{completedAt:'2026-01-01'}]},()=>'gen-id');
+  assert.equal(backup.reminders[0].id,'gen-id');
+  const merged=applyAction(emptyState(),{type:'import',backup});
+  assert.equal(merged.reminders.length,1);
+  assert.equal(merged.checklistChecks.length,1);
+});
+test('seasonal checklist catalog has four non-empty seasons with unique item IDs',()=>{
+  const seasons=checklistCatalog.map(s=>s.season);
+  assert.deepEqual(new Set(seasons).size,seasons.length);
+  assert.deepEqual(seasons.sort(),['evacuation','severe_weather','summer','winter']);
+  for (const {items} of checklistCatalog) {
+    assert.ok(items.length>0);
+    assert.equal(new Set(items.map(i=>i.id)).size,items.length);
+  }
+});
+test('a reminder is due recurringDays after its last completion, or after startDate if never completed',()=>{
+  const reminder={recurringDays:30,startDate:'2026-01-01',lastCompletedDate:'',snoozedUntil:''};
+  assert.equal(nextReminderDueDate(reminder),'2026-01-31');
+  assert.equal(isReminderOverdue(reminder,new Date(2026,0,30)),false);
+  assert.equal(isReminderOverdue(reminder,new Date(2026,0,31)),true);
+  const completed={...reminder,lastCompletedDate:'2026-02-01'};
+  assert.equal(nextReminderDueDate(completed),'2026-03-03');
+  assert.equal(nextReminderDueDate({recurringDays:30,startDate:'',lastCompletedDate:'',snoozedUntil:''}),null);
+});
+test('snoozing a reminder postpones its due date but never brings it earlier',()=>{
+  const reminder={recurringDays:30,startDate:'2026-01-01',lastCompletedDate:'',snoozedUntil:''};
+  const due=nextReminderDueDate(reminder);
+  const snoozed={...reminder,snoozedUntil:addDaysISO(due,10)};
+  assert.equal(effectiveReminderDueDate(snoozed),addDaysISO(due,10));
+  assert.equal(isReminderOverdue(snoozed,new Date(2026,0,31)),false);
+  const earlierSnooze={...reminder,snoozedUntil:'2026-01-02'};
+  assert.equal(effectiveReminderDueDate(earlierSnooze),due);
+});
+test('API records reminder completion and snooze history, but not plain field edits',async()=>{
+  let state=applyAction(emptyState(),{type:'add',collection:'reminders',id:'r1',item:{title:'Rotate water',category:'Water Rotation',recurringDays:90,startDate:'2026-01-01'}});
+  let version=0;
+  const historyEvents=[];
+  const repository={
+    async readState(){return {data:structuredClone(state),version};},
+    async compareAndSave(expected,next){if(expected!==version)return undefined;state=next;return ++version;},
+    async logAudit(){},
+    async logReminderHistory(entry){historyEvents.push(entry);},
+  };
+  const handler=createHandler(repository,()=>({userId:'user-1'}));
+
+  const editRes=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'update',collection:'reminders',id:'r1',item:{notes:'brand refreshed'}}},editRes);
+  assert.equal(editRes.code,200);assert.equal(historyEvents.length,0);
+
+  const completeRes=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'update',collection:'reminders',id:'r1',item:{lastCompletedDate:'2026-02-01'}}},completeRes);
+  assert.equal(completeRes.code,200);
+  assert.deepEqual(historyEvents,[{reminderId:'r1',reminderTitle:'Rotate water',category:'Water Rotation',event:'completed',eventDate:'2026-02-01',userId:'user-1'}]);
+
+  const snoozeRes=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'update',collection:'reminders',id:'r1',item:{snoozedUntil:'2026-02-10'}}},snoozeRes);
+  assert.equal(snoozeRes.code,200);
+  assert.equal(historyEvents.length,2);
+  assert.equal(historyEvents[1].event,'snoozed');
+  assert.equal(historyEvents[1].eventDate,'2026-02-10');
+});
+test('reminder history API enforces membership and returns entries',async()=>{
+  const entries=[{reminderId:'r1',reminderTitle:'Rotate water',category:'Water Rotation',event:'completed',eventDate:'2026-02-01',createdAt:'2026-02-01T00:00:00Z',actorEmail:'a@example.com'}];
+  const repository={async getMembership(){return {role:'member'};},async listReminderHistory(){return entries;}};
+  const ok=response();
+  await createReminderHistoryHandler(repository,()=>({userId:'user-1'}))({method:'GET',headers:{}},ok);
+  assert.equal(ok.code,200);assert.deepEqual(ok.data.entries,entries);
+
+  const denied=response();
+  await createReminderHistoryHandler({...repository,async getMembership(){return undefined;}},()=>({userId:'user-1'}))({method:'GET',headers:{}},denied);
+  assert.equal(denied.code,403);
+
+  const unauthed=response();
+  await createReminderHistoryHandler(repository,()=>false)({method:'GET',headers:{}},unauthed);
+  assert.equal(unauthed.code,401);
 });

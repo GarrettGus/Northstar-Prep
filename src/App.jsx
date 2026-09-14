@@ -9,7 +9,9 @@ import {
 } from 'lucide-react';
 import { request } from './api.js';
 import { computeReadiness, isExpired, isRecurringDue } from '../shared/readiness.js';
-import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories } from '../shared/schema.js';
+import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
+import { effectiveReminderDueDate, isReminderOverdue, todayLocal, addDaysISO } from '../shared/reminders.js';
+import { checklistCatalog } from '../shared/checklists.js';
 import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
 
 // --- Constants ---
@@ -40,6 +42,8 @@ export default function App() {
   const [inventory, setInventory] = useState([]);
   const [shoppingList, setShoppingList] = useState([]);
   const [appliances, setAppliances] = useState([]);
+  const [reminders, setReminders] = useState([]);
+  const [checklistChecks, setChecklistChecks] = useState([]);
   const [plan, setPlan] = useState(null);
   const [loading, setLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -60,7 +64,8 @@ export default function App() {
     if (version < revision.current) return;
     revision.current = version;
     setInventory(data.inventory); setShoppingList(data.shoppingList);
-    setAppliances(data.appliances); setPlan(data.plan); setSettings(settingsSchema.parse(data.settings ?? {}));
+    setAppliances(data.appliances); setReminders(data.reminders ?? []); setChecklistChecks(data.checklistChecks ?? []);
+    setPlan(data.plan); setSettings(settingsSchema.parse(data.settings ?? {}));
     saveCachedState({data,version});
     if (synced) setLastSyncedAt(Date.now());
   };
@@ -118,7 +123,7 @@ export default function App() {
   }, [user, online]);
   const queueOffline = action => {
     try {
-      const next = applyAction({inventory, shoppingList, appliances, plan, settings}, action);
+      const next = applyAction({inventory, shoppingList, appliances, reminders, checklistChecks, plan, settings}, action);
       const count = enqueueAction(action);
       accept({data:next,version:revision.current}, false);
       setPendingSync(count); setGlobalError('Offline: saved on this device and queued for sync.');
@@ -138,11 +143,11 @@ export default function App() {
     finally {busy.current=false;setIsSyncing(false);}
   };
   const logout = async () => {
-    try {await request('session',{},'DELETE');epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setPlan(null);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    try {await request('session',{},'DELETE');epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setPlan(null);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
-    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,plan,settings},null,2)],{type:'application/json'});
+    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,reminders,checklistChecks,plan,settings},null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob);const link=document.createElement('a');
     link.href=url;link.download=`northstar-backup-${new Date().toISOString().slice(0,10)}.json`;link.click();
     setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -174,6 +179,7 @@ export default function App() {
 
   // --- Logic Helpers ---
   const stats = useMemo(() => computeReadiness({ inventory, appliances }, settings), [inventory, appliances, settings]);
+  const overdueReminders = useMemo(() => reminders.filter(r => isReminderOverdue(r)), [reminders]);
   const handleUpdateSettings = (next) => mutate({ type: 'settings', settings: next });
 
   const generateMealPlan = async () => {
@@ -229,6 +235,12 @@ export default function App() {
     }
     return true;
   };
+  const handleCompleteReminder = (reminder) => handleUpdate('reminders', reminder.id, {...reminder, lastCompletedDate: todayLocal(), snoozedUntil: ''});
+  const handleSnoozeReminder = (reminder, days) => handleUpdate('reminders', reminder.id, {...reminder, snoozedUntil: addDaysISO(todayLocal(), days)});
+  const handleToggleChecklistItem = (season, itemId, checked) => {
+    const id = `${season}__${itemId}`;
+    return checked ? mutate({type:'add', collection:'checklist', id, item:{completedAt: todayLocal()}}) : mutate({type:'delete', collection:'checklist', id});
+  };
 
   const handleAuthenticated = (profile) => {
     epoch.current++;revision.current=-1;setLoading(true);setUser(profile);setGlobalError(null);
@@ -250,7 +262,7 @@ export default function App() {
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
-        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} onGeneratePlan={generateMealPlan} onAnalyzeGaps={analyzeInventory} isAiLoading={isAiLoading} />}
+        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} onGeneratePlan={generateMealPlan} onAnalyzeGaps={analyzeInventory} isAiLoading={isAiLoading} overdueReminders={overdueReminders} onViewReminders={() => setActiveTab('plan')} />}
         {activeTab === 'inventory' && (
           <InventoryManager
             title="Supply Hub"
@@ -297,7 +309,18 @@ export default function App() {
             isAiLoading={isAiLoading}
           />
         )}
-        {activeTab === 'plan' && <EmergencyPlan plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunDrill={generateDrill} isAiLoading={isAiLoading} />}
+        {activeTab === 'plan' && (
+          <EmergencyPlan
+            plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunDrill={generateDrill} isAiLoading={isAiLoading}
+            reminders={reminders} checklistChecks={checklistChecks}
+            onAddReminder={(i) => handleAdd('reminders', i)}
+            onUpdateReminder={(id, i) => handleUpdate('reminders', id, i)}
+            onDeleteReminder={(id) => handleDelete('reminders', id)}
+            onCompleteReminder={handleCompleteReminder}
+            onSnoozeReminder={handleSnoozeReminder}
+            onToggleChecklistItem={handleToggleChecklistItem}
+          />
+        )}
       </main>
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
@@ -309,9 +332,15 @@ export default function App() {
 }
 
 // --- Dashboard ---
-function Dashboard({ stats, settings, onGeneratePlan, onAnalyzeGaps, isAiLoading }) {
+function Dashboard({ stats, settings, onGeneratePlan, onAnalyzeGaps, isAiLoading, overdueReminders = [], onViewReminders }) {
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
+      {overdueReminders.length > 0 && (
+        <button onClick={onViewReminders} className="w-full flex items-center justify-between gap-3 bg-red-50 border border-red-100 rounded-2xl px-4 py-3 text-sm text-left active:scale-95 transition-all">
+          <span className="flex items-center gap-2 font-bold text-red-800"><AlertOctagon size={16}/> {overdueReminders.length} overdue maintenance {overdueReminders.length > 1 ? 'reminders' : 'reminder'}</span>
+          <ChevronRight size={16} className="text-red-400"/>
+        </button>
+      )}
       <div className="grid grid-cols-2 gap-4">
         <StatusCard icon={<Droplets size={24}/>} color="blue" value={stats.waterDays.toFixed(1)} label="Water Days" />
         <StatusCard icon={<Utensils size={24}/>} color="emerald" value={stats.foodDays.toFixed(1)} label="Food Days" />
@@ -777,7 +806,7 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
 }
 
 // --- Emergency Plan ---
-function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
+function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading, reminders = [], checklistChecks = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem }) {
   const [isEditing, setIsEditing] = useState(false);
   const [spot, setSpot] = useState(plan?.shelterSpot || '');
   useEffect(() => { if (!isEditing) setSpot(plan?.shelterSpot || ''); }, [plan, isEditing]);
@@ -818,6 +847,9 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
         )}
       </section>
 
+      <RemindersSection reminders={reminders} onAdd={onAddReminder} onUpdate={onUpdateReminder} onDelete={onDeleteReminder} onComplete={onCompleteReminder} onSnooze={onSnoozeReminder} />
+      <ChecklistsSection checklistChecks={checklistChecks} onToggle={onToggleChecklistItem} />
+
       {/* Survival Sync Links Moved Here */}
       <div className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm mt-6">
         <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Survival Sync</h3>
@@ -839,6 +871,156 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
         </div>
       </div>
     </div>
+  );
+}
+
+// --- Maintenance Reminders ---
+function getReminderIcon(category) {
+  switch (category) {
+    case 'Water Rotation': return <Droplets size={20}/>;
+    case 'Batteries': return <Battery size={20}/>;
+    case 'Generator Test': return <Zap size={20}/>;
+    case 'Medication': return <Shield size={20}/>;
+    default: return <ClipboardList size={20}/>;
+  }
+}
+const emptyReminderForm = () => ({ title: '', category: 'Water Rotation', recurringDays: 90, notes: '', startDate: todayLocal() });
+
+function RemindersSection({ reminders, onAdd, onUpdate, onDelete, onComplete, onSnooze }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState(emptyReminderForm);
+
+  const reset = () => { setForm(emptyReminderForm()); setEditingId(null); setShowAdd(false); };
+  const submit = async (e) => {
+    e.preventDefault();
+    const data = { ...form, recurringDays: Number(form.recurringDays) };
+    if (editingId) { if (!await onUpdate(editingId, data)) return; }
+    else if (!await onAdd(data)) return;
+    reset();
+  };
+  const handleEdit = (reminder) => {
+    setForm({ title: reminder.title, category: reminder.category, recurringDays: reminder.recurringDays, notes: reminder.notes, startDate: reminder.startDate || todayLocal() });
+    setEditingId(reminder.id);
+    setShowAdd(true);
+  };
+
+  const sorted = useMemo(() => [...reminders].sort((a, b) => (effectiveReminderDueDate(a) || '9999-99-99').localeCompare(effectiveReminderDueDate(b) || '9999-99-99')), [reminders]);
+
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest flex items-center gap-2"><ClipboardList size={14}/> Maintenance Reminders</h3>
+        <button aria-label={showAdd ? 'Cancel adding reminder' : 'Add reminder'} onClick={() => showAdd ? reset() : setShowAdd(true)} className="bg-slate-900 text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase flex items-center gap-1">
+          {showAdd ? 'Cancel' : <><Plus size={14}/> Add</>}
+        </button>
+      </div>
+
+      {showAdd && (
+        <form onSubmit={submit} className="space-y-3 bg-slate-50 rounded-2xl p-5 mb-4">
+          <div className="flex justify-between items-center">
+            <h4 className="text-[10px] font-black uppercase text-blue-600">{editingId ? 'Edit Reminder' : 'New Reminder'}</h4>
+            {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
+          </div>
+          <div><Label>Title</Label><Input val={form.title} set={v => setForm({...form, title: v})} placeholder="e.g. Rotate stored water" /></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={reminderCategories} /></div>
+            <div><Label>Repeat every (days)</Label><Input val={form.recurringDays} set={v => setForm({...form, recurringDays: v})} type="number" /></div>
+          </div>
+          <div><Label>Start date</Label><Input val={form.startDate} set={v => setForm({...form, startDate: v})} type="date" /></div>
+          <div><Label>Notes (optional)</Label><Input val={form.notes} set={v => setForm({...form, notes: v})} placeholder="Any details" /></div>
+          <button type="submit" className="w-full bg-blue-600 text-white py-3 rounded-xl font-black text-sm">{editingId ? 'Save Changes' : 'Add Reminder'}</button>
+        </form>
+      )}
+
+      <div className="space-y-3">
+        {sorted.map(reminder => {
+          const due = effectiveReminderDueDate(reminder);
+          const overdue = isReminderOverdue(reminder);
+          return (
+            <div key={reminder.id} className={`border p-4 rounded-2xl ${overdue ? 'bg-red-50 border-red-200' : 'bg-white border-slate-200'}`}>
+              <div className="flex items-center gap-3 min-w-0 cursor-pointer" onClick={() => handleEdit(reminder)}>
+                <div className={`p-2.5 rounded-xl shrink-0 ${overdue ? 'bg-red-100 text-red-600' : 'bg-slate-100 text-slate-600'}`}>{getReminderIcon(reminder.category)}</div>
+                <div className="min-w-0">
+                  <div className="font-black text-slate-800 text-sm truncate">{reminder.title}</div>
+                  <div className="text-[10px] font-bold text-slate-600 uppercase">{reminder.category} • Every {reminder.recurringDays}d</div>
+                  <div className={`text-[10px] font-black uppercase mt-0.5 ${overdue ? 'text-red-600' : 'text-slate-500'}`}>
+                    {due ? (overdue ? `Overdue since ${due}` : `Due ${due}`) : 'No start date set'}
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-2 mt-3">
+                <button aria-label={`Mark ${reminder.title} complete`} onClick={() => onComplete(reminder)} className="flex-1 bg-emerald-50 text-emerald-700 py-2 rounded-xl text-[10px] font-black uppercase flex items-center justify-center gap-1"><CheckCircle size={12}/> Mark Complete</button>
+                <button aria-label={`Snooze ${reminder.title} 7 days`} onClick={() => onSnooze(reminder, 7)} className="flex-1 bg-amber-50 text-amber-700 py-2 rounded-xl text-[10px] font-black uppercase">Snooze 7d</button>
+              </div>
+            </div>
+          );
+        })}
+        {reminders.length === 0 && !showAdd && <p className="text-center py-6 text-slate-600 text-xs font-bold uppercase tracking-widest">No reminders yet</p>}
+      </div>
+      <ReminderHistoryPanel />
+    </section>
+  );
+}
+
+function ReminderHistoryPanel() {
+  const [entries, setEntries] = useState(null);
+  useEffect(() => { request('reminder-history').then(r => setEntries(r.entries)).catch(() => setEntries([])); }, []);
+  if (!entries) return null;
+  return (
+    <div className="mt-5 pt-4 border-t border-slate-100">
+      <h4 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-2 flex items-center gap-2"><History size={12}/> Recent checks</h4>
+      {entries.length === 0 ? <p className="text-xs text-slate-500">No completed or snoozed reminders yet.</p> : (
+        <ul className="space-y-1 max-h-40 overflow-y-auto text-xs text-slate-600">
+          {entries.map((entry, i) => (
+            <li key={i}>
+              <span className="font-bold text-slate-800">{entry.reminderTitle || 'A reminder'}</span> was {entry.event}
+              {entry.event === 'snoozed' ? ` until ${entry.eventDate}` : ` on ${entry.eventDate}`} by {entry.actorEmail || 'someone'}
+              · <span className="text-slate-400">{new Date(entry.createdAt).toLocaleString()}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// --- Seasonal Checklists ---
+function ChecklistsSection({ checklistChecks, onToggle }) {
+  const checkedIds = useMemo(() => new Set(checklistChecks.map(c => c.id)), [checklistChecks]);
+  const [openSeason, setOpenSeason] = useState(null);
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4 flex items-center gap-2"><Layers size={14}/> Seasonal Checklists</h3>
+      <div className="space-y-3">
+        {checklistCatalog.map(({season, label, items}) => {
+          const doneCount = items.filter(item => checkedIds.has(`${season}__${item.id}`)).length;
+          const open = openSeason === season;
+          return (
+            <div key={season} className="border border-slate-100 rounded-2xl overflow-hidden">
+              <button type="button" aria-expanded={open} onClick={() => setOpenSeason(open ? null : season)} className="w-full flex justify-between items-center px-4 py-3 bg-slate-50">
+                <span className="font-black text-slate-800 text-sm">{label}</span>
+                <span className={`text-[10px] font-black uppercase ${doneCount === items.length ? 'text-emerald-600' : 'text-slate-500'}`}>{doneCount}/{items.length}</span>
+              </button>
+              {open && (
+                <div className="p-4 space-y-2">
+                  {items.map(item => {
+                    const id = `${season}__${item.id}`;
+                    const checked = checkedIds.has(id);
+                    return (
+                      <label key={item.id} className="flex items-center gap-3 text-sm">
+                        <input type="checkbox" checked={checked} onChange={e => onToggle(season, item.id, e.target.checked)} className="h-4 w-4 accent-blue-600 shrink-0" />
+                        <span className={checked ? 'line-through text-slate-400' : 'text-slate-700'}>{item.text}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -1277,6 +1459,7 @@ function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImpor
       {pendingImport && <div role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-2 text-sm">
         <p className="font-black text-amber-900">Backup ready to review</p>
         <p className="text-amber-800">{pendingImport.inventory.length} inventory items, {pendingImport.shoppingList.length} shopping items, {pendingImport.appliances.length} appliances and {pendingImport.plan ? 'a family plan' : 'no family plan'} will be merged by ID.</p>
+        {pendingImport.reminders?.length > 0 && <p className="text-amber-800">{pendingImport.reminders.length} maintenance reminders will be merged.</p>}
         {pendingImport.settings && <p className="text-amber-800">Readiness assumptions are included.</p>}
         <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">Merge backup</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
       </div>}

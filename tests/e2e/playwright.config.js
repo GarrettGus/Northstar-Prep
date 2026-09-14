@@ -14,11 +14,16 @@ export default defineConfig({
     trace: 'retain-on-failure',
   },
   webServer: {
-    command: `npx vite --config tests/e2e/vite.config.js --port ${port} --strictPort`,
+    // --host pins the bind address to IPv4 explicitly: without it, Vite's default
+    // "localhost" bind can resolve to IPv6-only on some CI runners, and polling
+    // http://127.0.0.1 then never connects, timing out instead of erroring fast.
+    command: `npx vite --config tests/e2e/vite.config.js --host 127.0.0.1 --port ${port} --strictPort`,
     cwd: repoRoot,
     url: `http://127.0.0.1:${port}`,
     reuseExistingServer: !process.env.CI,
-    timeout: 30_000,
+    timeout: 60_000,
+    stdout: 'pipe',
+    stderr: 'pipe',
   },
   projects: [
     {

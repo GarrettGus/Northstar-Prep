@@ -8,7 +8,7 @@ import {
   Siren, SearchCheck, Power, Tag, Calendar, ArrowUpDown
 } from 'lucide-react';
 import { request } from './api.js';
-import { computeReadiness, computeReadinessGaps, isExpired, isRecurringDue } from '../shared/readiness.js';
+import { computeReadiness, computeReadinessGaps, isExpired, isRecurringDue, expirationQueue } from '../shared/readiness.js';
 import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
 import { effectiveReminderDueDate, isReminderOverdue, todayLocal, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
@@ -241,7 +241,7 @@ export default function App() {
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
-        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} onViewReminders={() => setActiveTab('plan')} />}
+        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} onViewReminders={() => setActiveTab('plan')} onViewRotation={() => setActiveTab('inventory')} />}
         {activeTab === 'inventory' && (
           <InventoryManager
             title="Supply Hub"
@@ -306,13 +306,24 @@ export default function App() {
 }
 
 // --- Dashboard ---
-function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueReminders = [], onViewReminders }) {
+function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueReminders = [], onViewReminders, onViewRotation }) {
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       {overdueReminders.length > 0 && (
         <button onClick={onViewReminders} className="w-full flex items-center justify-between gap-3 bg-red-50 border border-red-100 rounded-2xl px-4 py-3 text-sm text-left active:scale-95 transition-all">
           <span className="flex items-center gap-2 font-bold text-red-800"><AlertOctagon size={16}/> {overdueReminders.length} overdue maintenance {overdueReminders.length > 1 ? 'reminders' : 'reminder'}</span>
           <ChevronRight size={16} className="text-red-400"/>
+        </button>
+      )}
+      {(stats.expiringSoon > 0 || stats.expired > 0) && (
+        <button onClick={onViewRotation} className="w-full flex items-center justify-between gap-3 bg-orange-50 border border-orange-100 rounded-2xl px-4 py-3 text-sm text-left active:scale-95 transition-all">
+          <span className="flex items-center gap-2 font-bold text-orange-800">
+            <Calendar size={16}/>
+            {stats.expiringSoon > 0 && <>{stats.expiringSoon} item{stats.expiringSoon === 1 ? '' : 's'} expiring within 90 days</>}
+            {stats.expiringSoon > 0 && stats.expired > 0 && <> · </>}
+            {stats.expired > 0 && <>{stats.expired} already expired</>}
+          </span>
+          <ChevronRight size={16} className="text-orange-400"/>
         </button>
       )}
       <div className="grid grid-cols-2 gap-4">
@@ -573,6 +584,14 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
 
   const totalShopCost = useMemo(() => items.reduce((acc, i) => acc + (Number(i.price||0) * Number(i.quantity||0)), 0), [items]);
 
+  // Supplies that have not lapsed yet but will within 90 days, soonest first. Items already on
+  // the shopping list are left out so "replace" does not queue a second copy of the same thing.
+  const rotationQueue = useMemo(() => {
+    if (isShoppingMode) return [];
+    return expirationQueue(items).filter(row => !shoppingList.some(existing =>
+      existing.category === row.item.category && String(existing.name || '').trim().toLowerCase() === String(row.item.name || '').trim().toLowerCase()));
+  }, [items, shoppingList, isShoppingMode]);
+
   const dueRecurringItems = useMemo(() => {
     if (isShoppingMode) return [];
     return items.filter(item => isRecurringDue(item) && !shoppingList.some(row => row.category === item.category && String(row.name || '').trim().toLowerCase() === String(item.name || '').trim().toLowerCase()));
@@ -669,6 +688,28 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
           <span className="font-bold text-amber-800">{dueRecurringItems.length} item{dueRecurringItems.length > 1 ? 's' : ''} due for restock</span>
           <button aria-label="Add due recurring items to shopping list" onClick={async () => { if (await onRestock(dueRecurringItems)) alert('Added due items to your shopping list.'); }} className="text-amber-700 font-black">Add to shopping list</button>
         </div>
+      )}
+
+      {rotationQueue.length > 0 && (
+        <section aria-labelledby="rotation-queue-heading" className="bg-orange-50 border border-orange-100 rounded-2xl px-4 py-3 mb-4 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <h3 id="rotation-queue-heading" className="text-[10px] font-black uppercase tracking-widest text-orange-800 flex items-center gap-2"><Calendar size={12}/> Rotation queue — use these first</h3>
+            <button aria-label="Add every item in the rotation queue to the shopping list" onClick={async () => { if (await onRestock(rotationQueue.map(row => row.item))) alert('Queued replacements onto your shopping list.'); }} className="text-orange-700 font-black text-[10px] uppercase">Replace all</button>
+          </div>
+          <ul className="space-y-2">
+            {rotationQueue.map(({ item, daysRemaining, window: windowDays }) => (
+              <li key={item.id} className="flex items-center justify-between gap-3 text-sm">
+                <span className="font-bold text-slate-700 truncate">
+                  {item.name}
+                  <span className="ml-2 text-[9px] font-black uppercase bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded">
+                    {daysRemaining === 0 ? 'Today' : `${daysRemaining}d`} · ≤{windowDays}d
+                  </span>
+                </span>
+                <button aria-label={`Queue a replacement for ${item.name}`} onClick={async () => { if (await onRestock([item])) alert(`Queued a replacement for ${item.name}.`); }} className="text-orange-700 font-black text-[10px] uppercase shrink-0">Replace</button>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
 
       {showAdd && (

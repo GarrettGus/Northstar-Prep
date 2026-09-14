@@ -314,7 +314,7 @@ test('invite API validates tokens, enforces the invited email, and rejects accou
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',email:'invitee@example.com',password:'longenoughpw'}},success);
   assert.equal(success.code,200);assert.equal(success.data.user.id,'new-user-id');assert.match(success.headers['Set-Cookie'],/northstar=/);
 });
-import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds } from '../shared/readiness.js';
+import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds, daysUntilExpiry, expirationQueue, expirationSummary } from '../shared/readiness.js';
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{
   assert.equal(waterGallons({quantity:3.785411784,unit:'liters'}),1);
   assert.equal(waterGallons({quantity:10,unit:'bottles'}),0);
@@ -342,6 +342,52 @@ test('readiness needs scale with configurable household size and per-person rate
   assert.equal(solo.foodDays,10);assert.equal(family.foodDays,2.5);
   assert.equal(solo.dailyWaterNeed,1);assert.equal(family.dailyWaterNeed,4);
   assert.equal(solo.waterDays,8);assert.equal(family.waterDays,2);
+});
+test('days until expiry counts whole local calendar days either side of today',()=>{
+  const now=new Date(2026,8,14,23,45);
+  assert.equal(daysUntilExpiry('2026-09-14',now),0);
+  assert.equal(daysUntilExpiry('2026-09-15',now),1);
+  assert.equal(daysUntilExpiry('2026-09-13',now),-1);
+  assert.equal(daysUntilExpiry('',now),null);
+  assert.equal(daysUntilExpiry('not-a-date',now),null);
+});
+test('rotation queue lists unlapsed supplies soonest first inside the 90 day horizon',()=>{
+  const now=new Date(2026,8,14);
+  const inventory=[
+    {id:'far',name:'Far',expiryDate:'2027-04-01'},
+    {id:'mid',name:'Mid',expiryDate:'2026-10-29'},
+    {id:'lapsed',name:'Lapsed',expiryDate:'2026-09-01'},
+    {id:'today',name:'Today',expiryDate:'2026-09-14'},
+    {id:'none',name:'No date',expiryDate:''},
+  ];
+  const queue=expirationQueue(inventory,now);
+  // Soonest first; already-expired, undated and beyond-horizon items are all left out.
+  assert.deepEqual(queue.map(row=>row.item.id),['today','mid']);
+  assert.deepEqual(queue.map(row=>row.daysRemaining),[0,45]);
+  // Each row is tagged with the tightest window it falls inside.
+  assert.deepEqual(queue.map(row=>row.window),[30,60]);
+});
+test('rotation windows count cumulatively so 60 days includes the first 30',()=>{
+  const now=new Date(2026,8,14);
+  const inventory=[
+    {id:'a',name:'A',expiryDate:'2026-09-20'},
+    {id:'b',name:'B',expiryDate:'2026-10-20'},
+    {id:'c',name:'C',expiryDate:'2026-12-10'},
+  ];
+  const {counts,total}=expirationSummary(inventory,now);
+  assert.equal(counts[30],1);
+  assert.equal(counts[60],2);
+  assert.equal(counts[90],3);
+  assert.equal(total,3);
+});
+test('readiness reports an expiring-soon count beside the existing expired count',()=>{
+  const settings=settingsSchema.parse({});
+  const soon=new Date(Date.now()+20*86400000);
+  const iso=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const inventory=[{id:'a',name:'A',category:'Food',quantity:1,expiryDate:iso(soon)},{id:'b',name:'B',category:'Food',quantity:1,expiryDate:'2020-01-01'}];
+  const stats=computeReadiness({inventory,appliances:[]},settings);
+  assert.equal(stats.expiringSoon,1);
+  assert.equal(stats.expired,1);
 });
 test('readiness falls back to household size until a member opts in',()=>{
   const settings=settingsSchema.parse({householdSize:4});

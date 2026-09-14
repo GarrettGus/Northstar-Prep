@@ -10,6 +10,36 @@ export function isExpired(date,now=new Date()) {
   const local=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
   return date<local;
 }
+// Whole days from today until an expiry date, in local calendar terms: 0 means it lapses today
+// and a negative number means it already has. Returns null for an item with no expiry date.
+export function daysUntilExpiry(date,now=new Date()) {
+  if(!date)return null;
+  const [y,m,d]=date.split('-').map(Number);
+  if(!y||!m||!d)return null;
+  const target=new Date(y,m-1,d);
+  const today=new Date(now.getFullYear(),now.getMonth(),now.getDate());
+  return Math.round((target-today)/86400000);
+}
+export const rotationWindows=[30,60,90];
+// The rotation queue: supplies that have not lapsed yet but will within the longest window,
+// soonest first, each tagged with the tightest window it falls inside. Expired items are left
+// out -- readiness already excludes them and they are reported separately as an expired count.
+export function expirationQueue(inventory=[],now=new Date(),windows=rotationWindows) {
+  const longest=Math.max(...windows);
+  return inventory
+    .map(item=>({item,daysRemaining:daysUntilExpiry(item.expiryDate,now)}))
+    .filter(row=>row.daysRemaining!==null&&row.daysRemaining>=0&&row.daysRemaining<=longest)
+    .map(row=>({...row,window:[...windows].sort((a,b)=>a-b).find(days=>row.daysRemaining<=days)}))
+    .sort((a,b)=>a.daysRemaining-b.daysRemaining||String(a.item.name||'').localeCompare(String(b.item.name||'')));
+}
+// How many supplies fall in each window, cumulatively: the 60-day count includes the 30-day one,
+// because "expiring within 60 days" is how a household reads it.
+export function expirationSummary(inventory=[],now=new Date(),windows=rotationWindows) {
+  const queue=expirationQueue(inventory,now,windows);
+  const counts=Object.fromEntries(windows.map(days=>[days,queue.filter(row=>row.daysRemaining<=days).length]));
+  return {queue,counts,total:queue.length};
+}
+
 // Recurring items replenish every recurringDays from purchaseDate; 0/unset means it doesn't recur.
 export function nextRecurringDate(item) {
   if(!item.recurringDays||!item.purchaseDate)return null;
@@ -92,6 +122,7 @@ export function computeReadiness({inventory=[],appliances=[],plan=null},settings
 
   const waterDays=dailyWaterNeed>0?waterQty/dailyWaterNeed:0;
   const foodDays=dailyCalorieNeed>0?totalCals/dailyCalorieNeed:0;
+  const expiringSoon=expirationSummary(inventory).total;
 
   const coreStatus=Object.keys(buckets).map(name=>{
     const val=buckets[name];
@@ -112,7 +143,7 @@ export function computeReadiness({inventory=[],appliances=[],plan=null},settings
   return {
     waterDays,foodDays,totalFuelHours:fuelHours,fuelByType,
     totalPowerKwh:usablePowerKwh,rawPowerKwh:storedPowerKwh,totalCalories:totalCals,totalValue,
-    lowStock,expired,coreStatus,dailyLoadKwh,powerDays,
+    lowStock,expired,expiringSoon,coreStatus,dailyLoadKwh,powerDays,
     dailyCalorieNeed,dailyWaterNeed,
     needsMode:needs.mode,people:needs.people,pets:needs.pets,
   };

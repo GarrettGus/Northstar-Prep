@@ -921,7 +921,7 @@ function SummaryCard({ icon, color, label, value, unit, pct }) {
   );
 }
 
-function InventoryItem({ item, onClick, onBuy, selected, onSelect }) {
+export function InventoryItem({ item, onClick, onBuy, selected, onSelect }) {
   const { icon, style } = getCategoryIcon(item.category);
   const price = item.price ? Number(item.price) : 0;
   const totalVal = price * (Number(item.quantity) || 0);
@@ -940,42 +940,46 @@ function InventoryItem({ item, onClick, onBuy, selected, onSelect }) {
   const expired = isExpired(item.expiryDate);
 
   return (
-    <div role="button" tabIndex="0" aria-label={`Edit ${item.name}`} onClick={onClick} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onClick(); } }} className={`bg-white border border-slate-200 p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm active:scale-95 transition-all cursor-pointer ${expired ? 'border-red-300 bg-red-50' : ''}`}>
+    <div className={`bg-white border border-slate-200 p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm active:scale-95 transition-all ${expired ? 'border-red-300 bg-red-50' : ''}`}>
        <div className="flex items-center gap-3 min-w-0">
-          {onSelect && <input aria-label={`Select ${item.name}`} type="checkbox" checked={selected} onChange={event => { event.stopPropagation(); onSelect(event.target.checked); }} onClick={event => event.stopPropagation()} className="h-4 w-4 accent-blue-600" />}
-          <div className={`w-12 h-12 rounded-2xl flex items-center justify-center overflow-hidden ${style}`}>
-            {item.image ? (
-               <img src={item.image} alt="" className="w-full h-full object-cover"/>
-            ) : (
-               item.emoji ? <span className="text-2xl">{item.emoji}</span> : icon
-            )}
-          </div>
-          <div>
-             <div className="flex items-center gap-2">
-               <h4 className="font-black text-slate-800 leading-tight">{item.name}</h4>
-               {item.macroTag && (
-                 <span className={`text-[8px] font-bold uppercase px-1.5 py-0.5 rounded-md ${getTagColor(item.macroTag)}`}>
-                   {item.macroTag}
-                 </span>
+          {onSelect && <input aria-label={`Select ${item.name}`} type="checkbox" checked={selected} onChange={event => onSelect(event.target.checked)} className="h-4 w-4 accent-blue-600" />}
+          {/* Edit control is scoped to just the icon/name so it doesn't nest the
+              checkbox or buy button above inside a single focusable "button" region. */}
+          <div role="button" tabIndex="0" aria-label={`Edit ${item.name}`} onClick={onClick} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onClick(); } }} className="flex items-center gap-3 min-w-0 cursor-pointer">
+            <div className={`w-12 h-12 rounded-2xl flex items-center justify-center overflow-hidden ${style}`}>
+              {item.image ? (
+                 <img src={item.image} alt="" className="w-full h-full object-cover"/>
+              ) : (
+                 item.emoji ? <span className="text-2xl">{item.emoji}</span> : icon
+              )}
+            </div>
+            <div>
+               <div className="flex items-center gap-2">
+                 <h4 className="font-black text-slate-800 leading-tight">{item.name}</h4>
+                 {item.macroTag && (
+                   <span className={`text-[8px] font-bold uppercase px-1.5 py-0.5 rounded-md ${getTagColor(item.macroTag)}`}>
+                     {item.macroTag}
+                   </span>
+                 )}
+               </div>
+               <div className="flex gap-2 mt-1">
+                 {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
+                 <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
+                  {item.quantity} {item.unit}
+                 </p>
+               </div>
+               {price > 0 && (
+                 <p className="text-[9px] font-black text-emerald-600 mt-1">
+                   ${price.toFixed(2)}/ea • Total: ${totalVal.toFixed(2)}
+                 </p>
                )}
-             </div>
-             <div className="flex gap-2 mt-1">
-               {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
-               <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
-                {item.quantity} {item.unit}
-               </p>
-             </div>
-             {price > 0 && (
-               <p className="text-[9px] font-black text-emerald-600 mt-1">
-                 ${price.toFixed(2)}/ea • Total: ${totalVal.toFixed(2)}
-               </p>
-             )}
+            </div>
           </div>
        </div>
        <div className="flex items-center gap-2">
          {onBuy && (
            <button aria-label={`Move ${item.name} to inventory`}
-             onClick={(e) => { e.stopPropagation(); onBuy(item); }}
+             onClick={() => onBuy(item)}
              className="p-2 bg-slate-100 text-slate-500 hover:bg-emerald-100 hover:text-emerald-600 rounded-full transition-colors"
              title="Buy & Move to Inventory"
            >
@@ -1029,7 +1033,7 @@ function formatRelativeTime(timestamp) {
   return `Saved ${minutes}m ago`;
 }
 
-function Header({ hubId, isSyncing, online, pendingSync, lastSyncedAt, onSyncClick, error, onDownload }) {
+export function Header({ hubId, isSyncing, online, pendingSync, lastSyncedAt, onSyncClick, error, onDownload }) {
   return (
     <header className="bg-slate-900 text-white p-4 sticky top-0 z-50 shadow-xl border-b border-white/5">
       <div className="max-w-xl mx-auto flex justify-between items-center text-white">
@@ -1042,7 +1046,7 @@ function Header({ hubId, isSyncing, online, pendingSync, lastSyncedAt, onSyncCli
           <button aria-label="Open household settings" onClick={onSyncClick} className="flex flex-col items-end">
             <div aria-live="polite" className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[9px] font-black uppercase transition-all ${error ? 'bg-red-500/20 text-red-300' : isSyncing ? 'bg-blue-500/20 text-blue-300' : 'bg-green-500/20 text-green-300'}`}>
               {error ? <AlertOctagon size={10}/> : isSyncing ? <RefreshCw size={10} className="animate-spin" /> : <CheckCircle size={10} />}
-              {online ? (pendingSync ? `${pendingSync} queued` : formatRelativeTime(lastSyncedAt)) : 'Offline'}
+              {error ? 'Sync error' : online ? (pendingSync ? `${pendingSync} queued` : formatRelativeTime(lastSyncedAt)) : 'Offline'}
             </div>
           </button>
         </div>
@@ -1084,7 +1088,7 @@ function getCategoryIcon(cat) {
 }
 
 // --- Modals ---
-function useDialogFocus(dialogRef, onClose) {
+export function useDialogFocus(dialogRef, onClose) {
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   useEffect(() => {
@@ -1381,7 +1385,7 @@ function AcceptInvite({token,onJoined}) {
   </main>;
 }
 
-function AiModal({ content, onClose }) {
+export function AiModal({ content, onClose }) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return (

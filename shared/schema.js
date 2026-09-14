@@ -67,23 +67,37 @@ export const itemSchema = z.object({
   recurringDays: z.coerce.number().int().min(0).max(3650).default(0),
 });
 export const applianceSchema = z.object({ id: idSchema, name: z.string().trim().min(1).max(200), watts: number, hours: z.coerce.number().finite().min(0).max(24), active: z.boolean().default(true) });
+
+// --- Recurring maintenance reminders (water rotation, medication expiry, batteries, generator tests, etc). ---
+export const reminderCategories = ['Water Rotation', 'Medication', 'Batteries', 'Generator Test', 'Other'];
+export const reminderSchema = z.object({
+  id: idSchema, title: z.string().trim().min(1).max(200),
+  category: z.enum(reminderCategories).default('Other'),
+  // Days between checks; the reminder recurs from lastCompletedDate (or startDate if never completed).
+  recurringDays: z.coerce.number().int().min(1).max(3650).default(90),
+  notes: text.default(''), startDate: date, lastCompletedDate: date, snoozedUntil: date,
+});
+// One row per checked seasonal checklist item; id is `${season}__${itemId}` from shared/checklists.js.
+// Unchecking an item deletes its row instead of storing a false flag.
+export const checklistCheckSchema = z.object({ id: idSchema, completedAt: date });
 export const planSchema = z.object({
   shelterSpot: z.string().max(3000).default(''),
   family: z.array(z.object({name: z.string().max(100), role: z.string().max(100), dob: z.string().max(30)})).max(30).default([]),
   contacts: z.array(z.object({name: text, phone: z.string().max(80), type: text.default('')})).max(50).default([]),
   meetingPoints: z.object({primary: text.default(''), secondary: text.default('')}).default({primary:'',secondary:''}),
 });
-export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable(), settings: settingsSchema.default(() => settingsSchema.parse({})) });
-export const backupSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable().default(null), settings: settingsInputSchema.optional() });
-export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], plan:null, settings:settingsSchema.parse({})});
-export const collectionKey = {inventory:'inventory', shopping_list:'shoppingList', appliances:'appliances'};
+export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), reminders: z.array(reminderSchema).max(300), checklistChecks: z.array(checklistCheckSchema).max(500), plan: planSchema.nullable(), settings: settingsSchema.default(() => settingsSchema.parse({})) });
+export const backupSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), reminders: z.array(reminderSchema).max(300).default([]), checklistChecks: z.array(checklistCheckSchema).max(500).default([]), plan: planSchema.nullable().default(null), settings: settingsInputSchema.optional() });
+export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], reminders:[], checklistChecks:[], plan:null, settings:settingsSchema.parse({})});
+export const collectionKey = {inventory:'inventory', shopping_list:'shoppingList', appliances:'appliances', reminders:'reminders', checklist:'checklistChecks'};
+const schemaByKey = {inventory: itemSchema, shoppingList: itemSchema, appliances: applianceSchema, reminders: reminderSchema, checklistChecks: checklistCheckSchema};
 const bulkQuantitySchema = z.object({mode: z.enum(['set', 'delta']), value: z.coerce.number().finite().max(1e9)});
 
 export function normalizeBackup(input, makeId) {
   if (Array.isArray(input)) input = {inventory:input};
   if (!input || typeof input !== 'object') throw new Error('Expected a backup object.');
   const result = {};
-  for (const key of ['inventory','shoppingList','appliances']) {
+  for (const key of ['inventory','shoppingList','appliances','reminders','checklistChecks']) {
     const rows = input[key] ?? [];
     if (!Array.isArray(rows)) throw new Error(`${key} must be an array.`);
     result[key] = rows.map(row => ({...row, id: row.id || makeId()}));
@@ -98,7 +112,7 @@ export function applyAction(state, action) {
   const next = structuredClone(state);
   if (action.type === 'import') {
     const backup = backupSchema.parse(action.backup);
-    for (const key of ['inventory','shoppingList','appliances']) {
+    for (const key of ['inventory','shoppingList','appliances','reminders','checklistChecks']) {
       const merged = new Map(next[key].map(row => [row.id,row]));
       backup[key].forEach(row => merged.set(row.id,row));
       next[key] = [...merged.values()];
@@ -150,7 +164,7 @@ export function applyAction(state, action) {
     else if (action.type === 'add' || action.type === 'update') {
       if (action.type === 'update' && index < 0) throw new Error('Item no longer exists. Refresh and retry.');
       if (action.type === 'add' && index >= 0) throw new Error('Item already exists.');
-      const schema = key === 'appliances' ? applianceSchema : itemSchema;
+      const schema = schemaByKey[key];
       const value = schema.parse({...next[key][index], ...action.item, id});
       if (index < 0) next[key].push(value); else next[key][index] = value;
     } else throw new Error('Unknown action.');

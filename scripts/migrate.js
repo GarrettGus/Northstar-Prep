@@ -112,6 +112,37 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_appliances (
   active boolean NOT NULL DEFAULT true,
   PRIMARY KEY (household_id, id)
 )`;
+await sql`CREATE TABLE IF NOT EXISTS northstar_reminders (
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  id text NOT NULL,
+  seq bigserial,
+  title text NOT NULL,
+  category text NOT NULL DEFAULT 'Other',
+  recurring_days integer NOT NULL DEFAULT 90,
+  notes text NOT NULL DEFAULT '',
+  start_date text NOT NULL DEFAULT '',
+  last_completed_date text NOT NULL DEFAULT '',
+  snoozed_until text NOT NULL DEFAULT '',
+  PRIMARY KEY (household_id, id)
+)`;
+await sql`CREATE TABLE IF NOT EXISTS northstar_checklist_checks (
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  id text NOT NULL,
+  completed_at text NOT NULL DEFAULT '',
+  PRIMARY KEY (household_id, id)
+)`;
+await sql`CREATE TABLE IF NOT EXISTS northstar_reminder_history (
+  id bigserial PRIMARY KEY,
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  reminder_id text,
+  reminder_title text,
+  category text,
+  event text NOT NULL CHECK (event IN ('completed','snoozed')),
+  event_date text,
+  user_id uuid REFERENCES northstar_users(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+)`;
+await sql`CREATE INDEX IF NOT EXISTS northstar_reminder_history_household_idx ON northstar_reminder_history (household_id, created_at DESC)`;
 await sql`CREATE TABLE IF NOT EXISTS northstar_plan (
   household_id integer PRIMARY KEY REFERENCES northstar_household(id),
   shelter_spot text NOT NULL DEFAULT '',
@@ -174,7 +205,8 @@ const [{count: settingsRows}] = await sql`SELECT count(*)::int AS count FROM nor
 if (inventoryRows === 0 && settingsRows === 0) {
   const [existing] = await sql`SELECT data FROM northstar_household WHERE id = 1`;
   if (existing) {
-    const state = stateSchema.parse(existing.data);
+    // The pre-relational JSONB blob predates reminders/checklists; default them so old rows still parse.
+    const state = stateSchema.parse({reminders: [], checklistChecks: [], ...existing.data});
     for (const item of state.inventory) {
       await sql`INSERT INTO northstar_inventory (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date)
         VALUES (1, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate})

@@ -1,6 +1,7 @@
 import { validSession, sameOrigin } from '../server/auth.js';
-import { readState, getMembership, insertBackupRecord, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory } from '../server/db.js';
+import { readState, getMembership, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory } from '../server/db.js';
 import { backupsConfigured, encryptBackup, decryptBackup } from '../server/backupCrypto.js';
+import { configured as offSiteConfigured, uploadBackupCopy, downloadBackupCopy, deleteBackupCopy } from '../server/backupBlobStore.js';
 import { stateSchema, backupSchema } from '../shared/schema.js';
 import { beginRequest, logFailure, logIssue, metricsRetentionDays, readinessRetentionDays, observe } from '../server/observability.js';
 import { computeReadiness } from '../shared/readiness.js';
@@ -15,7 +16,11 @@ function isCronRequest(req) {
   return Boolean(secret) && req.headers.authorization === `Bearer ${secret}`;
 }
 
-export function createHandler(repository = {readState, getMembership, insertBackupRecord, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory}, authenticate = validSession) {
+export function createHandler(
+  repository = {readState, getMembership, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory},
+  authenticate = validSession,
+  offSite = {configured: offSiteConfigured, upload: uploadBackupCopy, download: downloadBackupCopy, remove: deleteBackupCopy},
+) {
   return async function handler(req, res) {
     const request = beginRequest(req, res);
     res.setHeader('Cache-Control', 'no-store');
@@ -27,13 +32,28 @@ export function createHandler(repository = {readState, getMembership, insertBack
         catch (error) { await repository.insertBackupRecord({status: 'failed', error: error.message}).catch(() => {}); throw error; }
         const plaintext = JSON.stringify(state);
         const {iv, ciphertext, authTag, checksum} = encryptBackup(plaintext);
-        await repository.insertBackupRecord({
+        const backupId = await repository.insertBackupRecord({
           status: 'success', checksum, sizeBytes: ciphertext.length,
           inventoryCount: state.inventory.length, shoppingCount: state.shoppingList.length,
           applianceCount: state.appliances.length, hasPlan: state.plan !== null,
           iv, authTag, ciphertext,
         });
-        await repository.pruneBackups(1, retainCount);
+        // A failed off-site copy never fails the backup itself: the Postgres copy the cron
+        // exists for is already safely written by this point.
+        let offSiteStatus = 'skipped';
+        if (offSite.configured()) {
+          try { await offSite.upload(backupId, {iv, ciphertext, authTag, checksum}); offSiteStatus = 'success'; }
+          catch (error) { offSiteStatus = 'failed'; logIssue(request, '/api/backup', 'off_site_copy_failure', error); }
+        }
+        try { await repository.updateBackupOffSiteStatus(backupId, {status: offSiteStatus, error: offSiteStatus === 'failed' ? 'Off-site copy failed; the Postgres copy is unaffected.' : null}); }
+        catch (error) { logIssue(request, '/api/backup', 'off_site_status_write_failure', error); }
+
+        const prunedIds = await repository.pruneBackups(1, retainCount);
+        if (offSite.configured() && prunedIds.length > 0) {
+          await Promise.allSettled(prunedIds.map(id => offSite.remove(id))).then(results => {
+            for (const result of results) if (result.status === 'rejected') logIssue(request, '/api/backup', 'off_site_prune_failure', result.reason);
+          });
+        }
         // The daily cron doubles as the maintenance run for request metrics, so operational
         // history stays bounded without a second scheduled job (Vercel Hobby allows one).
         let metricsPruned = true;
@@ -53,7 +73,7 @@ export function createHandler(repository = {readState, getMembership, insertBack
           });
           await repository.pruneReadinessHistory(readinessRetentionDays());
         } catch (error) { readinessRecorded = false; logIssue(request, '/api/backup', 'readiness_snapshot_failure', error); }
-        return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length, metricsPruned, readinessRecorded});
+        return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length, metricsPruned, readinessRecorded, offSiteStatus});
       } catch (error) {
         logFailure(request, '/api/backup', 500, error);
         return res.status(500).json({status: 'failed', error: error.message});
@@ -79,7 +99,16 @@ export function createHandler(repository = {readState, getMembership, insertBack
       if (!record) return res.status(404).json({error: 'Backup not found.'});
       let plaintext;
       try { plaintext = decryptBackup(record); }
-      catch { return res.status(422).json({error: 'This backup could not be verified. It may be corrupted or the encryption key changed.'}); }
+      catch {
+        // The Postgres copy is corrupted or was tampered with; fall back to the off-site copy
+        // of the same backup, if one exists, before giving up. Same decrypt/checksum pipeline
+        // either way, so a recovered backup gets exactly the same validation as normal.
+        let offSiteRecord;
+        if (offSite.configured()) { try { offSiteRecord = await offSite.download(id); } catch { offSiteRecord = undefined; } }
+        if (!offSiteRecord) return res.status(422).json({error: 'This backup could not be verified. It may be corrupted or the encryption key changed.'});
+        try { plaintext = decryptBackup(offSiteRecord); }
+        catch { return res.status(422).json({error: 'This backup could not be verified. It may be corrupted or the encryption key changed.'}); }
+      }
       let backup;
       try { backup = backupSchema.parse(stateSchema.parse(JSON.parse(plaintext))); }
       catch { return res.status(422).json({error: 'This backup failed validation and was not restored.'}); }

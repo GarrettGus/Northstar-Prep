@@ -2,9 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { backupsConfigured, encryptBackup, decryptBackup } from '../server/backupCrypto.js';
+import { encodeBackupRecord, decodeBackupRecord, backupPathname } from '../server/backupBlobStore.js';
 import { createHandler } from '../api/backup.js';
 import { emptyState } from '../shared/schema.js';
 import { token, cookie } from '../server/auth.js';
+
+const noOffSite = {configured: () => false, upload: async () => {}, download: async () => undefined, remove: async () => {}};
 
 process.env.SESSION_SECRET = 'test-only-secret-with-more-than-32-characters';
 process.env.DATABASE_URL = 'postgres://test-only/db';
@@ -38,17 +41,34 @@ test('decryptBackup detects tampered ciphertext, a wrong auth tag and a checksum
   assert.throws(() => decryptBackup({ ...record, checksum: 'not-the-real-checksum' }));
 });
 
+test('backupPathname namespaces off-site copies by household and backup ID', () => {
+  assert.equal(backupPathname(42, 1), 'households/1/backups/42.json');
+  assert.equal(backupPathname('42', 2), 'households/2/backups/42.json');
+});
+
+test('encodeBackupRecord/decodeBackupRecord round-trips a backup record for off-site storage', () => {
+  const plaintext = JSON.stringify(emptyState());
+  const record = encryptBackup(plaintext);
+  const decoded = decodeBackupRecord(encodeBackupRecord(record));
+  assert.deepEqual(decoded.iv, record.iv);
+  assert.deepEqual(decoded.ciphertext, record.ciphertext);
+  assert.deepEqual(decoded.authTag, record.authTag);
+  assert.equal(decoded.checksum, record.checksum);
+  assert.equal(decryptBackup(decoded), plaintext);
+});
+
 test('backup API: a valid cron secret creates a backup and prunes old backups and request metrics', async () => {
   const state = { ...emptyState(), inventory: [{id:'rice',name:'Rice',quantity:2,unit:'units',category:'Food',caloriesPerUnit:0,hoursPerUnit:0,capacityPerUnit:0,price:0,gallonsPerUnit:0,target:0,store:'',emoji:'',image:'',macroTag:'',fuelType:'',purchaseDate:'',expiryDate:''}] };
   let inserted = null, pruned = false, metricsRetention = null;
   const repository = {
     async readState() { return {data: state, version: 1}; },
-    async insertBackupRecord(entry) { inserted = entry; },
-    async pruneBackups() { pruned = true; },
+    async insertBackupRecord(entry) { inserted = entry; return 42; },
+    async updateBackupOffSiteStatus() {},
+    async pruneBackups() { pruned = true; return []; },
     async pruneRequestMetrics(days) { metricsRetention = days; },
   };
   const res = response();
-  await createHandler(repository)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
+  await createHandler(repository, undefined, noOffSite)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
   assert.equal(res.code, 200);
   assert.equal(res.data.status, 'success');
   assert.equal(inserted.status, 'success');
@@ -56,6 +76,7 @@ test('backup API: a valid cron secret creates a backup and prunes old backups an
   assert.ok(pruned);
   assert.equal(metricsRetention, 14);
   assert.equal(res.data.metricsPruned, true);
+  assert.equal(res.data.offSiteStatus, 'skipped');
 });
 
 test('backup API: the same cron run records a readiness snapshot and prunes old ones', async () => {
@@ -69,14 +90,15 @@ test('backup API: the same cron run records a readiness snapshot and prunes old 
   let snapshot = null, snapshotRetention = null;
   const repository = {
     async readState() { return {data: state, version: 1}; },
-    async insertBackupRecord() {},
-    async pruneBackups() {},
+    async insertBackupRecord() { return 1; },
+    async updateBackupOffSiteStatus() {},
+    async pruneBackups() { return []; },
     async pruneRequestMetrics() {},
     async recordReadinessSnapshot(entry) { snapshot = entry; },
     async pruneReadinessHistory(days) { snapshotRetention = days; },
   };
   const res = response();
-  await createHandler(repository)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
+  await createHandler(repository, undefined, noOffSite)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
   assert.equal(res.data.readinessRecorded, true);
   // 14 gallons against the default 4 gal/day household need.
   assert.equal(snapshot.waterDays, 3.5);
@@ -93,14 +115,15 @@ test('backup API: a failed readiness snapshot is reported without failing the ba
   let inserted = null;
   const repository = {
     async readState() { return {data: emptyState(), version: 1}; },
-    async insertBackupRecord(entry) { inserted = entry; },
-    async pruneBackups() {},
+    async insertBackupRecord(entry) { inserted = entry; return 1; },
+    async updateBackupOffSiteStatus() {},
+    async pruneBackups() { return []; },
     async pruneRequestMetrics() {},
     async recordReadinessSnapshot() { throw new Error('snapshot table missing'); },
     async pruneReadinessHistory() {},
   };
   const res = response();
-  await createHandler(repository)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
+  await createHandler(repository, undefined, noOffSite)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
   // The backup the cron exists for still succeeded.
   assert.equal(res.code, 200);
   assert.equal(res.data.status, 'success');
@@ -115,7 +138,7 @@ test('backup API: cron creation failure while reading state is recorded and surf
     async insertBackupRecord(entry) { recordedError = entry; },
   };
   const res = response();
-  await createHandler(repository)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
+  await createHandler(repository, undefined, noOffSite)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
   assert.equal(res.code, 500);
   assert.equal(recordedError.status, 'failed');
   assert.match(recordedError.error, /Database unavailable/);
@@ -158,7 +181,7 @@ test('backup API: restoring a valid backup validates it and returns a mergeable 
     async getBackupRecord(id) { return id === 7 ? encrypted : undefined; },
   };
   const res = response();
-  await createHandler(repository, () => ({userId:'user-1'}))(authedRequest('POST', {type:'restore', id:7}), res);
+  await createHandler(repository, () => ({userId:'user-1'}), noOffSite)(authedRequest('POST', {type:'restore', id:7}), res);
   assert.equal(res.code, 200);
   assert.equal(res.data.backup.inventory.length, 1);
   assert.equal(res.data.backup.inventory[0].id, 'rice');
@@ -173,12 +196,100 @@ test('backup API: restoring a missing or corrupted backup fails safely without a
     async getBackupRecord(id) { return {1: tampered}[id]; },
   };
   const notFound = response();
-  await createHandler(repository, () => ({userId:'user-1'}))(authedRequest('POST', {type:'restore', id:999}), notFound);
+  await createHandler(repository, () => ({userId:'user-1'}), noOffSite)(authedRequest('POST', {type:'restore', id:999}), notFound);
   assert.equal(notFound.code, 404);
 
   const corrupted = response();
-  await createHandler(repository, () => ({userId:'user-1'}))(authedRequest('POST', {type:'restore', id:1}), corrupted);
+  await createHandler(repository, () => ({userId:'user-1'}), noOffSite)(authedRequest('POST', {type:'restore', id:1}), corrupted);
   assert.equal(corrupted.code, 422);
+});
+
+test('backup API: off-site upload success and failure are recorded without affecting backup status', async () => {
+  const state = emptyState();
+  const succeeding = {
+    async readState() { return {data: state, version: 1}; },
+    async insertBackupRecord() { return 11; },
+    async updateBackupOffSiteStatus(id, {status, error}) { succeeding.recorded = {id, status, error}; },
+    async pruneBackups() { return []; },
+    async pruneRequestMetrics() {},
+    async recordReadinessSnapshot() {},
+    async pruneReadinessHistory() {},
+  };
+  let uploadedId = null;
+  const workingOffSite = {configured: () => true, upload: async id => { uploadedId = id; }, download: async () => undefined, remove: async () => {}};
+  const okRes = response();
+  await createHandler(succeeding, undefined, workingOffSite)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, okRes);
+  assert.equal(okRes.data.status, 'success');
+  assert.equal(okRes.data.offSiteStatus, 'success');
+  assert.equal(uploadedId, 11);
+  assert.deepEqual(succeeding.recorded, {id: 11, status: 'success', error: null});
+
+  const failing = {
+    async readState() { return {data: state, version: 1}; },
+    async insertBackupRecord() { return 12; },
+    async updateBackupOffSiteStatus(id, {status, error}) { failing.recorded = {id, status, error}; },
+    async pruneBackups() { return []; },
+    async pruneRequestMetrics() {},
+    async recordReadinessSnapshot() {},
+    async pruneReadinessHistory() {},
+  };
+  const brokenOffSite = {configured: () => true, upload: async () => { throw new Error('network error'); }, download: async () => undefined, remove: async () => {}};
+  const failRes = response();
+  await createHandler(failing, undefined, brokenOffSite)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, failRes);
+  // The off-site copy failed, but the Postgres backup the cron exists for still succeeded.
+  assert.equal(failRes.code, 200);
+  assert.equal(failRes.data.status, 'success');
+  assert.equal(failRes.data.offSiteStatus, 'failed');
+  assert.equal(failing.recorded.status, 'failed');
+  assert.ok(failing.recorded.error);
+});
+
+test('backup API: pruned backups also have their off-site copies removed', async () => {
+  const removedIds = [];
+  const repository = {
+    async readState() { return {data: emptyState(), version: 1}; },
+    async insertBackupRecord() { return 99; },
+    async updateBackupOffSiteStatus() {},
+    async pruneBackups() { return [1, 2, 3]; },
+    async pruneRequestMetrics() {},
+    async recordReadinessSnapshot() {},
+    async pruneReadinessHistory() {},
+  };
+  const offSite = {configured: () => true, upload: async () => {}, download: async () => undefined, remove: async id => { removedIds.push(id); }};
+  const res = response();
+  await createHandler(repository, undefined, offSite)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
+  assert.equal(res.data.status, 'success');
+  assert.deepEqual(removedIds.sort(), [1, 2, 3]);
+});
+
+test('backup API: restore falls back to the off-site copy when the Postgres copy is corrupted', async () => {
+  const state = { ...emptyState(), inventory: [{id:'rice',name:'Rice',quantity:2,unit:'units',category:'Food',caloriesPerUnit:0,hoursPerUnit:0,capacityPerUnit:0,price:0,gallonsPerUnit:0,target:0,store:'',emoji:'',image:'',macroTag:'',fuelType:'',purchaseDate:'',expiryDate:''}] };
+  const good = encryptBackup(JSON.stringify(state));
+  const tamperedCiphertext = Buffer.from(good.ciphertext); tamperedCiphertext[0] ^= 0xff;
+  const corruptedInPostgres = { ...good, ciphertext: tamperedCiphertext };
+  const repository = {
+    async getMembership() { return {role:'owner'}; },
+    async getBackupRecord(id) { return id === 5 ? corruptedInPostgres : undefined; },
+  };
+  const offSite = {configured: () => true, upload: async () => {}, download: async id => id === 5 ? good : undefined, remove: async () => {}};
+  const res = response();
+  await createHandler(repository, () => ({userId:'user-1'}), offSite)(authedRequest('POST', {type:'restore', id:5}), res);
+  assert.equal(res.code, 200);
+  assert.equal(res.data.backup.inventory[0].id, 'rice');
+});
+
+test('backup API: restore fails safely when both the Postgres and off-site copies are corrupted or missing', async () => {
+  const good = encryptBackup(JSON.stringify(emptyState()));
+  const tamperedCiphertext = Buffer.from(good.ciphertext); tamperedCiphertext[0] ^= 0xff;
+  const corrupted = { ...good, ciphertext: tamperedCiphertext };
+  const repository = {
+    async getMembership() { return {role:'owner'}; },
+    async getBackupRecord() { return corrupted; },
+  };
+  const noCopyAvailable = {configured: () => true, upload: async () => {}, download: async () => undefined, remove: async () => {}};
+  const res = response();
+  await createHandler(repository, () => ({userId:'user-1'}), noCopyAvailable)(authedRequest('POST', {type:'restore', id:5}), res);
+  assert.equal(res.code, 422);
 });
 
 test('backup API: restore mutations reject cross-site origins', async () => {

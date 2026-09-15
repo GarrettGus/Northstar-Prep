@@ -12,6 +12,7 @@
     "test:e2e:app": "playwright test --config tests/e2e/app.config.js",
     "db:migrate": "node --env-file-if-exists=.env.local scripts/migrate.js",
     "db:migrate-images": "node --env-file-if-exists=.env.local scripts/migrate-images.js",
+    "restore-off-site-backup": "node --env-file-if-exists=.env.local scripts/restore-off-site-backup.js",
     "smoke-test": "node scripts/smoketest.js"
   },
   "dependencies": {

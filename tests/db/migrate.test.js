@@ -144,14 +144,31 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       process.env.BACKUP_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
       const plaintext = JSON.stringify({inventory: [{id: 'rice-1'}]});
       const {iv, ciphertext, authTag, checksum} = encryptBackup(plaintext);
-      await db.insertBackupRecord({
+      const backupId = await db.insertBackupRecord({
         status: 'success', checksum, sizeBytes: ciphertext.length, inventoryCount: 1, shoppingCount: 0,
         applianceCount: 0, hasPlan: false, iv, authTag, ciphertext,
       });
+      assert.ok(backupId);
       const [record] = await db.listBackupRecords();
       assert.equal(record.status, 'success');
+      assert.equal(record.id, backupId);
+      assert.equal(record.offSiteStatus, null);
       const stored = await db.getBackupRecord(record.id);
       assert.equal(decryptBackup(stored), plaintext);
+
+      // Off-site copy status is written after the fact, once the upload attempt is known.
+      await db.updateBackupOffSiteStatus(backupId, {status: 'success'});
+      assert.equal((await db.listBackupRecords())[0].offSiteStatus, 'success');
+      await db.updateBackupOffSiteStatus(backupId, {status: 'failed', error: 'network error'});
+      const afterFailure = (await db.listBackupRecords())[0];
+      assert.equal(afterFailure.offSiteStatus, 'failed');
+      assert.equal(afterFailure.offSiteError, 'network error');
+
+      // Pruning returns the pruned rows' IDs, so their off-site copies can be deleted too.
+      const secondId = await db.insertBackupRecord({status: 'success', checksum, iv, authTag, ciphertext});
+      const prunedIds = await db.pruneBackups(1, 0);
+      assert.deepEqual(prunedIds.sort((a, b) => a - b), [backupId, secondId].sort((a, b) => a - b));
+      assert.equal((await db.listBackupRecords()).length, 0);
 
       await db.recordRequestMetric({route: '/api/hub', outcome: 'ok', status: 200, latencyMs: 12});
       await db.recordRequestMetric({route: '/api/hub', outcome: 'ok', status: 200, latencyMs: 30});

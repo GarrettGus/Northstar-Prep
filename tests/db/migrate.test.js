@@ -52,7 +52,7 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
         'northstar_alert_state', 'northstar_appliances', 'northstar_audit_log', 'northstar_backups',
         'northstar_checklist_checks', 'northstar_contacts', 'northstar_family_members', 'northstar_household',
         'northstar_household_members', 'northstar_inventory', 'northstar_invitations', 'northstar_login_limits',
-        'northstar_plan', 'northstar_readiness_history', 'northstar_reminder_history', 'northstar_reminders',
+        'northstar_password_resets', 'northstar_plan', 'northstar_readiness_history', 'northstar_reminder_history', 'northstar_reminders',
         'northstar_request_metrics', 'northstar_settings', 'northstar_shopping_items', 'northstar_users',
       ]);
     });

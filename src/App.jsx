@@ -230,8 +230,11 @@ export default function App() {
 
   if (!authReady) return <LoadingScreen />;
   if (!user) {
-    const inviteToken = new URLSearchParams(window.location.search).get('invite');
+    const params = new URLSearchParams(window.location.search);
+    const inviteToken = params.get('invite');
     if (inviteToken) return <AcceptInvite token={inviteToken} onJoined={handleAuthenticated} />;
+    const resetToken = params.get('reset');
+    if (resetToken) return <ResetPassword token={resetToken} onReset={handleAuthenticated} />;
     return <Login configured={configured} error={globalError} onLogin={handleAuthenticated} />;
   }
   if (loading && !inventory.length && !globalError) return <LoadingScreen />;
@@ -1750,6 +1753,7 @@ function MembersPanel({ currentUserId }) {
   const [error, setError] = useState(null);
   const [inviteForm, setInviteForm] = useState({ email: '', role: 'member' });
   const [inviteLink, setInviteLink] = useState(null);
+  const [resetLink, setResetLink] = useState(null);
   const [busy, setBusy] = useState(false);
 
   const load = () => request('members').then(setData).catch(err => setError(err.message));
@@ -1773,7 +1777,15 @@ function MembersPanel({ currentUserId }) {
     setError(null);
     try { await request('members', { type: 'revoke', invitationId }); await load(); } catch (err) { setError(err.message); }
   };
+  const sendResetLink = async userId => {
+    setError(null);
+    try {
+      const result = await request('members', { type: 'reset-link', userId });
+      setResetLink({ userId, url: `${window.location.origin}${window.location.pathname}?reset=${result.token}` });
+    } catch (err) { setError(err.message); }
+  };
   const copyLink = () => { if (inviteLink) navigator.clipboard?.writeText(inviteLink).catch(() => {}); };
+  const copyResetLink = () => { if (resetLink) navigator.clipboard?.writeText(resetLink.url).catch(() => {}); };
 
   if (!data) return <p className="text-xs text-slate-500">Loading household members…</p>;
   return (
@@ -1784,12 +1796,23 @@ function MembersPanel({ currentUserId }) {
         {data.members.map(m => (
           <li key={m.user_id} className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2 text-sm">
             <span className="truncate">{m.email} <span className="text-[10px] font-black uppercase text-slate-500">{m.role}</span></span>
-            {data.role === 'owner' && m.user_id !== currentUserId && (
-              <button onClick={() => remove(m.user_id)} className="text-red-600 text-[10px] font-black uppercase ml-2 shrink-0">Remove</button>
+            {data.role === 'owner' && (
+              <span className="flex items-center gap-2 ml-2 shrink-0">
+                <button onClick={() => sendResetLink(m.user_id)} className="text-blue-700 text-[10px] font-black uppercase">Reset link</button>
+                {m.user_id !== currentUserId && <button onClick={() => remove(m.user_id)} className="text-red-600 text-[10px] font-black uppercase">Remove</button>}
+              </span>
             )}
           </li>
         ))}
       </ul>
+      {resetLink && (
+        <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 space-y-2 text-xs">
+          <p className="font-black text-blue-900">Send this password reset link to {data.members.find(m => m.user_id === resetLink.userId)?.email || 'the member'}:</p>
+          <input readOnly value={resetLink.url} onFocus={e => e.target.select()} className="w-full bg-white rounded-lg p-2 text-[10px] font-mono border border-blue-200" />
+          <button type="button" onClick={copyResetLink} className="rounded-lg bg-blue-600 text-white px-3 py-1.5 font-black">Copy link</button>
+          <p className="text-blue-800">Expires in 1 hour and can only be used once.</p>
+        </div>
+      )}
       {data.role === 'owner' && (
         <>
           <form onSubmit={invite} className="space-y-2">
@@ -1820,6 +1843,34 @@ function MembersPanel({ currentUserId }) {
         </>
       )}
     </div>
+  );
+}
+
+// Self-service password change for a signed-in user who still knows their current password.
+// A locked-out member instead needs a reset link from an owner (see MembersPanel).
+function ChangePasswordPanel() {
+  const [form, setForm] = useState({ currentPassword: '', newPassword: '' });
+  const [message, setMessage] = useState(null);
+  const [saved, setSaved] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async e => {
+    e.preventDefault(); setMessage(null); setSaved(false); setBusy(true);
+    try {
+      await request('password', form);
+      setForm({ currentPassword: '', newPassword: '' }); setSaved(true);
+    } catch (err) { setMessage(err.message); } finally { setBusy(false); }
+  };
+
+  return (
+    <form onSubmit={submit} className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Change your password</h3>
+      {message && <p role="alert" className="text-xs font-bold text-red-600">{message}</p>}
+      {saved && <p className="text-xs font-bold text-emerald-600">Password changed.</p>}
+      <label className="block text-sm">Current password<input autoComplete="current-password" type="password" required value={form.currentPassword} onChange={e => setForm({...form, currentPassword: e.target.value})} className="mt-1 w-full rounded-xl border border-slate-200 p-2.5 text-sm" /></label>
+      <label className="block text-sm">New password<input autoComplete="new-password" type="password" required minLength={8} value={form.newPassword} onChange={e => setForm({...form, newPassword: e.target.value})} className="mt-1 w-full rounded-xl border border-slate-200 p-2.5 text-sm" /></label>
+      <button type="submit" disabled={busy} className="w-full rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">{busy ? 'Saving…' : 'Change password'}</button>
+    </form>
   );
 }
 
@@ -1873,6 +1924,7 @@ function SyncModal({onClose,onImport,pendingImport,pendingImportSource,onConfirm
       <ServiceHealthPanel />
       <BackupsPanel onRestore={onRestoreBackup} />
       <MembersPanel currentUserId={currentUserId} />
+      <ChangePasswordPanel />
       <ActivityPanel />
       <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>
       <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>
@@ -2040,6 +2092,43 @@ function AcceptInvite({token,onJoined}) {
           <label className="block">Email<input autoComplete="username" type="email" required value={email} onChange={e=>setEmail(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
           <label className="block">Choose a password<input autoComplete="new-password" type="password" required minLength={8} value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
           <button disabled={pending} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{pending?'Joining…':'Join household'}</button>
+        </form>
+      )}
+    </div>
+  </main>;
+}
+
+// Consumes a single-use reset link an owner generated for a locked-out member (the 'reset-link'
+// action in MembersPanel); mirrors AcceptInvite but sets a password on an existing account.
+function ResetPassword({token,onReset}) {
+  const [status,setStatus]=useState('checking');
+  const [email,setEmail]=useState(null);
+  const [password,setPassword]=useState('');
+  const [message,setMessage]=useState(null);
+  const [pending,setPending]=useState(false);
+  useEffect(() => {
+    request(`password-reset?token=${encodeURIComponent(token)}`).then(result => {
+      if (!result.valid) { setStatus('invalid'); return; }
+      setEmail(result.email); setStatus('ready');
+    }).catch(() => setStatus('invalid'));
+  }, [token]);
+  const submit = async event => {
+    event.preventDefault(); setPending(true); setMessage(null);
+    try { const result = await request('password-reset', {token, password}); onReset(result.user); }
+    catch (error) { setMessage(error.message); }
+    finally { setPending(false); }
+  };
+  return <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
+    <div className="w-full max-w-sm space-y-6">
+      <Shield className="text-blue-400" size={40}/><h1 className="text-3xl font-black">NorthStar Prep</h1>
+      {status === 'checking' && <p className="text-slate-300">Checking your reset link…</p>}
+      {status === 'invalid' && <p role="alert" className="text-red-300">This reset link is invalid, expired or already used. Ask a household owner for a new one.</p>}
+      {status === 'ready' && (
+        <form onSubmit={submit} className="space-y-6">
+          <p className="text-slate-300">Choose a new password for {email}.</p>
+          {message && <p role="alert" className="text-red-300">{message}</p>}
+          <label className="block">New password<input autoComplete="new-password" type="password" required minLength={8} value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+          <button disabled={pending} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{pending?'Saving…':'Set new password'}</button>
         </form>
       )}
     </div>

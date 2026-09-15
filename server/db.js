@@ -203,6 +203,17 @@ export async function findUserById(userId) {
   const rows = await sql`SELECT id, email FROM northstar_users WHERE id = ${userId}`;
   return rows[0];
 }
+// Only used for verifying a currently-held password (self-service change); every other
+// lookup above deliberately omits password_hash.
+export async function findCredentialsById(userId) {
+  const sql = database();
+  const rows = await sql`SELECT id, email, password_hash FROM northstar_users WHERE id = ${userId}`;
+  return rows[0];
+}
+export async function setPassword(userId, passwordHash) {
+  const sql = database();
+  await sql`UPDATE northstar_users SET password_hash = ${passwordHash} WHERE id = ${userId}`;
+}
 export async function getMembership(userId, householdId = 1) {
   const sql = database();
   const rows = await sql`SELECT role FROM northstar_household_members WHERE household_id = ${householdId} AND user_id = ${userId}`;
@@ -264,6 +275,28 @@ export async function acceptInvitation({invitationId, householdId, role, email, 
     tx`UPDATE northstar_invitations SET accepted_at = now(), accepted_by = ${userId} WHERE id = ${invitationId} AND accepted_at IS NULL`,
   ]);
   return userId;
+}
+export async function createPasswordReset({userId, tokenHash, expiresAt}) {
+  const sql = database();
+  const id = randomUUID();
+  await sql`INSERT INTO northstar_password_resets (id, user_id, token_hash, expires_at) VALUES (${id}, ${userId}, ${tokenHash}, ${expiresAt})`;
+  return id;
+}
+export async function findPasswordResetByTokenHash(tokenHash) {
+  const sql = database();
+  const rows = await sql`SELECT r.id, r.user_id, r.expires_at, r.used_at, u.email
+    FROM northstar_password_resets r JOIN northstar_users u ON u.id = r.user_id
+    WHERE r.token_hash = ${tokenHash}`;
+  return rows[0];
+}
+// Sets the new password and consumes every pending reset for this user (not just the one used),
+// so a second, still-unexpired link generated earlier for the same person stops working too.
+export async function resetPassword({userId, passwordHash}) {
+  const sql = database();
+  await sql.transaction(tx => [
+    tx`UPDATE northstar_users SET password_hash = ${passwordHash} WHERE id = ${userId}`,
+    tx`UPDATE northstar_password_resets SET used_at = now() WHERE user_id = ${userId} AND used_at IS NULL`,
+  ]);
 }
 export async function insertAuditLog({householdId = 1, userId, action, collection = null, itemId = null, itemName = null}) {
   const sql = database();

@@ -4,9 +4,9 @@ A household preparedness tracker built with React, Vite and Tailwind, backed by 
 
 ## Architecture
 
-The browser calls same-origin `/api/session`, `/api/hub`, `/api/members` and `/api/invite` endpoints. Only server code connects to Postgres. Individual accounts (email plus a scrypt-hashed password) sign in to create a signed, HttpOnly, SameSite=Strict session cookie (Secure in production) that carries just the user's ID; every request re-checks that user's household membership and role directly from Postgres rather than trusting a role baked into the cookie. Sessions last seven days; rotating `SESSION_SECRET` invalidates all of them. Login attempts are rate-limited in Postgres.
+The browser calls same-origin `/api/session`, `/api/hub`, `/api/members`, `/api/invite`, `/api/password-reset` and `/api/password` endpoints. Only server code connects to Postgres. Individual accounts (email plus a scrypt-hashed password) sign in to create a signed, HttpOnly, SameSite=Strict session cookie (Secure in production) that carries just the user's ID; every request re-checks that user's household membership and role directly from Postgres rather than trusting a role baked into the cookie. Sessions last seven days; rotating `SESSION_SECRET` invalidates all of them. Login and password-reset attempts are rate-limited in Postgres.
 
-This is a **single-household application** with individual accounts inside it. An owner invites others from **Household settings**, which generates a one-time shareable link (there is no outbound email — send the link yourself); members can be promoted to owner at invite time or removed later, and every add, edit, delete, purchase, import, plan and settings change is recorded with who made it. There is no anonymous access, client database SDK, or public hub-ID access. Do not use this shared-household design for unrelated households.
+This is a **single-household application** with individual accounts inside it. An owner invites others from **Household settings**, which generates a one-time shareable link (there is no outbound email — send the link yourself); members can be promoted to owner at invite time or removed later, and every add, edit, delete, purchase, import, plan and settings change is recorded with who made it. An owner can also generate a single-use, one-hour password reset link for a locked-out member the same way, and any signed-in member can change their own password after re-entering the current one. There is no anonymous access, client database SDK, or public hub-ID access. Do not use this shared-household design for unrelated households.
 
 Database updates use compare-and-swap revisions and bounded retries. Shopping purchases move the current stored record atomically; backups merge by ID. Devices refresh every 15 seconds and on window focus.
 
@@ -76,6 +76,10 @@ If **Project Settings → Deployment Protection → Vercel Authentication** is e
 4. Never restore a preview or staging database from a production backup or branch without stripping household PII first — see the single-household privacy note above.
 
 Practice both paths (Instant Rollback and a backup restore) against a preview deployment periodically so the first real incident isn't the first time either has been exercised.
+
+**Account recovery:** A member who forgot their password asks any owner for a reset link — **Household settings → Household members → Reset link** generates a single-use link, valid for one hour, that lets them set a new password without knowing the old one. A signed-in member can also change their own password from the same screen after re-entering the current one. Both invalidate any other pending reset link for that account.
+
+**A locked-out sole owner** (the only owner, with no other owner signed in anywhere to generate them a reset link) has no self-service path — generating a reset link requires being authenticated as an owner already. Recover by connecting to Postgres directly (the `DATABASE_URL` in Vercel's environment variables) and either: update `northstar_users.password_hash` to a value produced by `hashPassword()` from `server/auth.js` (run it locally with the target password, e.g. via `node -e "import('./server/auth.js').then(a=>console.log(a.hashPassword('new-password')))"`), or insert a row directly into `northstar_password_resets` with a token you generate yourself, then visit `/?reset=<token>`. Rotating `SESSION_SECRET` afterward signs out anyone who obtained a session before the account was recovered.
 
 ## Inventory management
 

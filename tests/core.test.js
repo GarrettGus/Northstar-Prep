@@ -9,6 +9,8 @@ import { createHandler } from '../api/hub.js';
 import { createHandler as createSessionHandler } from '../api/session.js';
 import { createHandler as createMembersHandler } from '../api/members.js';
 import { createHandler as createInviteHandler } from '../api/invite.js';
+import { createHandler as createPasswordResetHandler } from '../api/password-reset.js';
+import { createHandler as createPasswordHandler } from '../api/password.js';
 import { createHandler as createReminderHistoryHandler } from '../api/reminder-history.js';
 import { createHandler as createReadinessHistoryHandler } from '../api/readiness-history.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
@@ -315,6 +317,99 @@ test('invite API validates tokens, enforces the invited email, and rejects accou
   const success=response();
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',email:'invitee@example.com',password:'longenoughpw'}},success);
   assert.equal(success.code,200);assert.equal(success.data.user.id,'new-user-id');assert.match(success.headers['Set-Cookie'],/northstar=/);
+});
+test('members API: an owner can generate a single-use reset link for a member',async()=>{
+  const resets=[];
+  const repository={
+    getMembership:async userId=>({'owner-1':{role:'owner'},'member-1':{role:'member'}}[userId]),
+    createPasswordReset:async entry=>{resets.push(entry);},
+  };
+  const asOwner=createMembersHandler(repository,()=>({userId:'owner-1'}));
+  const asMember=createMembersHandler(repository,()=>({userId:'member-1'}));
+
+  const created=response();
+  await asOwner({method:'POST',headers:{'content-type':'application/json'},body:{type:'reset-link',userId:'member-1'}},created);
+  assert.equal(created.code,200);assert.ok(created.data.token);assert.equal(resets.length,1);assert.equal(resets[0].userId,'member-1');
+
+  const missing=response();
+  await asOwner({method:'POST',headers:{'content-type':'application/json'},body:{type:'reset-link',userId:'nobody'}},missing);
+  assert.equal(missing.code,400);
+
+  const denied=response();
+  await asMember({method:'POST',headers:{'content-type':'application/json'},body:{type:'reset-link',userId:'owner-1'}},denied);
+  assert.equal(denied.code,403);
+});
+test('password-reset API validates tokens, rejects expired/used links, and signs the member in on success',async()=>{
+  const future=new Date(Date.now()+3600000).toISOString();
+  const past=new Date(Date.now()-3600000).toISOString();
+  let passwordSet=null;
+  const repository={
+    async rateLimit(){return true;},
+    async findPasswordResetByTokenHash(hash){
+      if(hash===hashToken('good-token')) return {id:'reset-1',user_id:'member-1',email:'member@example.com',expires_at:future,used_at:null};
+      if(hash===hashToken('expired-token')) return {id:'reset-2',user_id:'member-1',email:'member@example.com',expires_at:past,used_at:null};
+      if(hash===hashToken('used-token')) return {id:'reset-3',user_id:'member-1',email:'member@example.com',expires_at:future,used_at:new Date().toISOString()};
+      return undefined;
+    },
+    async getMembership(userId){return userId==='member-1' ? {role:'member'} : undefined;},
+    async resetPassword(entry){passwordSet=entry;},
+  };
+  const handler=createPasswordResetHandler(repository);
+
+  const validCheck=response();
+  await handler({method:'GET',url:'/api/password-reset?token=good-token',headers:{}},validCheck);
+  assert.deepEqual(validCheck.data,{valid:true,email:'member@example.com'});
+
+  const expiredCheck=response();
+  await handler({method:'GET',url:'/api/password-reset?token=expired-token',headers:{}},expiredCheck);
+  assert.equal(expiredCheck.data.valid,false);
+
+  const usedCheck=response();
+  await handler({method:'GET',url:'/api/password-reset?token=used-token',headers:{}},usedCheck);
+  assert.equal(usedCheck.data.valid,false);
+
+  const tooShort=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',password:'short'}},tooShort);
+  assert.equal(tooShort.code,400);
+
+  const expiredSubmit=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'expired-token',password:'longenoughpw'}},expiredSubmit);
+  assert.equal(expiredSubmit.code,410);
+
+  const success=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',password:'longenoughpw'}},success);
+  assert.equal(success.code,200);assert.equal(success.data.user.id,'member-1');assert.match(success.headers['Set-Cookie'],/northstar=/);
+  assert.equal(passwordSet.userId,'member-1');
+
+  const limited=response();
+  await createPasswordResetHandler({...repository,async rateLimit(){return false;}})({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',password:'longenoughpw'}},limited);
+  assert.equal(limited.code,429);
+});
+test('password API lets a signed-in user change their own password after re-entering the current one',async()=>{
+  const hash=hashPassword('old-password');
+  let updated=null;
+  const repository={
+    async rateLimit(){return true;},
+    async findCredentialsById(userId){return userId==='user-1' ? {id:'user-1',email:'me@example.com',password_hash:hash} : undefined;},
+    async setPassword(userId,passwordHash){updated={userId,passwordHash};},
+  };
+  const handler=createPasswordHandler(repository,()=>({userId:'user-1'}));
+
+  const wrongCurrent=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'nope',newPassword:'new-password-123'}},wrongCurrent);
+  assert.equal(wrongCurrent.code,401);assert.equal(updated,null);
+
+  const success=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},success);
+  assert.equal(success.code,200);assert.equal(updated.userId,'user-1');assert.ok(verifyPassword('new-password-123',updated.passwordHash));
+
+  const unauthenticated=response();
+  await createPasswordHandler(repository,()=>false)({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},unauthenticated);
+  assert.equal(unauthenticated.code,401);
+
+  const limited=response();
+  await createPasswordHandler({...repository,async rateLimit(){return false;}},()=>({userId:'user-1'}))({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},limited);
+  assert.equal(limited.code,429);
 });
 import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds, daysUntilExpiry, expirationQueue, expirationSummary } from '../shared/readiness.js';
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{

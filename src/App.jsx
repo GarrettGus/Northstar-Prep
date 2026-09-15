@@ -10,6 +10,7 @@ import {
 import { request } from './api.js';
 import { computeReadiness, computeReadinessGaps, isExpired, isRecurringDue, expirationQueue } from '../shared/readiness.js';
 import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
+import { backupToCsv, csvToBackupPreview } from '../shared/csv.js';
 import { simulateOutage, appliancePriorities, appliancePriorityLabels } from '../shared/outage.js';
 import { supplyTemplateCatalog, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
 import { effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, todayLocal, addDaysISO } from '../shared/reminders.js';
@@ -153,6 +154,22 @@ export default function App() {
       setPendingImportSource({kind:'backup'});
       setGlobalError(null);
     } catch(error){setGlobalError(`Import failed: ${error.message}`);}
+  };
+  const downloadCsv = () => {
+    const blob = new Blob([backupToCsv(inventory, shoppingList)], {type:'text/csv'});
+    const url=URL.createObjectURL(blob);const link=document.createElement('a');
+    link.href=url;link.download=`northstar-inventory-${new Date().toISOString().slice(0,10)}.csv`;link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  };
+  const handleCsvUpload = async event => {
+    const file=event.target.files[0];event.target.value='';if(!file)return;
+    try {
+      if(file.size>2_000_000)throw new Error('CSV must be smaller than 2 MB.');
+      const {backup,errors}=csvToBackupPreview(await file.text(),()=>crypto.randomUUID());
+      setPendingImport(backup);
+      setPendingImportSource({kind:'csv', errors});
+      setGlobalError(null);
+    } catch(error){setGlobalError(`CSV import failed: ${error.message}`);}
   };
   // Starter templates go through the same non-destructive preview as a JSON backup, so nothing
   // is written until it is confirmed and existing rows merge by ID rather than being replaced.
@@ -317,7 +334,7 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => { cancelImport(); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} pendingImportSource={pendingImportSource} onConfirmImport={confirmImport} onCancelImport={cancelImport} onApplyTemplate={previewTemplate} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
+      {showSyncModal && <SyncModal onClose={() => { cancelImport(); setShowSyncModal(false); }} onImport={handleFileUpload} onImportCsv={handleCsvUpload} onDownloadCsv={downloadCsv} pendingImport={pendingImport} pendingImportSource={pendingImportSource} onConfirmImport={confirmImport} onCancelImport={cancelImport} onApplyTemplate={previewTemplate} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
       {outage && <OutageSimulationModal result={outage} settings={settings} onClose={() => setOutage(null)} />}
     </div>
   );
@@ -2140,7 +2157,7 @@ function ActivityPanel() {
   );
 }
 
-function SyncModal({onClose,onImport,pendingImport,pendingImportSource,onConfirmImport,onCancelImport,onApplyTemplate,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,onOpenBinder}) {
+function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pendingImportSource,onConfirmImport,onCancelImport,onApplyTemplate,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,onOpenBinder}) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
@@ -2149,12 +2166,24 @@ function SyncModal({onClose,onImport,pendingImport,pendingImportSource,onConfirm
       <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances and your family plan.</p>
       <button type="button" onClick={onOpenBinder} className="w-full rounded-xl p-3 bg-slate-50 border border-slate-200 text-sm font-bold flex items-center justify-center gap-2"><BookOpen size={16}/> Printable emergency binder</button>
       <label className="block text-sm font-bold">Import JSON backup<input type="file" accept=".json,application/json" onChange={onImport} className="block mt-2 w-full text-xs" /></label>
+      <div className="space-y-2">
+        <label className="block text-sm font-bold">Import inventory/shopping CSV<input type="file" accept=".csv,text/csv" onChange={onImportCsv} className="block mt-2 w-full text-xs" /></label>
+        <button type="button" onClick={onDownloadCsv} className="w-full rounded-xl p-3 bg-slate-50 border border-slate-200 text-sm font-bold flex items-center justify-center gap-2"><Download size={16}/> Export inventory/shopping CSV</button>
+      </div>
       <StarterTemplatesPanel settings={settings} onApply={onApplyTemplate} disabled={Boolean(pendingImport)} />
       {pendingImport && <div role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-2 text-sm">
-        <p className="font-black text-amber-900">{pendingImportSource?.kind === 'template' ? `${pendingImportSource.label} ready to review` : 'Backup ready to review'}</p>
+        <p className="font-black text-amber-900">{pendingImportSource?.kind === 'template' ? `${pendingImportSource.label} ready to review` : pendingImportSource?.kind === 'csv' ? 'CSV ready to review' : 'Backup ready to review'}</p>
         <p className="text-amber-800">{pendingImport.inventory.length} inventory items, {pendingImport.shoppingList.length} shopping items, {pendingImport.appliances.length} appliances and {pendingImport.plan ? 'a family plan' : 'no family plan'} will be merged by ID.</p>
         {pendingImport.reminders?.length > 0 && <p className="text-amber-800">{pendingImport.reminders.length} maintenance reminders will be merged.</p>}
         {pendingImport.settings && <p className="text-amber-800">Readiness assumptions are included.</p>}
+        {pendingImportSource?.kind === 'csv' && pendingImportSource.errors?.length > 0 && (
+          <div className="rounded-xl border border-red-200 bg-red-50 p-3 space-y-1">
+            <p className="font-black text-red-900">{pendingImportSource.errors.length} row{pendingImportSource.errors.length === 1 ? '' : 's'} skipped</p>
+            <ul className="text-xs text-red-800 space-y-0.5 max-h-32 overflow-y-auto">
+              {pendingImportSource.errors.map((err, index) => <li key={index}>Row {err.row}: {err.message}</li>)}
+            </ul>
+          </div>
+        )}
         {pendingImportSource?.kind === 'template' && (
           <>
             <ul className="text-amber-800 text-xs space-y-0.5 max-h-40 overflow-y-auto">

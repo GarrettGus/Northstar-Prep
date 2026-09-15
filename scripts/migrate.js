@@ -255,6 +255,10 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_backups (
   ciphertext bytea
 )`;
 await sql`CREATE INDEX IF NOT EXISTS northstar_backups_household_idx ON northstar_backups (household_id, created_at DESC)`;
+// Whether this backup was also copied to object storage (server/backupBlobStore.js). Additive:
+// null on rows written before this column existed, meaning no copy was ever attempted.
+await sql`ALTER TABLE northstar_backups ADD COLUMN IF NOT EXISTS off_site_status text`;
+await sql`ALTER TABLE northstar_backups ADD COLUMN IF NOT EXISTS off_site_error text`;
 
 // --- Production monitoring: per-minute request metrics and alert de-duplication state. ---
 // Deliberately content-free (route, outcome, status, latency only) so operational history can

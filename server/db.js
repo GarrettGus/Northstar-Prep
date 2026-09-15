@@ -352,14 +352,25 @@ export async function listReminderHistory(householdId = 1, limit = 100) {
 }
 
 // --- Encrypted household backups. Ciphertext/IV/auth tag never leave insertBackupRecord/getBackupRecord. ---
+// off_site_status/off_site_error record whether the same backup was also copied to object
+// storage (see server/backupBlobStore.js); null means no copy was attempted (storage not
+// configured, or the row predates this column).
 export async function insertBackupRecord({householdId = 1, status, error = null, checksum = null, sizeBytes = null, inventoryCount = null, shoppingCount = null, applianceCount = null, hasPlan = null, iv = null, authTag = null, ciphertext = null}) {
   const sql = database();
-  await sql`INSERT INTO northstar_backups (household_id, status, error, checksum, size_bytes, inventory_count, shopping_count, appliance_count, has_plan, iv, auth_tag, ciphertext)
-    VALUES (${householdId}, ${status}, ${error}, ${checksum}, ${sizeBytes}, ${inventoryCount}, ${shoppingCount}, ${applianceCount}, ${hasPlan}, ${iv}, ${authTag}, ${ciphertext})`;
+  const rows = await sql`INSERT INTO northstar_backups (household_id, status, error, checksum, size_bytes, inventory_count, shopping_count, appliance_count, has_plan, iv, auth_tag, ciphertext)
+    VALUES (${householdId}, ${status}, ${error}, ${checksum}, ${sizeBytes}, ${inventoryCount}, ${shoppingCount}, ${applianceCount}, ${hasPlan}, ${iv}, ${authTag}, ${ciphertext})
+    RETURNING id`;
+  return rows[0].id;
+}
+export async function updateBackupOffSiteStatus(id, {status, error = null}, householdId = 1) {
+  const sql = database();
+  await sql`UPDATE northstar_backups SET off_site_status = ${status}, off_site_error = ${error}
+    WHERE id = ${id} AND household_id = ${householdId}`;
 }
 export async function listBackupRecords(householdId = 1, limit = 20) {
   const sql = database();
-  return sql`SELECT id, created_at, status, error, checksum, size_bytes, inventory_count, shopping_count, appliance_count, has_plan
+  return sql`SELECT id, created_at, status, error, checksum, size_bytes, inventory_count, shopping_count, appliance_count, has_plan,
+      off_site_status AS "offSiteStatus", off_site_error AS "offSiteError"
     FROM northstar_backups WHERE household_id = ${householdId} ORDER BY created_at DESC LIMIT ${limit}`;
 }
 export async function getBackupRecord(id, householdId = 1) {
@@ -368,11 +379,13 @@ export async function getBackupRecord(id, householdId = 1) {
     FROM northstar_backups WHERE id = ${id} AND household_id = ${householdId} AND status = 'success'`;
   return rows[0];
 }
+// Returns the pruned rows' IDs so the caller can also delete their off-site copies, if any.
 export async function pruneBackups(householdId = 1, keep = 30) {
   const sql = database();
-  await sql`DELETE FROM northstar_backups WHERE household_id = ${householdId} AND id NOT IN (
+  const rows = await sql`DELETE FROM northstar_backups WHERE household_id = ${householdId} AND id NOT IN (
     SELECT id FROM northstar_backups WHERE household_id = ${householdId} ORDER BY created_at DESC LIMIT ${keep}
-  )`;
+  ) RETURNING id`;
+  return rows.map(row => row.id);
 }
 
 // --- Request metrics and alert state. ---

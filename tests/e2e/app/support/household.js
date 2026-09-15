@@ -6,7 +6,7 @@ import { environment } from './environment.js';
 
 const collections = [
   'northstar_inventory', 'northstar_shopping_items', 'northstar_appliances', 'northstar_reminders',
-  'northstar_checklist_checks', 'northstar_plan', 'northstar_family_members', 'northstar_contacts',
+  'northstar_checklist_checks', 'northstar_kits', 'northstar_medications', 'northstar_plan', 'northstar_family_members', 'northstar_contacts',
   'northstar_settings', 'northstar_audit_log', 'northstar_reminder_history', 'northstar_backups',
 ];
 

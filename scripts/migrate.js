@@ -116,6 +116,12 @@ await sql`ALTER TABLE northstar_inventory ADD COLUMN IF NOT EXISTS barcode text 
 await sql`ALTER TABLE northstar_inventory ADD COLUMN IF NOT EXISTS recurring_days integer NOT NULL DEFAULT 0`;
 await sql`ALTER TABLE northstar_shopping_items ADD COLUMN IF NOT EXISTS barcode text NOT NULL DEFAULT ''`;
 await sql`ALTER TABLE northstar_shopping_items ADD COLUMN IF NOT EXISTS recurring_days integer NOT NULL DEFAULT 0`;
+// Where the item is physically stored, and which kit (if any) it counts toward. Additive columns
+// so existing rows default to "unassigned" (see itemSchema.location/kitId in shared/schema.js).
+await sql`ALTER TABLE northstar_inventory ADD COLUMN IF NOT EXISTS location text NOT NULL DEFAULT ''`;
+await sql`ALTER TABLE northstar_inventory ADD COLUMN IF NOT EXISTS kit_id text NOT NULL DEFAULT ''`;
+await sql`ALTER TABLE northstar_shopping_items ADD COLUMN IF NOT EXISTS location text NOT NULL DEFAULT ''`;
+await sql`ALTER TABLE northstar_shopping_items ADD COLUMN IF NOT EXISTS kit_id text NOT NULL DEFAULT ''`;
 await sql`CREATE TABLE IF NOT EXISTS northstar_appliances (
   household_id integer NOT NULL REFERENCES northstar_household(id),
   id text NOT NULL,
@@ -146,6 +152,32 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_checklist_checks (
   household_id integer NOT NULL REFERENCES northstar_household(id),
   id text NOT NULL,
   completed_at text NOT NULL DEFAULT '',
+  PRIMARY KEY (household_id, id)
+)`;
+// --- Storage kits (go-bag, basement, vehicle, ...). target_contents is a small denormalized
+// JSON list (name/quantity/unit) rather than its own table: it belongs to the kit alone, nothing
+// else references a row within it, and it never grows large enough to need its own indexing.
+await sql`CREATE TABLE IF NOT EXISTS northstar_kits (
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  id text NOT NULL,
+  seq bigserial,
+  name text NOT NULL,
+  purpose text NOT NULL DEFAULT '',
+  target_contents jsonb NOT NULL DEFAULT '[]',
+  PRIMARY KEY (household_id, id)
+)`;
+// --- Medications and prescriptions: sensitive household health data (see README privacy notes). ---
+await sql`CREATE TABLE IF NOT EXISTS northstar_medications (
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  id text NOT NULL,
+  seq bigserial,
+  person text NOT NULL DEFAULT '',
+  name text NOT NULL,
+  dose text NOT NULL DEFAULT '',
+  quantity_on_hand numeric NOT NULL DEFAULT 0,
+  refill_date text NOT NULL DEFAULT '',
+  prescriber text NOT NULL DEFAULT '',
+  notes text NOT NULL DEFAULT '',
   PRIMARY KEY (household_id, id)
 )`;
 await sql`CREATE TABLE IF NOT EXISTS northstar_reminder_history (

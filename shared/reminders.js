@@ -24,3 +24,8 @@ export function isReminderOverdue(reminder, now = new Date()) {
   if (!due) return false;
   return due <= isoLocal(now);
 }
+// A medication with no refill date on file is never "due" — there is nothing to compare against.
+export function isMedicationRefillDue(medication, now = new Date()) {
+  if (!medication.refillDate) return false;
+  return medication.refillDate <= isoLocal(now);
+}

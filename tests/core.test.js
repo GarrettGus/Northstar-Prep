@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema, planSchema } from '../shared/schema.js';
-import { nextReminderDueDate, effectiveReminderDueDate, isReminderOverdue, addDaysISO } from '../shared/reminders.js';
+import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema, planSchema, kitSchema, medicationSchema } from '../shared/schema.js';
+import { nextReminderDueDate, effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, addDaysISO } from '../shared/reminders.js';
+import { kitCompleteness } from '../shared/kits.js';
 import { checklistCatalog } from '../shared/checklists.js';
 import { categories } from '../shared/schema.js';
 import { token, validSession, hashPassword, verifyPassword, hashToken, randomToken, cookie, sameOrigin } from '../server/auth.js';
@@ -33,6 +34,14 @@ test('backup merge is repeatable and preserves existing records',()=>{
   assert.equal(once.inventory.length,2);
   assert.equal(once.plan.shelterSpot,'Basement');
 });
+test('backups carry kits and medications, merging by ID like every other collection',()=>{
+  let state=applyAction(emptyState(),{type:'add',collection:'kits',id:'k1',item:{name:'Existing kit'}});
+  const backup=normalizeBackup({kits:[{id:'k1',name:'Updated kit'},{name:'New kit'}],medications:[{name:'Lisinopril'}]},()=> 'generated-id');
+  const merged=applyAction(state,{type:'import',backup});
+  assert.equal(merged.kits.find(k=>k.id==='k1').name,'Updated kit');
+  assert.equal(merged.kits.length,2);
+  assert.equal(merged.medications[0].id,'generated-id');
+});
 test('settings are validated, persisted and used by imports',()=>{
   const updated=applyAction(emptyState(),{type:'settings',settings:{householdSize:'6',survivalGoalDays:'30'}});
   assert.equal(updated.settings.householdSize,6);
@@ -51,6 +60,65 @@ test('item schema validates barcode and recurringDays, defaulting both when abse
   assert.equal(itemSchema.parse({...base,recurringDays:'30'}).recurringDays,30);
   assert.throws(()=>itemSchema.parse({...base,barcode:'not valid!'}));
   assert.throws(()=>itemSchema.parse({...base,recurringDays:-1}));
+});
+test('item schema defaults location and kitId to blank, and accepts a valid kit reference',()=>{
+  const base={id:'x',name:'Rice'};
+  assert.equal(itemSchema.parse(base).location,'');
+  assert.equal(itemSchema.parse(base).kitId,'');
+  assert.equal(itemSchema.parse({...base,location:'Basement',kitId:'go-bag'}).kitId,'go-bag');
+  assert.throws(()=>itemSchema.parse({...base,kitId:'has a space'}));
+});
+test('kit schema validates target contents and defaults them to an empty list',()=>{
+  assert.deepEqual(kitSchema.parse({id:'k1',name:'Go-bag'}).targetContents,[]);
+  const kit=kitSchema.parse({id:'k1',name:'Go-bag',purpose:'Evacuation',targetContents:[{name:'Flashlight',quantity:1}]});
+  assert.equal(kit.targetContents[0].unit,'units');
+  assert.throws(()=>kitSchema.parse({id:'k1',name:'Go-bag',targetContents:[{name:'',quantity:1}]}));
+});
+test('medication schema requires a name and defaults the rest',()=>{
+  const med=medicationSchema.parse({id:'m1',name:'Lisinopril'});
+  assert.equal(med.person,'');
+  assert.equal(med.quantityOnHand,0);
+  assert.equal(med.refillDate,'');
+  assert.throws(()=>medicationSchema.parse({id:'m1',name:''}));
+});
+test('kits and medications go through the same generic add/update/delete actions as other collections',()=>{
+  let state=emptyState();
+  state=applyAction(state,{type:'add',collection:'kits',id:'k1',item:{name:'Go-bag',targetContents:[{name:'Flashlight',quantity:1}]}});
+  state=applyAction(state,{type:'add',collection:'medications',id:'m1',item:{name:'Lisinopril',person:'Alex',refillDate:'2026-01-01'}});
+  assert.equal(state.kits[0].name,'Go-bag');
+  assert.equal(state.medications[0].person,'Alex');
+  state=applyAction(state,{type:'update',collection:'medications',id:'m1',item:{quantityOnHand:30}});
+  assert.equal(state.medications[0].quantityOnHand,30);
+  state=applyAction(state,{type:'delete',collection:'kits',id:'k1'});
+  assert.equal(state.kits.length,0);
+  assert.throws(()=>applyAction(state,{type:'update',collection:'kits',id:'missing',item:{name:'x'}}));
+});
+test('kit completeness matches assigned inventory items by name and sums their quantity',()=>{
+  const kit={id:'k1',name:'Go-bag',targetContents:[{name:'Flashlight',quantity:2,unit:'units'},{name:'Water bottle',quantity:1,unit:'units'}]};
+  const inventory=[
+    {id:'a',name:'Flashlight',quantity:1,kitId:'k1'},
+    {id:'b',name:'flashlight',quantity:1,kitId:'k1'}, // case-insensitive match, sums with the row above
+    {id:'c',name:'Water bottle',quantity:0,kitId:'k1'}, // assigned but short of target
+    {id:'d',name:'Tarp',quantity:5,kitId:'other-kit'}, // not assigned to this kit
+  ];
+  const result=kitCompleteness(kit,inventory);
+  assert.equal(result.assignedCount,3);
+  assert.equal(result.metCount,1);
+  assert.equal(result.totalCount,2);
+  assert.equal(result.percent,50);
+  assert.equal(result.contents.find(row=>row.name==='Flashlight').actualQuantity,2);
+});
+test('an empty-target kit reads 0% until at least one item is assigned, then 100%',()=>{
+  const kit={id:'k1',name:'Go-bag',targetContents:[]};
+  assert.equal(kitCompleteness(kit,[]).percent,0);
+  assert.equal(kitCompleteness(kit,[{id:'a',name:'Anything',quantity:1,kitId:'k1'}]).percent,100);
+});
+test('a medication is refill-due once its refill date has passed, and never due with no date on file',()=>{
+  const now=new Date('2026-06-15T12:00:00');
+  assert.equal(isMedicationRefillDue({refillDate:''},now),false);
+  assert.equal(isMedicationRefillDue({refillDate:'2026-06-15'},now),true);
+  assert.equal(isMedicationRefillDue({refillDate:'2026-06-16'},now),false);
+  assert.equal(isMedicationRefillDue({refillDate:'2026-01-01'},now),true);
 });
 test('bulk delete removes only validated IDs from one collection',()=>{
   let state=emptyState();

@@ -51,8 +51,8 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       assert.deepEqual(tables, [
         'northstar_alert_state', 'northstar_appliances', 'northstar_audit_log', 'northstar_backups',
         'northstar_checklist_checks', 'northstar_contacts', 'northstar_family_members', 'northstar_household',
-        'northstar_household_members', 'northstar_inventory', 'northstar_invitations', 'northstar_login_limits',
-        'northstar_password_resets', 'northstar_plan', 'northstar_readiness_history', 'northstar_reminder_history', 'northstar_reminders',
+        'northstar_household_members', 'northstar_inventory', 'northstar_invitations', 'northstar_kits', 'northstar_login_limits',
+        'northstar_medications', 'northstar_password_resets', 'northstar_plan', 'northstar_readiness_history', 'northstar_reminder_history', 'northstar_reminders',
         'northstar_request_metrics', 'northstar_settings', 'northstar_shopping_items', 'northstar_users',
       ]);
     });
@@ -68,6 +68,7 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
         id: 'rice-1', name: 'Rice', quantity: 5, unit: 'lbs', category: 'Food', caloriesPerUnit: 1600,
         hoursPerUnit: 0, capacityPerUnit: 0, price: 12, gallonsPerUnit: 0, target: 10, store: '', emoji: '',
         image: '', macroTag: 'Carbs', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '012345678905', recurringDays: 30,
+        location: '', kitId: '',
       };
       const saved = await db.compareAndSave(version, {...data, inventory: [item]}, data);
       assert.equal(saved, 1);
@@ -91,6 +92,7 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
         id, name, quantity: 1, unit: 'units', category: 'Gear', caloriesPerUnit: 0, hoursPerUnit: 0,
         capacityPerUnit: 0, price: 0, gallonsPerUnit: 0, target: 0, store: '', emoji: '', image: '',
         macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: 0,
+        location: '', kitId: '',
       });
       const phoneEdit = {...data, inventory: [...data.inventory, row('phone-1', 'Radio')]};
       const laptopEdit = {...data, inventory: [...data.inventory, row('laptop-1', 'Lantern')]};
@@ -108,6 +110,30 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       const names = after.data.inventory.map(item => item.name);
       assert.ok(names.includes(winner), `the winning device's item is missing: ${names}`);
       assert.ok(!names.includes(loser), `the losing device's item was applied anyway: ${names}`);
+    });
+
+    it('saves and reads back kits, medications, and an item with a storage location and kit assignment', async () => {
+      const db = await loadDb(database.url);
+      const {data, version} = await db.readState();
+      const kit = {id: 'kit-1', name: 'Go-bag', purpose: 'Evacuation', targetContents: [{name: 'Flashlight', quantity: 1, unit: 'units'}]};
+      const medication = {id: 'med-1', person: 'Alex', name: 'Lisinopril', dose: '10mg', quantityOnHand: 30, refillDate: '2026-10-01', prescriber: 'Dr. Lee', notes: ''};
+      const item = {id: 'flashlight-1', name: 'Flashlight', quantity: 1, unit: 'units', category: 'Gear',
+        caloriesPerUnit: 0, hoursPerUnit: 0, capacityPerUnit: 0, price: 0, gallonsPerUnit: 0, target: 0, store: '', emoji: '', image: '',
+        macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: 0, location: 'Basement', kitId: 'kit-1'};
+      const saved = await db.compareAndSave(version, {...data, inventory: [...data.inventory, item], kits: [kit], medications: [medication]}, data);
+      assert.equal(saved, version + 1);
+
+      const after = await db.readState();
+      assert.deepEqual(after.data.kits, [kit]);
+      assert.deepEqual(after.data.medications, [medication]);
+      const savedItem = after.data.inventory.find(row => row.id === 'flashlight-1');
+      assert.equal(savedItem.location, 'Basement');
+      assert.equal(savedItem.kitId, 'kit-1');
+
+      const deleted = await db.compareAndSave(after.version, {...after.data, kits: [], medications: []}, after.data);
+      assert.equal(deleted, after.version + 1);
+      assert.deepEqual((await db.readState()).data.kits, []);
+      assert.deepEqual((await db.readState()).data.medications, []);
     });
 
     it('stores and reads back an encrypted backup record and request metrics', async () => {

@@ -14,25 +14,28 @@ export const householdId = 1;
 // rows that actually changed, inside one transaction guarded by the household's version.
 export async function readState() {
   const sql = database();
-  const [households, inventory, shoppingList, appliances, reminders, checklistChecks, planRows, familyRows, contactRows, settingsRows] = await Promise.all([
+  const [households, inventory, shoppingList, appliances, reminders, checklistChecks, kitRows, medications, planRows, familyRows, contactRows, settingsRows] = await Promise.all([
     sql`SELECT version FROM northstar_household WHERE id = ${householdId}`,
     sql`SELECT id, name, quantity, unit, category,
           calories_per_unit AS "caloriesPerUnit", hours_per_unit AS "hoursPerUnit", capacity_per_unit AS "capacityPerUnit",
           price, gallons_per_unit AS "gallonsPerUnit", target, store, emoji, image,
           macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate",
-          barcode, recurring_days AS "recurringDays"
+          barcode, recurring_days AS "recurringDays", location, kit_id AS "kitId"
         FROM northstar_inventory WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, name, quantity, unit, category,
           calories_per_unit AS "caloriesPerUnit", hours_per_unit AS "hoursPerUnit", capacity_per_unit AS "capacityPerUnit",
           price, gallons_per_unit AS "gallonsPerUnit", target, store, emoji, image,
           macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate",
-          barcode, recurring_days AS "recurringDays"
+          barcode, recurring_days AS "recurringDays", location, kit_id AS "kitId"
         FROM northstar_shopping_items WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, name, watts, hours, active, priority FROM northstar_appliances WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, title, category, recurring_days AS "recurringDays", notes, start_date AS "startDate",
           last_completed_date AS "lastCompletedDate", snoozed_until AS "snoozedUntil"
         FROM northstar_reminders WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, completed_at AS "completedAt" FROM northstar_checklist_checks WHERE household_id = ${householdId}`,
+    sql`SELECT id, name, purpose, target_contents AS "targetContents" FROM northstar_kits WHERE household_id = ${householdId} ORDER BY seq`,
+    sql`SELECT id, person, name, dose, quantity_on_hand AS "quantityOnHand", refill_date AS "refillDate", prescriber, notes
+        FROM northstar_medications WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary"
         FROM northstar_plan WHERE household_id = ${householdId}`,
     sql`SELECT name, role, dob, kind, calories_per_day AS "caloriesPerDay", water_gallons_per_day AS "waterGallonsPerDay"
@@ -52,7 +55,8 @@ export async function readState() {
     contacts: contactRows,
     meetingPoints: {primary: planRow.meetingPrimary, secondary: planRow.meetingSecondary},
   } : null;
-  const data = stateSchema.parse({inventory, shoppingList, appliances, reminders, checklistChecks, plan, settings: settingsRows[0]});
+  const kits = kitRows.map(row => ({...row, targetContents: row.targetContents ?? []}));
+  const data = stateSchema.parse({inventory, shoppingList, appliances, reminders, checklistChecks, kits, medications, plan, settings: settingsRows[0]});
   return {data, version: households[0].version};
 }
 
@@ -64,26 +68,28 @@ function diffById(currentRows, nextRows) {
   return {toDelete, toUpsert};
 }
 function upsertInventoryItem(tx, item, guard) {
-  return tx`INSERT INTO northstar_inventory (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date, barcode, recurring_days)
-    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}, ${item.barcode}, ${item.recurringDays}
+  return tx`INSERT INTO northstar_inventory (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date, barcode, recurring_days, location, kit_id)
+    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}, ${item.barcode}, ${item.recurringDays}, ${item.location}, ${item.kitId}
     WHERE ${guard}
     ON CONFLICT (household_id, id) DO UPDATE SET
       name = EXCLUDED.name, quantity = EXCLUDED.quantity, unit = EXCLUDED.unit, category = EXCLUDED.category,
       calories_per_unit = EXCLUDED.calories_per_unit, hours_per_unit = EXCLUDED.hours_per_unit, capacity_per_unit = EXCLUDED.capacity_per_unit,
       price = EXCLUDED.price, gallons_per_unit = EXCLUDED.gallons_per_unit, target = EXCLUDED.target, store = EXCLUDED.store,
       emoji = EXCLUDED.emoji, image = EXCLUDED.image, macro_tag = EXCLUDED.macro_tag, fuel_type = EXCLUDED.fuel_type,
-      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days`;
+      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days,
+      location = EXCLUDED.location, kit_id = EXCLUDED.kit_id`;
 }
 function upsertShoppingItem(tx, item, guard) {
-  return tx`INSERT INTO northstar_shopping_items (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date, barcode, recurring_days)
-    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}, ${item.barcode}, ${item.recurringDays}
+  return tx`INSERT INTO northstar_shopping_items (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date, barcode, recurring_days, location, kit_id)
+    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}, ${item.barcode}, ${item.recurringDays}, ${item.location}, ${item.kitId}
     WHERE ${guard}
     ON CONFLICT (household_id, id) DO UPDATE SET
       name = EXCLUDED.name, quantity = EXCLUDED.quantity, unit = EXCLUDED.unit, category = EXCLUDED.category,
       calories_per_unit = EXCLUDED.calories_per_unit, hours_per_unit = EXCLUDED.hours_per_unit, capacity_per_unit = EXCLUDED.capacity_per_unit,
       price = EXCLUDED.price, gallons_per_unit = EXCLUDED.gallons_per_unit, target = EXCLUDED.target, store = EXCLUDED.store,
       emoji = EXCLUDED.emoji, image = EXCLUDED.image, macro_tag = EXCLUDED.macro_tag, fuel_type = EXCLUDED.fuel_type,
-      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days`;
+      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days,
+      location = EXCLUDED.location, kit_id = EXCLUDED.kit_id`;
 }
 
 function upsertReminder(tx, reminder, guard) {
@@ -100,6 +106,21 @@ function upsertChecklistCheck(tx, check, guard) {
     WHERE ${guard}
     ON CONFLICT (household_id, id) DO UPDATE SET completed_at = EXCLUDED.completed_at`;
 }
+function upsertKit(tx, kit, guard) {
+  return tx`INSERT INTO northstar_kits (household_id, id, name, purpose, target_contents)
+    SELECT ${householdId}, ${kit.id}, ${kit.name}, ${kit.purpose}, ${JSON.stringify(kit.targetContents)}::jsonb
+    WHERE ${guard}
+    ON CONFLICT (household_id, id) DO UPDATE SET
+      name = EXCLUDED.name, purpose = EXCLUDED.purpose, target_contents = EXCLUDED.target_contents`;
+}
+function upsertMedication(tx, medication, guard) {
+  return tx`INSERT INTO northstar_medications (household_id, id, person, name, dose, quantity_on_hand, refill_date, prescriber, notes)
+    SELECT ${householdId}, ${medication.id}, ${medication.person}, ${medication.name}, ${medication.dose}, ${medication.quantityOnHand}, ${medication.refillDate}, ${medication.prescriber}, ${medication.notes}
+    WHERE ${guard}
+    ON CONFLICT (household_id, id) DO UPDATE SET
+      person = EXCLUDED.person, name = EXCLUDED.name, dose = EXCLUDED.dose, quantity_on_hand = EXCLUDED.quantity_on_hand,
+      refill_date = EXCLUDED.refill_date, prescriber = EXCLUDED.prescriber, notes = EXCLUDED.notes`;
+}
 
 export async function compareAndSave(version, next, current = emptyState()) {
   const sql = database();
@@ -112,6 +133,8 @@ export async function compareAndSave(version, next, current = emptyState()) {
   const applianceDiff = diffById(current.appliances, next.appliances);
   const reminderDiff = diffById(current.reminders, next.reminders);
   const checklistDiff = diffById(current.checklistChecks, next.checklistChecks);
+  const kitDiff = diffById(current.kits, next.kits);
+  const medicationDiff = diffById(current.medications, next.medications);
   const planChanged = JSON.stringify(current.plan) !== JSON.stringify(next.plan);
   const settingsChanged = JSON.stringify(current.settings) !== JSON.stringify(next.settings);
 
@@ -136,6 +159,10 @@ export async function compareAndSave(version, next, current = emptyState()) {
     for (const reminder of reminderDiff.toUpsert) statements.push(upsertReminder(tx, reminder, guard));
     for (const id of checklistDiff.toDelete) statements.push(tx`DELETE FROM northstar_checklist_checks WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
     for (const check of checklistDiff.toUpsert) statements.push(upsertChecklistCheck(tx, check, guard));
+    for (const id of kitDiff.toDelete) statements.push(tx`DELETE FROM northstar_kits WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
+    for (const kit of kitDiff.toUpsert) statements.push(upsertKit(tx, kit, guard));
+    for (const id of medicationDiff.toDelete) statements.push(tx`DELETE FROM northstar_medications WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
+    for (const medication of medicationDiff.toUpsert) statements.push(upsertMedication(tx, medication, guard));
 
     if (planChanged) {
       if (next.plan === null) {

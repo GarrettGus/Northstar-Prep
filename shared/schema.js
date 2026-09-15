@@ -55,6 +55,9 @@ export const itemSchema = z.object({
   category: categorySchema.default('Gear'),
   caloriesPerUnit: number, hoursPerUnit: number, capacityPerUnit: number, price: number,
   gallonsPerUnit: number, target: number, store: text.default(''), emoji: z.string().max(30).default(''),
+  // Where the item is physically kept (go-bag, basement, vehicle, ...) and which kit (if any)
+  // it counts toward. Both are additive/optional so existing rows keep parsing unchanged.
+  location: text.default(''), kitId: z.union([z.literal(''), idSchema]).default(''),
   // Legacy/offline-queued rows may still carry a base64 data URL; the server converts those to
   // an object storage URL (https://*.public.blob.vercel-storage.com/...) before persisting.
   image: z.string().max(180000).regex(/^(?:|data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+|https:\/\/[a-z0-9-]+\.public\.blob\.vercel-storage\.com\/[A-Za-z0-9/_.-]+)$/).default(''),
@@ -98,24 +101,43 @@ export const familyMemberSchema = z.object({
   caloriesPerDay: memberNeed(20000),
   waterGallonsPerDay: memberNeed(50),
 });
+// --- Storage kits (go-bag, basement, vehicle, ...): a target contents list to pack against. ---
+// Items are assigned to a kit via itemSchema.kitId; completeness is computed client-side by
+// matching each target row's name against assigned items (see shared/kits.js).
+export const kitTargetItemSchema = z.object({
+  name: z.string().trim().min(1).max(200), quantity: number, unit: z.string().max(80).default('units'),
+});
+export const kitSchema = z.object({
+  id: idSchema, name: z.string().trim().min(1).max(200), purpose: text.default(''),
+  targetContents: z.array(kitTargetItemSchema).max(200).default([]),
+});
+
+// --- Medications and prescriptions: who takes what, at what dose, and when it needs a refill. ---
+export const medicationSchema = z.object({
+  id: idSchema, person: z.string().trim().max(200).default(''), name: z.string().trim().min(1).max(200),
+  dose: z.string().trim().max(200).default(''), quantityOnHand: number, refillDate: date,
+  prescriber: z.string().trim().max(200).default(''), notes: text.default(''),
+});
+
 export const planSchema = z.object({
   shelterSpot: z.string().max(3000).default(''),
   family: z.array(familyMemberSchema).max(30).default([]),
   contacts: z.array(z.object({name: text, phone: z.string().max(80), type: text.default('')})).max(50).default([]),
   meetingPoints: z.object({primary: text.default(''), secondary: text.default('')}).default({primary:'',secondary:''}),
 });
-export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), reminders: z.array(reminderSchema).max(300), checklistChecks: z.array(checklistCheckSchema).max(500), plan: planSchema.nullable(), settings: settingsSchema.default(() => settingsSchema.parse({})) });
-export const backupSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), reminders: z.array(reminderSchema).max(300).default([]), checklistChecks: z.array(checklistCheckSchema).max(500).default([]), plan: planSchema.nullable().default(null), settings: settingsInputSchema.optional() });
-export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], reminders:[], checklistChecks:[], plan:null, settings:settingsSchema.parse({})});
-export const collectionKey = {inventory:'inventory', shopping_list:'shoppingList', appliances:'appliances', reminders:'reminders', checklist:'checklistChecks'};
-const schemaByKey = {inventory: itemSchema, shoppingList: itemSchema, appliances: applianceSchema, reminders: reminderSchema, checklistChecks: checklistCheckSchema};
+export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), reminders: z.array(reminderSchema).max(300), checklistChecks: z.array(checklistCheckSchema).max(500), kits: z.array(kitSchema).max(200).default([]), medications: z.array(medicationSchema).max(300).default([]), plan: planSchema.nullable(), settings: settingsSchema.default(() => settingsSchema.parse({})) });
+export const backupSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), reminders: z.array(reminderSchema).max(300).default([]), checklistChecks: z.array(checklistCheckSchema).max(500).default([]), kits: z.array(kitSchema).max(200).default([]), medications: z.array(medicationSchema).max(300).default([]), plan: planSchema.nullable().default(null), settings: settingsInputSchema.optional() });
+export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], reminders:[], checklistChecks:[], kits:[], medications:[], plan:null, settings:settingsSchema.parse({})});
+export const collectionKey = {inventory:'inventory', shopping_list:'shoppingList', appliances:'appliances', reminders:'reminders', checklist:'checklistChecks', kits:'kits', medications:'medications'};
+const schemaByKey = {inventory: itemSchema, shoppingList: itemSchema, appliances: applianceSchema, reminders: reminderSchema, checklistChecks: checklistCheckSchema, kits: kitSchema, medications: medicationSchema};
 const bulkQuantitySchema = z.object({mode: z.enum(['set', 'delta']), value: z.coerce.number().finite().max(1e9)});
+const collectionKeys = ['inventory','shoppingList','appliances','reminders','checklistChecks','kits','medications'];
 
 export function normalizeBackup(input, makeId) {
   if (Array.isArray(input)) input = {inventory:input};
   if (!input || typeof input !== 'object') throw new Error('Expected a backup object.');
   const result = {};
-  for (const key of ['inventory','shoppingList','appliances','reminders','checklistChecks']) {
+  for (const key of collectionKeys) {
     const rows = input[key] ?? [];
     if (!Array.isArray(rows)) throw new Error(`${key} must be an array.`);
     result[key] = rows.map(row => ({...row, id: row.id || makeId()}));
@@ -130,7 +152,7 @@ export function applyAction(state, action) {
   const next = structuredClone(state);
   if (action.type === 'import') {
     const backup = backupSchema.parse(action.backup);
-    for (const key of ['inventory','shoppingList','appliances','reminders','checklistChecks']) {
+    for (const key of collectionKeys) {
       const merged = new Map(next[key].map(row => [row.id,row]));
       backup[key].forEach(row => merged.set(row.id,row));
       next[key] = [...merged.values()];

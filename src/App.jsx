@@ -12,8 +12,9 @@ import { computeReadiness, computeReadinessGaps, isExpired, isRecurringDue, expi
 import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
 import { simulateOutage, appliancePriorities, appliancePriorityLabels } from '../shared/outage.js';
 import { supplyTemplateCatalog, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
-import { effectiveReminderDueDate, isReminderOverdue, todayLocal, addDaysISO } from '../shared/reminders.js';
+import { effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, todayLocal, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
+import { kitCompleteness } from '../shared/kits.js';
 import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
 
 // --- Constants ---
@@ -31,6 +32,8 @@ export default function App() {
   const [appliances, setAppliances] = useState([]);
   const [reminders, setReminders] = useState([]);
   const [checklistChecks, setChecklistChecks] = useState([]);
+  const [kits, setKits] = useState([]);
+  const [medications, setMedications] = useState([]);
   const [plan, setPlan] = useState(null);
   const [loading, setLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -53,6 +56,7 @@ export default function App() {
     revision.current = version;
     setInventory(data.inventory); setShoppingList(data.shoppingList);
     setAppliances(data.appliances); setReminders(data.reminders ?? []); setChecklistChecks(data.checklistChecks ?? []);
+    setKits(data.kits ?? []); setMedications(data.medications ?? []);
     setPlan(data.plan); setSettings(settingsSchema.parse(data.settings ?? {}));
     saveCachedState({data,version});
     if (synced) setLastSyncedAt(Date.now());
@@ -111,7 +115,7 @@ export default function App() {
   }, [user, online]);
   const queueOffline = action => {
     try {
-      const next = applyAction({inventory, shoppingList, appliances, reminders, checklistChecks, plan, settings}, action);
+      const next = applyAction({inventory, shoppingList, appliances, reminders, checklistChecks, kits, medications, plan, settings}, action);
       const count = enqueueAction(action);
       accept({data:next,version:revision.current}, false);
       setPendingSync(count); setGlobalError('Offline: saved on this device and queued for sync.');
@@ -131,11 +135,11 @@ export default function App() {
     finally {busy.current=false;setIsSyncing(false);}
   };
   const logout = async () => {
-    try {await request('session',{},'DELETE');epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setPlan(null);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    try {await request('session',{},'DELETE');epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
-    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,reminders,checklistChecks,plan,settings},null,2)],{type:'application/json'});
+    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,reminders,checklistChecks,kits,medications,plan,settings},null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob);const link=document.createElement('a');
     link.href=url;link.download=`northstar-backup-${new Date().toISOString().slice(0,10)}.json`;link.click();
     setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -186,6 +190,7 @@ export default function App() {
   const stats = useMemo(() => computeReadiness({ inventory, appliances, plan }, settings), [inventory, appliances, plan, settings]);
   const gaps = useMemo(() => computeReadinessGaps(stats, settings), [stats, settings]);
   const overdueReminders = useMemo(() => reminders.filter(r => isReminderOverdue(r)), [reminders]);
+  const refillDueMedications = useMemo(() => medications.filter(m => isMedicationRefillDue(m)), [medications]);
   const handleUpdateSettings = (next) => mutate({ type: 'settings', settings: next });
 
   // Queues a generic supply representing a readiness shortfall onto the shopping list; the
@@ -238,7 +243,7 @@ export default function App() {
     return <Login configured={configured} error={globalError} onLogin={handleAuthenticated} />;
   }
   if (loading && !inventory.length && !globalError) return <LoadingScreen />;
-  if (showBinder) return <EmergencyBinder plan={plan} inventory={inventory} stats={stats} settings={settings} checklistChecks={checklistChecks} onClose={() => setShowBinder(false)} />;
+  if (showBinder) return <EmergencyBinder plan={plan} inventory={inventory} stats={stats} settings={settings} checklistChecks={checklistChecks} medications={medications} onClose={() => setShowBinder(false)} />;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans select-none">
@@ -247,7 +252,7 @@ export default function App() {
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
-        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} onViewReminders={() => setActiveTab('plan')} onViewRotation={() => setActiveTab('inventory')} />}
+        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} refillDueMedications={refillDueMedications} onViewReminders={() => setActiveTab('plan')} onViewRotation={() => setActiveTab('inventory')} />}
         {activeTab === 'inventory' && (
           <InventoryManager
             title="Supply Hub"
@@ -255,12 +260,16 @@ export default function App() {
             shoppingList={shoppingList}
             stats={stats}
             settings={settings}
+            kits={kits}
             onAdd={(i) => handleAdd('inventory', i)}
             onUpdate={(id, i) => handleUpdate('inventory', id, i)}
             onDelete={(id) => handleDelete('inventory', id)}
             onBulkDelete={(ids) => handleBulkDelete('inventory', ids)}
             onBulkUpdate={(ids, changes) => handleBulkUpdate('inventory', ids, changes)}
             onRestock={handleRestockRecurring}
+            onAddKit={(i) => handleAdd('kits', i)}
+            onUpdateKit={(id, i) => handleUpdate('kits', id, i)}
+            onDeleteKit={(id) => handleDelete('kits', id)}
           />
         )}
         {activeTab === 'shopping' && (
@@ -292,13 +301,16 @@ export default function App() {
           <EmergencyPlan
             plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunSimulation={runOutageSimulation} settings={settings}
             onOpenBinder={() => setShowBinder(true)}
-            reminders={reminders} checklistChecks={checklistChecks}
+            reminders={reminders} checklistChecks={checklistChecks} medications={medications}
             onAddReminder={(i) => handleAdd('reminders', i)}
             onUpdateReminder={(id, i) => handleUpdate('reminders', id, i)}
             onDeleteReminder={(id) => handleDelete('reminders', id)}
             onCompleteReminder={handleCompleteReminder}
             onSnoozeReminder={handleSnoozeReminder}
             onToggleChecklistItem={handleToggleChecklistItem}
+            onAddMedication={(i) => handleAdd('medications', i)}
+            onUpdateMedication={(id, i) => handleUpdate('medications', id, i)}
+            onDeleteMedication={(id) => handleDelete('medications', id)}
           />
         )}
       </main>
@@ -312,12 +324,17 @@ export default function App() {
 }
 
 // --- Dashboard ---
-function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueReminders = [], onViewReminders, onViewRotation }) {
+function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueReminders = [], refillDueMedications = [], onViewReminders, onViewRotation }) {
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
-      {overdueReminders.length > 0 && (
+      {(overdueReminders.length > 0 || refillDueMedications.length > 0) && (
         <button onClick={onViewReminders} className="w-full flex items-center justify-between gap-3 bg-red-50 border border-red-100 rounded-2xl px-4 py-3 text-sm text-left active:scale-95 transition-all">
-          <span className="flex items-center gap-2 font-bold text-red-800"><AlertOctagon size={16}/> {overdueReminders.length} overdue maintenance {overdueReminders.length > 1 ? 'reminders' : 'reminder'}</span>
+          <span className="flex items-center gap-2 font-bold text-red-800">
+            <AlertOctagon size={16}/>
+            {overdueReminders.length > 0 && <>{overdueReminders.length} overdue maintenance {overdueReminders.length > 1 ? 'reminders' : 'reminder'}</>}
+            {overdueReminders.length > 0 && refillDueMedications.length > 0 && <> · </>}
+            {refillDueMedications.length > 0 && <>{refillDueMedications.length} medication{refillDueMedications.length > 1 ? 's' : ''} due for refill</>}
+          </span>
           <ChevronRight size={16} className="text-red-400"/>
         </button>
       )}
@@ -605,12 +622,15 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
 }
 
 // --- Inventory Manager (Reused for Shop) ---
-function InventoryManager({ title, items, shoppingList = [], stats, settings, onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onBuy, isShoppingMode }) {
+function InventoryManager({ title, items, shoppingList = [], stats, settings, kits = [], onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onBuy, isShoppingMode, onAddKit, onUpdateKit, onDeleteKit }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
   const [sortBy, setSortBy] = useState(''); // 'expiry', 'calories', 'date'
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [groupBy, setGroupBy] = useState('category'); // 'category', 'location', 'kit'
+  const [locationFilter, setLocationFilter] = useState('');
+  const [kitFilter, setKitFilter] = useState('');
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [formError, setFormError] = useState(null);
   const [bulkCategory, setBulkCategory] = useState('');
@@ -618,11 +638,11 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
   const [bulkQuantityValue, setBulkQuantityValue] = useState('');
 
   const [form, setForm] = useState({
-    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: ''
+    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '', location: '', kitId: ''
   });
 
   const reset = () => {
-    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '' });
+    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '', location: '', kitId: '' });
     setEditingItem(null);
     setShowAdd(false);
     setFormError(null);
@@ -691,13 +711,15 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
   const filteredItems = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return items.filter(item => {
-      if (needle && ![item.name, item.category, item.store, item.unit].some(value => String(value || '').toLowerCase().includes(needle))) return false;
+      if (needle && ![item.name, item.category, item.store, item.unit, item.location].some(value => String(value || '').toLowerCase().includes(needle))) return false;
       if (statusFilter === 'expired' && !isExpired(item.expiryDate)) return false;
       if (statusFilter === 'expiring' && (isExpired(item.expiryDate) || !item.expiryDate || new Date(item.expiryDate) > new Date(Date.now() + 30 * 24 * 60 * 60 * 1000))) return false;
       if (statusFilter === 'low' && Number(item.quantity || 0) >= Number(item.target || 1) * 0.25) return false;
+      if (!isShoppingMode && locationFilter && (item.location || '') !== locationFilter) return false;
+      if (!isShoppingMode && kitFilter && (item.kitId || '') !== (kitFilter === '__none__' ? '' : kitFilter)) return false;
       return true;
     });
-  }, [items, query, statusFilter]);
+  }, [items, query, statusFilter, locationFilter, kitFilter, isShoppingMode]);
 
   const sortedItems = useMemo(() => {
     let sorted = [...filteredItems];
@@ -711,17 +733,23 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
     return sorted;
   }, [filteredItems, sortBy]);
 
+  // Built as a plain object, not a Map: `Map` here is the lucide-react icon imported above, which
+  // shadows the global constructor within this module.
+  const kitNameById = useMemo(() => Object.fromEntries(kits.map(kit => [kit.id, kit.name])), [kits]);
+  const locations = useMemo(() => [...new Set(items.map(item => item.location).filter(Boolean))].sort(), [items]);
+
   const groupedItems = useMemo(() => {
     const groups = Object.create(null);
     const source = sortedItems;
-
-    if (isShoppingMode) {
-      source.forEach(item => { const s = item.store || 'Uncategorized'; if (!groups[s]) groups[s] = []; groups[s].push(item); });
-    } else {
-      source.forEach(item => { const c = item.category || 'Uncategorized'; if (!groups[c]) groups[c] = []; groups[c].push(item); });
-    }
+    const keyOf = item => {
+      if (isShoppingMode) return item.store || 'Uncategorized';
+      if (groupBy === 'location') return item.location || 'No location set';
+      if (groupBy === 'kit') return item.kitId ? (kitNameById[item.kitId] || 'Unknown kit') : 'Not in a kit';
+      return item.category || 'Uncategorized';
+    };
+    source.forEach(item => { const k = keyOf(item); if (!groups[k]) groups[k] = []; groups[k].push(item); });
     return groups;
-  }, [sortedItems, isShoppingMode]);
+  }, [sortedItems, isShoppingMode, groupBy, kitNameById]);
 
   const waterPct = settings.survivalGoalDays ? Math.min(Math.round((stats.waterDays / settings.survivalGoalDays) * 100), 100) : 0;
   const foodPct = settings.survivalGoalDays ? Math.min(Math.round((stats.foodDays / settings.survivalGoalDays) * 100), 100) : 0;
@@ -741,11 +769,29 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
       </div>
 
       <div className="grid grid-cols-[1fr_auto] gap-2">
-        <input aria-label={`Search ${title.toLowerCase()}`} value={query} onChange={event => setQuery(event.target.value)} placeholder="Search name, category or store" className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-3 text-sm outline-none focus:border-blue-400" />
+        <input aria-label={`Search ${title.toLowerCase()}`} value={query} onChange={event => setQuery(event.target.value)} placeholder="Search name, category, store or location" className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-3 text-sm outline-none focus:border-blue-400" />
         <select aria-label="Filter items" value={statusFilter} onChange={event => setStatusFilter(event.target.value)} className="bg-white border border-slate-200 rounded-2xl px-3 text-xs font-bold">
           <option value="all">All</option><option value="low">Low stock</option><option value="expiring">Expiring</option><option value="expired">Expired</option>
         </select>
       </div>
+      {!isShoppingMode && (
+        <div className="grid grid-cols-3 gap-2">
+          <select aria-label="Group items by" value={groupBy} onChange={event => setGroupBy(event.target.value)} className="bg-white border border-slate-200 rounded-2xl px-2 py-2.5 text-[11px] font-bold">
+            <option value="category">Group: Category</option>
+            <option value="location">Group: Location</option>
+            <option value="kit">Group: Kit</option>
+          </select>
+          <select aria-label="Filter by location" value={locationFilter} onChange={event => setLocationFilter(event.target.value)} className="bg-white border border-slate-200 rounded-2xl px-2 py-2.5 text-[11px] font-bold">
+            <option value="">All locations</option>
+            {locations.map(location => <option key={location} value={location}>{location}</option>)}
+          </select>
+          <select aria-label="Filter by kit" value={kitFilter} onChange={event => setKitFilter(event.target.value)} className="bg-white border border-slate-200 rounded-2xl px-2 py-2.5 text-[11px] font-bold">
+            <option value="">All kits</option>
+            <option value="__none__">Not in a kit</option>
+            {kits.map(kit => <option key={kit.id} value={kit.id}>{kit.name}</option>)}
+          </select>
+        </div>
+      )}
       {selectedIds.size > 0 && (
         <div className="bg-blue-50 border border-blue-100 rounded-2xl px-4 py-3 text-sm space-y-3">
           <div className="flex items-center justify-between gap-3">
@@ -825,6 +871,18 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
               <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={categories} /></div>
 
               {isShoppingMode && <div className="col-span-2"><Label>Store</Label><Input val={form.store} set={v => setForm({...form, store: v})} placeholder="e.g. Costco" /></div>}
+              {!isShoppingMode && (
+                <>
+                  <div><Label>Location (optional)</Label><Input val={form.location} set={v => setForm({...form, location: v})} placeholder="e.g. Basement, Go-bag, Vehicle" /></div>
+                  <div>
+                    <Label>Kit (optional)</Label>
+                    <select className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none border border-transparent" value={form.kitId} onChange={e => setForm({...form, kitId: e.target.value})}>
+                      <option value="">Unassigned</option>
+                      {kits.map(kit => <option key={kit.id} value={kit.id}>{kit.name}</option>)}
+                    </select>
+                  </div>
+                </>
+              )}
 
               <div className="col-span-2">
                 <Label>Barcode (optional)</Label>
@@ -886,6 +944,8 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
         </div>
       )}
 
+      {!isShoppingMode && <KitsSection kits={kits} inventory={items} onAdd={onAddKit} onUpdate={onUpdateKit} onDelete={onDeleteKit} />}
+
       {isShoppingMode && (
          <div className="bg-emerald-50 border border-emerald-100 rounded-[2.5rem] p-5 shadow-sm flex items-center justify-between mb-6">
            <div>
@@ -925,6 +985,98 @@ function InventoryManager({ title, items, shoppingList = [], stats, settings, on
         )}
       </div>
     </div>
+  );
+}
+
+// --- Storage kits (go-bag, basement, vehicle, ...) ---
+const emptyKitForm = () => ({ name: '', purpose: '', targetContents: [] });
+
+function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState(emptyKitForm);
+
+  const reset = () => { setForm(emptyKitForm()); setEditingId(null); setShowAdd(false); };
+  const updateRow = (i, patch) => setForm(prev => ({...prev, targetContents: prev.targetContents.map((row, idx) => idx === i ? {...row, ...patch} : row)}));
+  const removeRow = (i) => setForm(prev => ({...prev, targetContents: prev.targetContents.filter((_, idx) => idx !== i)}));
+  const addRow = () => setForm(prev => ({...prev, targetContents: [...prev.targetContents, { name: '', quantity: 1, unit: 'units' }]}));
+
+  const submit = async (e) => {
+    e.preventDefault();
+    const data = {
+      name: form.name, purpose: form.purpose,
+      targetContents: form.targetContents.filter(row => String(row.name || '').trim()).map(row => ({ name: row.name.trim(), quantity: Number(row.quantity) || 0, unit: row.unit || 'units' })),
+    };
+    if (editingId) { if (!await onUpdate(editingId, data)) return; }
+    else if (!await onAdd(data)) return;
+    reset();
+  };
+  const handleEdit = (kit) => {
+    setForm({ name: kit.name, purpose: kit.purpose, targetContents: kit.targetContents.map(row => ({...row})) });
+    setEditingId(kit.id);
+    setShowAdd(true);
+  };
+
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm mb-6">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest flex items-center gap-2"><Layers size={14}/> Kits</h3>
+        <button aria-label={showAdd ? 'Cancel adding kit' : 'Add kit'} onClick={() => showAdd ? reset() : setShowAdd(true)} className="bg-slate-900 text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase flex items-center gap-1">
+          {showAdd ? 'Cancel' : <><Plus size={14}/> Add Kit</>}
+        </button>
+      </div>
+
+      {showAdd && (
+        <form onSubmit={submit} className="space-y-3 bg-slate-50 rounded-2xl p-5 mb-4">
+          <div className="flex justify-between items-center">
+            <h4 className="text-[10px] font-black uppercase text-blue-600">{editingId ? 'Edit Kit' : 'New Kit'}</h4>
+            {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
+          </div>
+          <div><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Go-bag — Dad" /></div>
+          <div><Label>Purpose (optional)</Label><Input val={form.purpose} set={v => setForm({...form, purpose: v})} placeholder="e.g. Grab-and-go bag for evacuation" /></div>
+          <div>
+            <Label>Target contents</Label>
+            <div className="space-y-2">
+              {form.targetContents.map((row, i) => (
+                <div key={i} className="flex gap-2 items-center">
+                  <div className="flex-1"><Input val={row.name} set={v => updateRow(i, {name: v})} placeholder="Item name" /></div>
+                  <div className="w-16"><Input val={row.quantity} set={v => updateRow(i, {quantity: v})} type="number" /></div>
+                  <div className="w-20"><Input val={row.unit} set={v => updateRow(i, {unit: v})} placeholder="unit" /></div>
+                  <button type="button" aria-label={`Remove ${row.name || 'target item'}`} onClick={() => removeRow(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
+                </div>
+              ))}
+              {form.targetContents.length === 0 && <p className="text-xs text-slate-500">No target items yet — the kit is "ready" once at least one item is assigned to it.</p>}
+            </div>
+            <button type="button" onClick={addRow} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1 mt-2"><Plus size={12}/> Add target item</button>
+          </div>
+          <button type="submit" className="w-full bg-blue-600 text-white py-3 rounded-xl font-black text-sm">{editingId ? 'Save Changes' : 'Add Kit'}</button>
+        </form>
+      )}
+
+      <div className="space-y-3">
+        {kits.map(kit => {
+          const completeness = kitCompleteness(kit, inventory);
+          const ready = completeness.percent >= 100;
+          return (
+            <div key={kit.id} className="border border-slate-200 rounded-2xl p-4 cursor-pointer" onClick={() => handleEdit(kit)}>
+              <div className="flex justify-between items-center gap-3">
+                <div className="min-w-0">
+                  <div className="font-black text-slate-800 text-sm truncate">{kit.name}</div>
+                  {kit.purpose && <div className="text-[10px] text-slate-500 truncate">{kit.purpose}</div>}
+                </div>
+                <div className={`text-[10px] font-black uppercase shrink-0 ${ready ? 'text-emerald-600' : 'text-amber-600'}`}>
+                  {completeness.totalCount > 0 ? `${completeness.metCount}/${completeness.totalCount} packed` : `${completeness.assignedCount} item${completeness.assignedCount === 1 ? '' : 's'}`}
+                </div>
+              </div>
+              <div className="mt-3 h-2 bg-slate-100 rounded-full overflow-hidden">
+                <div className={`h-full ${ready ? 'bg-emerald-500' : 'bg-amber-500'}`} style={{width: `${completeness.percent}%`}}/>
+              </div>
+            </div>
+          );
+        })}
+        {kits.length === 0 && !showAdd && <p className="text-center py-6 text-slate-600 text-xs font-bold uppercase tracking-widest">No kits yet</p>}
+      </div>
+    </section>
   );
 }
 
@@ -1042,7 +1194,7 @@ function ContactsSection({ contacts, isEditing, onChange }) {
   );
 }
 
-function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder, reminders = [], checklistChecks = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem }) {
+function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder, reminders = [], checklistChecks = [], medications = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem, onAddMedication, onUpdateMedication, onDeleteMedication }) {
   const [isEditing, setIsEditing] = useState(false);
   const [spot, setSpot] = useState(plan?.shelterSpot || '');
   const [family, setFamily] = useState(plan?.family || []);
@@ -1149,6 +1301,7 @@ function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder
       <ContactsSection contacts={isEditing ? contacts : (plan?.contacts || [])} isEditing={isEditing} onChange={setContacts} />
 
       <RemindersSection reminders={reminders} onAdd={onAddReminder} onUpdate={onUpdateReminder} onDelete={onDeleteReminder} onComplete={onCompleteReminder} onSnooze={onSnoozeReminder} />
+      <MedicationsSection medications={medications} onAdd={onAddMedication} onUpdate={onUpdateMedication} onDelete={onDeleteMedication} />
       <ChecklistsSection checklistChecks={checklistChecks} onToggle={onToggleChecklistItem} />
 
       {/* Survival Sync Links Moved Here */}
@@ -1283,6 +1436,84 @@ function ReminderHistoryPanel() {
         </ul>
       )}
     </div>
+  );
+}
+
+// --- Medications and prescriptions ---
+const emptyMedicationForm = () => ({ person: '', name: '', dose: '', quantityOnHand: '', refillDate: '', prescriber: '', notes: '' });
+
+function MedicationsSection({ medications, onAdd, onUpdate, onDelete }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState(emptyMedicationForm);
+
+  const reset = () => { setForm(emptyMedicationForm()); setEditingId(null); setShowAdd(false); };
+  const submit = async (e) => {
+    e.preventDefault();
+    const data = { ...form, quantityOnHand: Number(form.quantityOnHand) || 0 };
+    if (editingId) { if (!await onUpdate(editingId, data)) return; }
+    else if (!await onAdd(data)) return;
+    reset();
+  };
+  const handleEdit = (medication) => {
+    setForm({ person: medication.person, name: medication.name, dose: medication.dose, quantityOnHand: medication.quantityOnHand, refillDate: medication.refillDate, prescriber: medication.prescriber, notes: medication.notes });
+    setEditingId(medication.id);
+    setShowAdd(true);
+  };
+
+  const sorted = useMemo(() => [...medications].sort((a, b) => (a.refillDate || '9999-99-99').localeCompare(b.refillDate || '9999-99-99')), [medications]);
+
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest flex items-center gap-2"><Shield size={14}/> Medications</h3>
+        <button aria-label={showAdd ? 'Cancel adding medication' : 'Add medication'} onClick={() => showAdd ? reset() : setShowAdd(true)} className="bg-slate-900 text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase flex items-center gap-1">
+          {showAdd ? 'Cancel' : <><Plus size={14}/> Add</>}
+        </button>
+      </div>
+
+      {showAdd && (
+        <form onSubmit={submit} className="space-y-3 bg-slate-50 rounded-2xl p-5 mb-4">
+          <div className="flex justify-between items-center">
+            <h4 className="text-[10px] font-black uppercase text-blue-600">{editingId ? 'Edit Medication' : 'New Medication'}</h4>
+            {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
+          </div>
+          <div><Label>Medication name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Lisinopril" /></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Person</Label><Input val={form.person} set={v => setForm({...form, person: v})} placeholder="Who takes this" /></div>
+            <div><Label>Dose</Label><Input val={form.dose} set={v => setForm({...form, dose: v})} placeholder="e.g. 10mg daily" /></div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Quantity on hand</Label><Input val={form.quantityOnHand} set={v => setForm({...form, quantityOnHand: v})} type="number" /></div>
+            <div><Label>Refill date</Label><Input val={form.refillDate} set={v => setForm({...form, refillDate: v})} type="date" /></div>
+          </div>
+          <div><Label>Prescriber (optional)</Label><Input val={form.prescriber} set={v => setForm({...form, prescriber: v})} placeholder="Doctor or pharmacy" /></div>
+          <div><Label>Notes (optional)</Label><Input val={form.notes} set={v => setForm({...form, notes: v})} placeholder="Any details" /></div>
+          <button type="submit" className="w-full bg-blue-600 text-white py-3 rounded-xl font-black text-sm">{editingId ? 'Save Changes' : 'Add Medication'}</button>
+        </form>
+      )}
+
+      <div className="space-y-3">
+        {sorted.map(medication => {
+          const dueForRefill = isMedicationRefillDue(medication);
+          return (
+            <div key={medication.id} className={`border p-4 rounded-2xl cursor-pointer ${dueForRefill ? 'bg-red-50 border-red-200' : 'bg-white border-slate-200'}`} onClick={() => handleEdit(medication)}>
+              <div className="flex items-center gap-3 min-w-0">
+                <div className={`p-2.5 rounded-xl shrink-0 ${dueForRefill ? 'bg-red-100 text-red-600' : 'bg-slate-100 text-slate-600'}`}><Shield size={20}/></div>
+                <div className="min-w-0">
+                  <div className="font-black text-slate-800 text-sm truncate">{medication.name}{medication.dose ? ` — ${medication.dose}` : ''}</div>
+                  <div className="text-[10px] font-bold text-slate-600 uppercase">{[medication.person, `${medication.quantityOnHand} on hand`].filter(Boolean).join(' • ')}</div>
+                  <div className={`text-[10px] font-black uppercase mt-0.5 ${dueForRefill ? 'text-red-600' : 'text-slate-500'}`}>
+                    {medication.refillDate ? (dueForRefill ? `Refill due since ${medication.refillDate}` : `Refill by ${medication.refillDate}`) : 'No refill date set'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {medications.length === 0 && !showAdd && <p className="text-center py-6 text-slate-600 text-xs font-bold uppercase tracking-widest">No medications tracked yet</p>}
+      </div>
+    </section>
   );
 }
 
@@ -1521,7 +1752,7 @@ function formatRelativeTime(timestamp) {
 // memory (which itself came from the local cache when offline), with nothing fetched here.
 // Replaces the normal app shell entirely while open, so printing needs no print stylesheet to
 // hide anything else — this is the only content on the page.
-export function EmergencyBinder({ plan, inventory = [], stats, settings, checklistChecks = [], onClose }) {
+export function EmergencyBinder({ plan, inventory = [], stats, settings, checklistChecks = [], medications = [], onClose }) {
   const checkedIds = useMemo(() => new Set(checklistChecks.map(c => c.id)), [checklistChecks]);
   const categoryCounts = useMemo(() => {
     const counts = {};
@@ -1571,6 +1802,20 @@ export function EmergencyBinder({ plan, inventory = [], stats, settings, checkli
         {contacts.length === 0 ? <p className="text-sm text-slate-500">None recorded.</p> : (
           <ul className="text-sm space-y-1">
             {contacts.map((c, i) => <li key={i}>{c.name}{c.type ? ` (${c.type})` : ''} — {c.phone || 'no phone on file'}</li>)}
+          </ul>
+        )}
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Medications</h2>
+        {medications.length === 0 ? <p className="text-sm text-slate-500">None recorded.</p> : (
+          <ul className="text-sm space-y-1">
+            {medications.map(m => (
+              <li key={m.id}>
+                {m.name}{m.dose ? ` (${m.dose})` : ''} — {m.person || 'Unassigned'}, {m.quantityOnHand} on hand
+                {m.refillDate ? `, refill by ${m.refillDate}` : ''}{m.prescriber ? `, ${m.prescriber}` : ''}
+              </li>
+            ))}
           </ul>
         )}
       </section>

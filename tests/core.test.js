@@ -1,11 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema } from '../shared/schema.js';
+import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema, planSchema, kitSchema, medicationSchema } from '../shared/schema.js';
+import { nextReminderDueDate, effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, addDaysISO } from '../shared/reminders.js';
+import { kitCompleteness } from '../shared/kits.js';
+import { checklistCatalog } from '../shared/checklists.js';
+import { categories } from '../shared/schema.js';
 import { token, validSession, hashPassword, verifyPassword, hashToken, randomToken, cookie, sameOrigin } from '../server/auth.js';
 import { createHandler } from '../api/hub.js';
 import { createHandler as createSessionHandler } from '../api/session.js';
 import { createHandler as createMembersHandler } from '../api/members.js';
 import { createHandler as createInviteHandler } from '../api/invite.js';
+import { createHandler as createPasswordResetHandler } from '../api/password-reset.js';
+import { createHandler as createPasswordHandler } from '../api/password.js';
+import { createHandler as createReminderHistoryHandler } from '../api/reminder-history.js';
+import { createHandler as createReadinessHistoryHandler } from '../api/readiness-history.js';
+import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds, daysUntilExpiry, expirationQueue, expirationSummary, deriveBurnRate, consumptionForecast } from '../shared/readiness.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
 process.env.DATABASE_URL='postgres://test-only/db';
 const item={id:'rice',name:'Rice',quantity:2,category:'Food'};
@@ -26,6 +35,14 @@ test('backup merge is repeatable and preserves existing records',()=>{
   assert.equal(once.inventory.length,2);
   assert.equal(once.plan.shelterSpot,'Basement');
 });
+test('backups carry kits and medications, merging by ID like every other collection',()=>{
+  let state=applyAction(emptyState(),{type:'add',collection:'kits',id:'k1',item:{name:'Existing kit'}});
+  const backup=normalizeBackup({kits:[{id:'k1',name:'Updated kit'},{name:'New kit'}],medications:[{name:'Lisinopril'}]},()=> 'generated-id');
+  const merged=applyAction(state,{type:'import',backup});
+  assert.equal(merged.kits.find(k=>k.id==='k1').name,'Updated kit');
+  assert.equal(merged.kits.length,2);
+  assert.equal(merged.medications[0].id,'generated-id');
+});
 test('settings are validated, persisted and used by imports',()=>{
   const updated=applyAction(emptyState(),{type:'settings',settings:{householdSize:'6',survivalGoalDays:'30'}});
   assert.equal(updated.settings.householdSize,6);
@@ -44,6 +61,65 @@ test('item schema validates barcode and recurringDays, defaulting both when abse
   assert.equal(itemSchema.parse({...base,recurringDays:'30'}).recurringDays,30);
   assert.throws(()=>itemSchema.parse({...base,barcode:'not valid!'}));
   assert.throws(()=>itemSchema.parse({...base,recurringDays:-1}));
+});
+test('item schema defaults location and kitId to blank, and accepts a valid kit reference',()=>{
+  const base={id:'x',name:'Rice'};
+  assert.equal(itemSchema.parse(base).location,'');
+  assert.equal(itemSchema.parse(base).kitId,'');
+  assert.equal(itemSchema.parse({...base,location:'Basement',kitId:'go-bag'}).kitId,'go-bag');
+  assert.throws(()=>itemSchema.parse({...base,kitId:'has a space'}));
+});
+test('kit schema validates target contents and defaults them to an empty list',()=>{
+  assert.deepEqual(kitSchema.parse({id:'k1',name:'Go-bag'}).targetContents,[]);
+  const kit=kitSchema.parse({id:'k1',name:'Go-bag',purpose:'Evacuation',targetContents:[{name:'Flashlight',quantity:1}]});
+  assert.equal(kit.targetContents[0].unit,'units');
+  assert.throws(()=>kitSchema.parse({id:'k1',name:'Go-bag',targetContents:[{name:'',quantity:1}]}));
+});
+test('medication schema requires a name and defaults the rest',()=>{
+  const med=medicationSchema.parse({id:'m1',name:'Lisinopril'});
+  assert.equal(med.person,'');
+  assert.equal(med.quantityOnHand,0);
+  assert.equal(med.refillDate,'');
+  assert.throws(()=>medicationSchema.parse({id:'m1',name:''}));
+});
+test('kits and medications go through the same generic add/update/delete actions as other collections',()=>{
+  let state=emptyState();
+  state=applyAction(state,{type:'add',collection:'kits',id:'k1',item:{name:'Go-bag',targetContents:[{name:'Flashlight',quantity:1}]}});
+  state=applyAction(state,{type:'add',collection:'medications',id:'m1',item:{name:'Lisinopril',person:'Alex',refillDate:'2026-01-01'}});
+  assert.equal(state.kits[0].name,'Go-bag');
+  assert.equal(state.medications[0].person,'Alex');
+  state=applyAction(state,{type:'update',collection:'medications',id:'m1',item:{quantityOnHand:30}});
+  assert.equal(state.medications[0].quantityOnHand,30);
+  state=applyAction(state,{type:'delete',collection:'kits',id:'k1'});
+  assert.equal(state.kits.length,0);
+  assert.throws(()=>applyAction(state,{type:'update',collection:'kits',id:'missing',item:{name:'x'}}));
+});
+test('kit completeness matches assigned inventory items by name and sums their quantity',()=>{
+  const kit={id:'k1',name:'Go-bag',targetContents:[{name:'Flashlight',quantity:2,unit:'units'},{name:'Water bottle',quantity:1,unit:'units'}]};
+  const inventory=[
+    {id:'a',name:'Flashlight',quantity:1,kitId:'k1'},
+    {id:'b',name:'flashlight',quantity:1,kitId:'k1'}, // case-insensitive match, sums with the row above
+    {id:'c',name:'Water bottle',quantity:0,kitId:'k1'}, // assigned but short of target
+    {id:'d',name:'Tarp',quantity:5,kitId:'other-kit'}, // not assigned to this kit
+  ];
+  const result=kitCompleteness(kit,inventory);
+  assert.equal(result.assignedCount,3);
+  assert.equal(result.metCount,1);
+  assert.equal(result.totalCount,2);
+  assert.equal(result.percent,50);
+  assert.equal(result.contents.find(row=>row.name==='Flashlight').actualQuantity,2);
+});
+test('an empty-target kit reads 0% until at least one item is assigned, then 100%',()=>{
+  const kit={id:'k1',name:'Go-bag',targetContents:[]};
+  assert.equal(kitCompleteness(kit,[]).percent,0);
+  assert.equal(kitCompleteness(kit,[{id:'a',name:'Anything',quantity:1,kitId:'k1'}]).percent,100);
+});
+test('a medication is refill-due once its refill date has passed, and never due with no date on file',()=>{
+  const now=new Date('2026-06-15T12:00:00');
+  assert.equal(isMedicationRefillDue({refillDate:''},now),false);
+  assert.equal(isMedicationRefillDue({refillDate:'2026-06-15'},now),true);
+  assert.equal(isMedicationRefillDue({refillDate:'2026-06-16'},now),false);
+  assert.equal(isMedicationRefillDue({refillDate:'2026-01-01'},now),true);
 });
 test('bulk delete removes only validated IDs from one collection',()=>{
   let state=emptyState();
@@ -93,7 +169,7 @@ test('settings action validates and applies configurable readiness assumptions',
   assert.throws(()=>applyAction(state,{type:'settings',settings:{batteryUsableFraction:1.5}}));
 });
 test('legacy state without stored settings gets defaulted values, and backup import leaves settings untouched',()=>{
-  const legacy=stateSchema.parse({inventory:[],shoppingList:[],appliances:[],plan:null});
+  const legacy=stateSchema.parse({inventory:[],shoppingList:[],appliances:[],reminders:[],checklistChecks:[],plan:null});
   assert.deepEqual(legacy.settings,settingsSchema.parse({}));
   const configured=applyAction(emptyState(),{type:'settings',settings:{householdSize:2}});
   const backup=normalizeBackup({inventory:[item]},()=>'id');
@@ -311,7 +387,99 @@ test('invite API validates tokens, enforces the invited email, and rejects accou
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',email:'invitee@example.com',password:'longenoughpw'}},success);
   assert.equal(success.code,200);assert.equal(success.data.user.id,'new-user-id');assert.match(success.headers['Set-Cookie'],/northstar=/);
 });
-import { waterGallons, isExpired, computeReadiness, isRecurringDue, nextRecurringDate, deriveBurnRate, consumptionForecast } from '../shared/readiness.js';
+test('members API: an owner can generate a single-use reset link for a member',async()=>{
+  const resets=[];
+  const repository={
+    getMembership:async userId=>({'owner-1':{role:'owner'},'member-1':{role:'member'}}[userId]),
+    createPasswordReset:async entry=>{resets.push(entry);},
+  };
+  const asOwner=createMembersHandler(repository,()=>({userId:'owner-1'}));
+  const asMember=createMembersHandler(repository,()=>({userId:'member-1'}));
+
+  const created=response();
+  await asOwner({method:'POST',headers:{'content-type':'application/json'},body:{type:'reset-link',userId:'member-1'}},created);
+  assert.equal(created.code,200);assert.ok(created.data.token);assert.equal(resets.length,1);assert.equal(resets[0].userId,'member-1');
+
+  const missing=response();
+  await asOwner({method:'POST',headers:{'content-type':'application/json'},body:{type:'reset-link',userId:'nobody'}},missing);
+  assert.equal(missing.code,400);
+
+  const denied=response();
+  await asMember({method:'POST',headers:{'content-type':'application/json'},body:{type:'reset-link',userId:'owner-1'}},denied);
+  assert.equal(denied.code,403);
+});
+test('password-reset API validates tokens, rejects expired/used links, and signs the member in on success',async()=>{
+  const future=new Date(Date.now()+3600000).toISOString();
+  const past=new Date(Date.now()-3600000).toISOString();
+  let passwordSet=null;
+  const repository={
+    async rateLimit(){return true;},
+    async findPasswordResetByTokenHash(hash){
+      if(hash===hashToken('good-token')) return {id:'reset-1',user_id:'member-1',email:'member@example.com',expires_at:future,used_at:null};
+      if(hash===hashToken('expired-token')) return {id:'reset-2',user_id:'member-1',email:'member@example.com',expires_at:past,used_at:null};
+      if(hash===hashToken('used-token')) return {id:'reset-3',user_id:'member-1',email:'member@example.com',expires_at:future,used_at:new Date().toISOString()};
+      return undefined;
+    },
+    async getMembership(userId){return userId==='member-1' ? {role:'member'} : undefined;},
+    async resetPassword(entry){passwordSet=entry;},
+  };
+  const handler=createPasswordResetHandler(repository);
+
+  const validCheck=response();
+  await handler({method:'GET',url:'/api/password-reset?token=good-token',headers:{}},validCheck);
+  assert.deepEqual(validCheck.data,{valid:true,email:'member@example.com'});
+
+  const expiredCheck=response();
+  await handler({method:'GET',url:'/api/password-reset?token=expired-token',headers:{}},expiredCheck);
+  assert.equal(expiredCheck.data.valid,false);
+
+  const usedCheck=response();
+  await handler({method:'GET',url:'/api/password-reset?token=used-token',headers:{}},usedCheck);
+  assert.equal(usedCheck.data.valid,false);
+
+  const tooShort=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',password:'short'}},tooShort);
+  assert.equal(tooShort.code,400);
+
+  const expiredSubmit=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'expired-token',password:'longenoughpw'}},expiredSubmit);
+  assert.equal(expiredSubmit.code,410);
+
+  const success=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',password:'longenoughpw'}},success);
+  assert.equal(success.code,200);assert.equal(success.data.user.id,'member-1');assert.match(success.headers['Set-Cookie'],/northstar=/);
+  assert.equal(passwordSet.userId,'member-1');
+
+  const limited=response();
+  await createPasswordResetHandler({...repository,async rateLimit(){return false;}})({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',password:'longenoughpw'}},limited);
+  assert.equal(limited.code,429);
+});
+test('password API lets a signed-in user change their own password after re-entering the current one',async()=>{
+  const hash=hashPassword('old-password');
+  let updated=null;
+  const repository={
+    async rateLimit(){return true;},
+    async findCredentialsById(userId){return userId==='user-1' ? {id:'user-1',email:'me@example.com',password_hash:hash} : undefined;},
+    async setPassword(userId,passwordHash){updated={userId,passwordHash};},
+  };
+  const handler=createPasswordHandler(repository,()=>({userId:'user-1'}));
+
+  const wrongCurrent=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'nope',newPassword:'new-password-123'}},wrongCurrent);
+  assert.equal(wrongCurrent.code,401);assert.equal(updated,null);
+
+  const success=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},success);
+  assert.equal(success.code,200);assert.equal(updated.userId,'user-1');assert.ok(verifyPassword('new-password-123',updated.passwordHash));
+
+  const unauthenticated=response();
+  await createPasswordHandler(repository,()=>false)({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},unauthenticated);
+  assert.equal(unauthenticated.code,401);
+
+  const limited=response();
+  await createPasswordHandler({...repository,async rateLimit(){return false;}},()=>({userId:'user-1'}))({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},limited);
+  assert.equal(limited.code,429);
+});
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{
   assert.equal(waterGallons({quantity:3.785411784,unit:'liters'}),1);
   assert.equal(waterGallons({quantity:10,unit:'bottles'}),0);
@@ -339,6 +507,269 @@ test('readiness needs scale with configurable household size and per-person rate
   assert.equal(solo.foodDays,10);assert.equal(family.foodDays,2.5);
   assert.equal(solo.dailyWaterNeed,1);assert.equal(family.dailyWaterNeed,4);
   assert.equal(solo.waterDays,8);assert.equal(family.waterDays,2);
+});
+import { supplyTemplateCatalog, templateScales, scaleTemplateQuantity, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
+test('starter template catalog has unique IDs and valid, scalable items throughout',()=>{
+  const ids=supplyTemplateCatalog.map(t=>t.id);
+  assert.ok(ids.length>0);
+  assert.equal(new Set(ids).size,ids.length);
+  for (const template of supplyTemplateCatalog) {
+    assert.ok(template.label&&template.description);
+    assert.ok(template.items.length>0);
+    assert.equal(new Set(template.items.map(i=>i.id)).size,template.items.length);
+    for (const item of template.items) {
+      assert.ok(templateScales.includes(item.scale),`${item.id} has scale ${item.scale}`);
+      assert.ok(categories.includes(item.category),`${item.id} has category ${item.category}`);
+      assert.ok(Number(item.quantity)>0);
+    }
+  }
+});
+test('every starter template produces rows the item schema accepts',()=>{
+  const settings=settingsSchema.parse({householdSize:3,survivalGoalDays:7});
+  for (const template of supplyTemplateCatalog) {
+    const backup=normalizeBackup(templateToBackup(template,settings),()=>'unused');
+    assert.equal(backup.inventory.length,template.items.length);
+    for (const row of backup.inventory) assert.doesNotThrow(()=>itemSchema.parse(row));
+  }
+});
+test('template quantities scale by household size and survival goal, and round up',()=>{
+  const small=settingsSchema.parse({householdSize:1,survivalGoalDays:3});
+  const large=settingsSchema.parse({householdSize:4,survivalGoalDays:14});
+  const perPersonPerDay={scale:'perPersonPerDay',quantity:1};
+  assert.equal(scaleTemplateQuantity(perPersonPerDay,small),3);
+  assert.equal(scaleTemplateQuantity(perPersonPerDay,large),56);
+  const perPerson={scale:'perPerson',quantity:2};
+  assert.equal(scaleTemplateQuantity(perPerson,small),2);
+  assert.equal(scaleTemplateQuantity(perPerson,large),8);
+  // A fixed line is one per household however large, and the survival goal does not touch it.
+  const fixed={scale:'fixed',quantity:1};
+  assert.equal(scaleTemplateQuantity(fixed,small),1);
+  assert.equal(scaleTemplateQuantity(fixed,large),1);
+  // Fractional lines round up rather than down, and never below one.
+  assert.equal(scaleTemplateQuantity({scale:'perPersonPerDay',quantity:0.15},large),9);
+  assert.equal(scaleTemplateQuantity({scale:'perPersonPerDay',quantity:0.01},small),1);
+});
+test('applying a starter template is non-destructive and repeatable',()=>{
+  const settings=settingsSchema.parse({householdSize:2,survivalGoalDays:7});
+  const template=findSupplyTemplate('water-and-food');
+  assert.ok(template);
+  assert.equal(findSupplyTemplate('no-such-template'),null);
+  let state=applyAction(emptyState(),{type:'add',collection:'inventory',id:'mine',item:{name:'My own rice',quantity:5,category:'Food'}});
+  const backup=normalizeBackup(templateToBackup(template,settings),()=>'unused');
+  const once=applyAction(state,{type:'import',backup});
+  // The household's own row survives untouched alongside the template's rows.
+  assert.equal(once.inventory.find(row=>row.id==='mine').quantity,5);
+  assert.equal(once.inventory.length,1+template.items.length);
+  // Applying the same template again merges by ID instead of duplicating every line.
+  const twice=applyAction(once,{type:'import',backup});
+  assert.deepEqual(twice,once);
+});
+test('a template seeds its restock target so new rows do not read as low stock',()=>{
+  const settings=settingsSchema.parse({householdSize:2,survivalGoalDays:7});
+  const backup=templateToBackup(findSupplyTemplate('first-aid'),settings);
+  for (const row of backup.inventory) assert.equal(row.target,row.quantity);
+  const stats=computeReadiness({inventory:normalizeBackup(backup,()=>'x').inventory,appliances:[]},settings);
+  assert.equal(stats.lowStock,0);
+});
+import { simulateOutage, outageResources, appliancePriorities } from '../shared/outage.js';
+const outageState={
+  inventory:[
+    {id:'w',name:'Water',category:'Water',quantity:20,unit:'gal'},
+    {id:'b',name:'Battery',category:'Power',quantity:1,capacityPerUnit:10},
+    {id:'f',name:'Propane',category:'Fuel',quantity:2,hoursPerUnit:12},
+  ],
+  appliances:[
+    {id:'fridge',name:'Fridge',watts:150,hours:24,active:true,priority:'critical'},
+    {id:'tv',name:'TV',watts:100,hours:5,active:true,priority:'low'},
+    {id:'heater',name:'Space heater',watts:1500,hours:4,active:true,priority:'normal'},
+    {id:'off',name:'Unplugged',watts:900,hours:8,active:false,priority:'low'},
+  ],
+  plan:null,
+};
+test('outage resources count usable stored power and ignore inactive appliances',()=>{
+  const settings=settingsSchema.parse({householdSize:2,batteryUsableFraction:0.5,inverterEfficiency:0.5});
+  const resources=outageResources(outageState,settings);
+  // 10 kWh nameplate derated by depth-of-discharge and inverter loss.
+  assert.equal(resources.powerKwh,2.5);
+  // Fridge 3.6 + TV 0.5 + heater 6.0 kWh/day; the unplugged 7.2 kWh device is excluded.
+  assert.equal(resources.dailyLoadKwh,10.1);
+  assert.equal(resources.waterGallons,20);
+  assert.equal(resources.fuelHours,24);
+  assert.equal(resources.dailyWaterNeed,2);
+});
+test('outage resources exclude expired water but still count fuel',()=>{
+  const settings=settingsSchema.parse({});
+  const state={inventory:[
+    {id:'w1',name:'Fresh',category:'Water',quantity:5,unit:'gal',expiryDate:'2099-01-01'},
+    {id:'w2',name:'Lapsed',category:'Water',quantity:5,unit:'gal',expiryDate:'2020-01-01'},
+    {id:'f',name:'Old propane',category:'Fuel',quantity:1,hoursPerUnit:10,expiryDate:'2020-01-01'},
+  ],appliances:[],plan:null};
+  const resources=outageResources(state,settings);
+  assert.equal(resources.waterGallons,5);
+  // Propane does not spoil, so a past date does not remove it from the drawdown.
+  assert.equal(resources.fuelHours,10);
+});
+test('outage simulation reports what runs out first and when',()=>{
+  const settings=settingsSchema.parse({householdSize:2,batteryUsableFraction:1,inverterEfficiency:1});
+  const result=simulateOutage(outageState,settings,{hours:72});
+  // Power: 10 kWh at 10.1 kWh/day ~= 23.8h. Fuel: 24h. Water: 20 gal at 2 gal/day = 240h.
+  assert.equal(result.firstExhausted.key,'power');
+  assert.ok(result.firstExhausted.runwayHours<24);
+  assert.equal(result.survives,false);
+  assert.deepEqual(result.runways.map(r=>r.key),['power','fuel','water']);
+  // The timeline ends exactly at the requested duration and never goes negative.
+  assert.equal(result.timeline.at(-1).hour,72);
+  assert.equal(result.timeline.at(-1).power,0);
+  assert.equal(result.timeline[0].water,20);
+  assert.ok(result.timeline.every(point=>point.power>=0&&point.fuel>=0&&point.water>=0));
+});
+test('a resource nothing consumes never runs out',()=>{
+  const settings=settingsSchema.parse({householdSize:2,waterGallonsPerPersonPerDay:0});
+  const result=simulateOutage({inventory:outageState.inventory,appliances:[],plan:null},settings,{hours:48});
+  // No appliances and no water need: only fuel is being drawn down, and it lasts 24 of the 48h.
+  assert.deepEqual(result.runways.map(r=>r.key),['fuel']);
+  assert.equal(result.firstExhausted.key,'fuel');
+  assert.equal(result.survives,false);
+  // Stored power and water are untouched because nothing consumes them.
+  assert.equal(result.timeline.at(-1).water,20);
+  assert.equal(result.timeline.at(-1).power,result.timeline[0].power);
+});
+test('load shedding drops least essential loads first and the hungriest within a tier',()=>{
+  const settings=settingsSchema.parse({batteryUsableFraction:1,inverterEfficiency:1});
+  const result=simulateOutage(outageState,settings,{hours:48});
+  // 10 kWh over 48h allows 5 kWh/day. Shedding the low-priority TV leaves 9.6, still too much,
+  // so the normal-priority heater goes next; the critical fridge is never shed.
+  assert.deepEqual(result.shedding.shed.map(a=>a.id),['tv','heater']);
+  assert.ok(Math.abs(result.shedding.remainingDailyLoadKwh-3.6)<1e-9);
+  // The critical fridge survived the plan, so no critical-load warning is raised.
+  assert.equal(result.shedding.shedsCritical,false);
+});
+test('load shedding warns when reaching the duration costs a critical load',()=>{
+  const settings=settingsSchema.parse({batteryUsableFraction:1,inverterEfficiency:1});
+  const state={inventory:[{id:'b',name:'Battery',category:'Power',quantity:1,capacityPerUnit:0.1}],appliances:outageState.appliances,plan:null};
+  const result=simulateOutage(state,settings,{hours:240});
+  // Every active appliance has to go, lowest priority first and critical last -- which is the
+  // warning worth surfacing, since shedding everything trivially "reaches" any duration.
+  assert.deepEqual(result.shedding.shed.map(a=>a.id),['tv','heater','fridge']);
+  assert.equal(result.shedding.shedsCritical,true);
+  assert.equal(result.shedding.remainingDailyLoadKwh,0);
+});
+test('load shedding is empty when stored power already covers the outage',()=>{
+  const settings=settingsSchema.parse({batteryUsableFraction:1,inverterEfficiency:1});
+  const result=simulateOutage(outageState,settings,{hours:12});
+  assert.deepEqual(result.shedding.shed,[]);
+  assert.equal(result.shedding.shedsCritical,false);
+});
+test('appliance priority defaults to normal and rejects unknown levels',()=>{
+  const state=applyAction(emptyState(),{type:'add',collection:'appliances',id:'fan',item:{name:'Fan',watts:50,hours:8}});
+  assert.equal(state.appliances[0].priority,'normal');
+  assert.deepEqual(appliancePriorities,['critical','high','normal','low']);
+  assert.throws(()=>applyAction(emptyState(),{type:'add',collection:'appliances',id:'fan',item:{name:'Fan',priority:'urgent'}}));
+});
+test('days until expiry counts whole local calendar days either side of today',()=>{
+  const now=new Date(2026,8,14,23,45);
+  assert.equal(daysUntilExpiry('2026-09-14',now),0);
+  assert.equal(daysUntilExpiry('2026-09-15',now),1);
+  assert.equal(daysUntilExpiry('2026-09-13',now),-1);
+  assert.equal(daysUntilExpiry('',now),null);
+  assert.equal(daysUntilExpiry('not-a-date',now),null);
+});
+test('rotation queue lists unlapsed supplies soonest first inside the 90 day horizon',()=>{
+  const now=new Date(2026,8,14);
+  const inventory=[
+    {id:'far',name:'Far',expiryDate:'2027-04-01'},
+    {id:'mid',name:'Mid',expiryDate:'2026-10-29'},
+    {id:'lapsed',name:'Lapsed',expiryDate:'2026-09-01'},
+    {id:'today',name:'Today',expiryDate:'2026-09-14'},
+    {id:'none',name:'No date',expiryDate:''},
+  ];
+  const queue=expirationQueue(inventory,now);
+  // Soonest first; already-expired, undated and beyond-horizon items are all left out.
+  assert.deepEqual(queue.map(row=>row.item.id),['today','mid']);
+  assert.deepEqual(queue.map(row=>row.daysRemaining),[0,45]);
+  // Each row is tagged with the tightest window it falls inside.
+  assert.deepEqual(queue.map(row=>row.window),[30,60]);
+});
+test('rotation windows count cumulatively so 60 days includes the first 30',()=>{
+  const now=new Date(2026,8,14);
+  const inventory=[
+    {id:'a',name:'A',expiryDate:'2026-09-20'},
+    {id:'b',name:'B',expiryDate:'2026-10-20'},
+    {id:'c',name:'C',expiryDate:'2026-12-10'},
+  ];
+  const {counts,total}=expirationSummary(inventory,now);
+  assert.equal(counts[30],1);
+  assert.equal(counts[60],2);
+  assert.equal(counts[90],3);
+  assert.equal(total,3);
+});
+test('readiness reports an expiring-soon count beside the existing expired count',()=>{
+  const settings=settingsSchema.parse({});
+  const soon=new Date(Date.now()+20*86400000);
+  const iso=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const inventory=[{id:'a',name:'A',category:'Food',quantity:1,expiryDate:iso(soon)},{id:'b',name:'B',category:'Food',quantity:1,expiryDate:'2020-01-01'}];
+  const stats=computeReadiness({inventory,appliances:[]},settings);
+  assert.equal(stats.expiringSoon,1);
+  assert.equal(stats.expired,1);
+});
+test('readiness falls back to household size until a member opts in',()=>{
+  const settings=settingsSchema.parse({householdSize:4});
+  const plan=planSchema.parse({family:[{name:'Ada',role:'Adult',dob:''},{name:'Baz',role:'Child',dob:''}]});
+  // Two members recorded but no figures given: the flat householdSize math still applies, so an
+  // existing household that only ever wrote down names sees no change to its numbers.
+  const needs=householdNeeds(plan,settings);
+  assert.equal(needs.mode,'household');
+  assert.equal(needs.dailyCalorieNeed,8000);
+  assert.equal(needs.dailyWaterNeed,4);
+  assert.deepEqual(householdNeeds(null,settings),needs);
+  const inventory=[{category:'Food',quantity:10,caloriesPerUnit:2000,name:'Rice'}];
+  assert.equal(computeReadiness({inventory,appliances:[],plan},settings).foodDays,2.5);
+});
+test('readiness sums per-member and pet needs once any member carries its own figures',()=>{
+  const settings=settingsSchema.parse({householdSize:4});
+  const plan=planSchema.parse({family:[
+    {name:'Ada',role:'Adult',dob:'',caloriesPerDay:2400,waterGallonsPerDay:1.5},
+    {name:'Baz',role:'Toddler',dob:'',caloriesPerDay:1200},
+    {name:'Cy',role:'Adult',dob:''},
+    {name:'Rex',role:'Dog',dob:'',kind:'pet',caloriesPerDay:700,waterGallonsPerDay:0.25},
+  ]});
+  const needs=householdNeeds(plan,settings);
+  assert.equal(needs.mode,'members');
+  assert.equal(needs.people,3);
+  assert.equal(needs.pets,1);
+  // Ada 2400 + Baz 1200 + Cy at the 2000 default + Rex 700; householdSize 4 is ignored entirely.
+  assert.equal(needs.dailyCalorieNeed,6300);
+  // Ada 1.5 + Baz at the 1 gal default + Cy 1 + Rex 0.25.
+  assert.equal(needs.dailyWaterNeed,3.75);
+  const stats=computeReadiness({inventory:[],appliances:[],plan},settings);
+  assert.equal(stats.needsMode,'members');
+  assert.equal(stats.dailyCalorieNeed,6300);
+});
+test('a pet with no figures counts for nothing but still switches on per-member mode',()=>{
+  const settings=settingsSchema.parse({householdSize:2});
+  const plan=planSchema.parse({family:[{name:'Ada',role:'Adult',dob:''},{name:'Rex',role:'Dog',dob:'',kind:'pet'}]});
+  const needs=householdNeeds(plan,settings);
+  assert.equal(needs.mode,'members');
+  // One person at the defaults; the pet contributes nothing until its own figures are entered.
+  assert.equal(needs.dailyCalorieNeed,2000);
+  assert.equal(needs.dailyWaterNeed,1);
+});
+test('member figures round-trip blank, zero and null distinctly',()=>{
+  const parsed=planSchema.parse({family:[
+    {name:'Ada',role:'',dob:''},
+    {name:'Baz',role:'',dob:'',caloriesPerDay:0,waterGallonsPerDay:0},
+    {name:'Cy',role:'',dob:'',caloriesPerDay:null,waterGallonsPerDay:null},
+  ]});
+  assert.equal(parsed.family[0].caloriesPerDay,'');
+  assert.equal(parsed.family[0].kind,'person');
+  // An explicit zero is a real figure and must not collapse back into "use the default".
+  assert.equal(parsed.family[1].caloriesPerDay,0);
+  // A NULL database column reads back as blank, not as zero.
+  assert.equal(parsed.family[2].caloriesPerDay,'');
+  const settings=settingsSchema.parse({householdSize:3});
+  assert.equal(householdNeeds(parsed,settings).dailyCalorieNeed,2000+0+2000);
+  assert.throws(()=>planSchema.parse({family:[{name:'A',role:'',dob:'',kind:'robot'}]}));
+  assert.throws(()=>planSchema.parse({family:[{name:'A',role:'',dob:'',caloriesPerDay:-5}]}));
 });
 test('readiness guards against divide-by-zero when per-person needs are zero',()=>{
   const inventory=[{category:'Food',quantity:5,caloriesPerUnit:500,name:'Bar'}];
@@ -391,4 +822,160 @@ test('burn rate and depletion forecasts require dated history and use local cale
   assert.equal(forecast.projectedDepletionDate,'2026-09-16');
   assert.equal(forecast.daysRemaining,10/3);
   assert.equal(consumptionForecast(item,[{...events[0],itemId:'other'}],new Date(2026,8,12)).projectedDepletionDate,null);
+});
+
+test('readiness gaps report a shortfall and a shopping suggestion for each unmet goal',()=>{
+  const settings=settingsSchema.parse({householdSize:1,caloriesPerPersonPerDay:2000,waterGallonsPerPersonPerDay:1,survivalGoalDays:14,heatGoalHours:36,powerGoalKwh:20,batteryUsableFraction:0.9,inverterEfficiency:0.9});
+  const stats=computeReadiness({inventory:[],appliances:[]},settings);
+  const gaps=computeReadinessGaps(stats,settings);
+  const byKey=Object.fromEntries(gaps.map(g=>[g.key,g]));
+  assert.equal(byKey.water.met,false);
+  assert.equal(byKey.water.shortfallDays,14);
+  assert.equal(byKey.water.suggestedQuantity,14);
+  assert.equal(byKey.food.met,false);
+  assert.equal(byKey.food.shortfallDays,14);
+  assert.equal(byKey.food.suggestedCalories,28000);
+  assert.equal(byKey.heat.met,false);
+  assert.equal(byKey.heat.shortfallHours,36);
+  assert.equal(byKey.power.met,false);
+  assert.equal(byKey.power.shortfallKwh,20);
+  // Raw stored capacity needed is larger than the usable shortfall, since it still has to survive
+  // battery/inverter derating (see computeReadiness's usablePowerKwh).
+  assert.equal(byKey.power.suggestedRawKwh,Math.ceil(20/(0.9*0.9)));
+});
+test('a fully stocked household reports every readiness gap as met',()=>{
+  const inventory=[
+    {category:'Water',quantity:20,unit:'gal',name:'Water'},
+    {category:'Food',quantity:20,caloriesPerUnit:2000,name:'Rice'},
+    {category:'Fuel',quantity:10,hoursPerUnit:10,name:'Propane'},
+    {category:'Power',quantity:10,capacityPerUnit:10,name:'Battery bank'},
+  ];
+  const settings=settingsSchema.parse({householdSize:1,survivalGoalDays:5,heatGoalHours:10,powerGoalKwh:5});
+  const stats=computeReadiness({inventory,appliances:[]},settings);
+  const gaps=computeReadinessGaps(stats,settings);
+  assert.ok(gaps.every(g=>g.met));
+});
+
+// --- Reminders and seasonal checklists ---
+test('reminder schema validates recurringDays and category, defaulting optional fields',()=>{
+  const base={id:'r1',title:'Rotate water'};
+  assert.equal(reminderSchema.parse(base).category,'Other');
+  assert.equal(reminderSchema.parse(base).recurringDays,90);
+  assert.equal(reminderSchema.parse({...base,category:'Water Rotation',recurringDays:'180'}).recurringDays,180);
+  assert.throws(()=>reminderSchema.parse({...base,category:'Not A Category'}));
+  assert.throws(()=>reminderSchema.parse({...base,recurringDays:0}));
+});
+test('reminders and checklist checks go through the generic add/update/delete collection actions',()=>{
+  let state=emptyState();
+  state=applyAction(state,{type:'add',collection:'reminders',id:'r1',item:{title:'Test generator',category:'Generator Test',recurringDays:30,startDate:'2026-01-01'}});
+  assert.equal(state.reminders[0].title,'Test generator');
+  state=applyAction(state,{type:'update',collection:'reminders',id:'r1',item:{lastCompletedDate:'2026-02-01'}});
+  assert.equal(state.reminders[0].lastCompletedDate,'2026-02-01');
+  state=applyAction(state,{type:'delete',collection:'reminders',id:'r1'});
+  assert.equal(state.reminders.length,0);
+
+  state=applyAction(state,{type:'add',collection:'checklist',id:'winter__insulate-pipes',item:{completedAt:'2026-01-05'}});
+  assert.equal(state.checklistChecks[0].id,'winter__insulate-pipes');
+  state=applyAction(state,{type:'delete',collection:'checklist',id:'winter__insulate-pipes'});
+  assert.equal(state.checklistChecks.length,0);
+});
+test('reminders and checklist checks round-trip through backup export/import',()=>{
+  const backup=normalizeBackup({reminders:[{title:'Rotate water',category:'Water Rotation',recurringDays:90}],checklistChecks:[{completedAt:'2026-01-01'}]},()=>'gen-id');
+  assert.equal(backup.reminders[0].id,'gen-id');
+  const merged=applyAction(emptyState(),{type:'import',backup});
+  assert.equal(merged.reminders.length,1);
+  assert.equal(merged.checklistChecks.length,1);
+});
+test('seasonal checklist catalog has four non-empty seasons with unique item IDs',()=>{
+  const seasons=checklistCatalog.map(s=>s.season);
+  assert.deepEqual(new Set(seasons).size,seasons.length);
+  assert.deepEqual(seasons.sort(),['evacuation','severe_weather','summer','winter']);
+  for (const {items} of checklistCatalog) {
+    assert.ok(items.length>0);
+    assert.equal(new Set(items.map(i=>i.id)).size,items.length);
+  }
+});
+test('a reminder is due recurringDays after its last completion, or after startDate if never completed',()=>{
+  const reminder={recurringDays:30,startDate:'2026-01-01',lastCompletedDate:'',snoozedUntil:''};
+  assert.equal(nextReminderDueDate(reminder),'2026-01-31');
+  assert.equal(isReminderOverdue(reminder,new Date(2026,0,30)),false);
+  assert.equal(isReminderOverdue(reminder,new Date(2026,0,31)),true);
+  const completed={...reminder,lastCompletedDate:'2026-02-01'};
+  assert.equal(nextReminderDueDate(completed),'2026-03-03');
+  assert.equal(nextReminderDueDate({recurringDays:30,startDate:'',lastCompletedDate:'',snoozedUntil:''}),null);
+});
+test('snoozing a reminder postpones its due date but never brings it earlier',()=>{
+  const reminder={recurringDays:30,startDate:'2026-01-01',lastCompletedDate:'',snoozedUntil:''};
+  const due=nextReminderDueDate(reminder);
+  const snoozed={...reminder,snoozedUntil:addDaysISO(due,10)};
+  assert.equal(effectiveReminderDueDate(snoozed),addDaysISO(due,10));
+  assert.equal(isReminderOverdue(snoozed,new Date(2026,0,31)),false);
+  const earlierSnooze={...reminder,snoozedUntil:'2026-01-02'};
+  assert.equal(effectiveReminderDueDate(earlierSnooze),due);
+});
+test('API records reminder completion and snooze history, but not plain field edits',async()=>{
+  let state=applyAction(emptyState(),{type:'add',collection:'reminders',id:'r1',item:{title:'Rotate water',category:'Water Rotation',recurringDays:90,startDate:'2026-01-01'}});
+  let version=0;
+  const historyEvents=[];
+  const repository={
+    async readState(){return {data:structuredClone(state),version};},
+    async compareAndSave(expected,next){if(expected!==version)return undefined;state=next;return ++version;},
+    async logAudit(){},
+    async logReminderHistory(entry){historyEvents.push(entry);},
+  };
+  const handler=createHandler(repository,()=>({userId:'user-1'}));
+
+  const editRes=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'update',collection:'reminders',id:'r1',item:{notes:'brand refreshed'}}},editRes);
+  assert.equal(editRes.code,200);assert.equal(historyEvents.length,0);
+
+  const completeRes=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'update',collection:'reminders',id:'r1',item:{lastCompletedDate:'2026-02-01'}}},completeRes);
+  assert.equal(completeRes.code,200);
+  assert.deepEqual(historyEvents,[{reminderId:'r1',reminderTitle:'Rotate water',category:'Water Rotation',event:'completed',eventDate:'2026-02-01',userId:'user-1'}]);
+
+  const snoozeRes=response();
+  await handler({method:'POST',headers:{'content-type':'application/json'},body:{type:'update',collection:'reminders',id:'r1',item:{snoozedUntil:'2026-02-10'}}},snoozeRes);
+  assert.equal(snoozeRes.code,200);
+  assert.equal(historyEvents.length,2);
+  assert.equal(historyEvents[1].event,'snoozed');
+  assert.equal(historyEvents[1].eventDate,'2026-02-10');
+});
+test('readiness history API enforces membership, method and returns entries',async()=>{
+  const entries=[{day:'2026-09-01',waterDays:3.5,foodDays:7,powerDays:1.2,fuelHours:24,itemCount:12,lowStock:2,expired:1}];
+  const repository={async getMembership(){return {role:'member'};},async listReadinessHistory(){return entries;}};
+  const ok=response();
+  await createReadinessHistoryHandler(repository,()=>({userId:'user-1'}))({method:'GET',headers:{}},ok);
+  assert.equal(ok.code,200);assert.deepEqual(ok.data.entries,entries);
+
+  const denied=response();
+  await createReadinessHistoryHandler({...repository,async getMembership(){return undefined;}},()=>({userId:'user-1'}))({method:'GET',headers:{}},denied);
+  assert.equal(denied.code,403);
+
+  const unauthed=response();
+  await createReadinessHistoryHandler(repository,()=>false)({method:'GET',headers:{}},unauthed);
+  assert.equal(unauthed.code,401);
+
+  const wrongMethod=response();
+  await createReadinessHistoryHandler(repository,()=>({userId:'user-1'}))({method:'POST',headers:{}},wrongMethod);
+  assert.equal(wrongMethod.code,405);
+
+  const broken=response();
+  await createReadinessHistoryHandler({...repository,async listReadinessHistory(){throw new Error('down');}},()=>({userId:'user-1'}))({method:'GET',headers:{}},broken);
+  assert.equal(broken.code,503);
+});
+test('reminder history API enforces membership and returns entries',async()=>{
+  const entries=[{reminderId:'r1',reminderTitle:'Rotate water',category:'Water Rotation',event:'completed',eventDate:'2026-02-01',createdAt:'2026-02-01T00:00:00Z',actorEmail:'a@example.com'}];
+  const repository={async getMembership(){return {role:'member'};},async listReminderHistory(){return entries;}};
+  const ok=response();
+  await createReminderHistoryHandler(repository,()=>({userId:'user-1'}))({method:'GET',headers:{}},ok);
+  assert.equal(ok.code,200);assert.deepEqual(ok.data.entries,entries);
+
+  const denied=response();
+  await createReminderHistoryHandler({...repository,async getMembership(){return undefined;}},()=>({userId:'user-1'}))({method:'GET',headers:{}},denied);
+  assert.equal(denied.code,403);
+
+  const unauthed=response();
+  await createReminderHistoryHandler(repository,()=>false)({method:'GET',headers:{}},unauthed);
+  assert.equal(unauthed.code,401);
 });

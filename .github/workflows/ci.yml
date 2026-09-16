@@ -4,14 +4,36 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Run on demand before a production `npm run db:migrate`, so the migration that is about
+  # to touch production has been proven against a disposable database first.
+  workflow_dispatch:
+  # Vercel reports every preview/staging deployment through this event; see the
+  # staging-smoke-test job below.
+  deployment_status:
 
 permissions:
   contents: read
 
+env:
+  TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+
 jobs:
   verify:
+    if: github.event_name != 'deployment_status'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    # The unit suite includes the migration tests, which create, migrate and drop their own
+    # databases on this server. Nothing here touches a deployed database.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,5 +41,60 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm test
+      - name: Unit and migration tests
+        run: npm test
       - run: npm run build
+
+  browser:
+    if: github.event_name != 'deployment_status'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Accessibility regression suite
+        run: npm run test:e2e
+      - name: Full-app browser flows
+        run: npm run test:e2e:app
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-traces
+          path: test-results/
+          retention-days: 7
+
+  # Fires whenever Vercel reports a deployment as ready (preview builds, and any persistent
+  # staging environment). Confirms the deployment's own database is reachable before anyone
+  # promotes it to production. Skips Production deployments themselves, which serve live
+  # household traffic the moment they go live rather than waiting on a smoke test.
+  staging-smoke-test:
+    if: github.event_name == 'deployment_status' && github.event.deployment_status.state == 'success' && github.event.deployment.environment != 'Production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Smoke test ${{ github.event.deployment_status.environment_url }}
+        # VERCEL_AUTOMATION_BYPASS_SECRET (from Project Settings -> Deployment Protection ->
+        # Protection Bypass for Automation) lets this reach deployments behind Vercel
+        # Authentication; see README. Empty/unset if that secret hasn't been configured yet.
+        env:
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: node scripts/smoketest.js "${{ github.event.deployment_status.environment_url }}"

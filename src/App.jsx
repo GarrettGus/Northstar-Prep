@@ -2,34 +2,25 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Shield, Package, Map, Link as LinkIcon, AlertTriangle, CheckCircle, Plus, Trash2, Home,
   Droplets, Thermometer, Wind, Phone, Navigation, RefreshCw, Settings, Link2, ChevronRight,
-  ClipboardList, Sparkles, Zap, BookOpen, X, Flame, Edit2, Save, History, Utensils,
+  ClipboardList, Zap, BookOpen, X, Flame, Edit2, Save, History, Utensils,
   Database, UploadCloud, Battery, AlertOctagon, Smartphone, FileJson, Download, Upload,
-  Plug, DollarSign, ShoppingCart, Store, ArrowRight, Image as ImageIcon, Layers,
+  Plug, DollarSign, ShoppingCart, Store, ArrowRight, Layers,
   Siren, SearchCheck, Power, Tag, Calendar, ArrowUpDown
 } from 'lucide-react';
 import { request } from './api.js';
-import { computeReadiness, consumptionForecast, isExpired, isRecurringDue } from '../shared/readiness.js';
-import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories } from '../shared/schema.js';
+import { computeReadiness, computeReadinessGaps, consumptionForecast, isExpired, isRecurringDue, expirationQueue } from '../shared/readiness.js';
+import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
+import { backupToCsv, csvToBackupPreview } from '../shared/csv.js';
+import { simulateOutage, appliancePriorities, appliancePriorityLabels } from '../shared/outage.js';
+import { supplyTemplateCatalog, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
+import { effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, todayLocal, addDaysISO } from '../shared/reminders.js';
+import { checklistCatalog } from '../shared/checklists.js';
+import { kitCompleteness } from '../shared/kits.js';
 import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
 
 // --- Constants ---
 const SYSTEM_ID = 'Household';
 const progressPercent = (value, goal) => goal > 0 ? (value / goal) * 100 : 0;
-
-// AI remains unavailable until an authenticated server endpoint is configured.
-async function callGemini() {
-  throw new Error('AI is not configured.');
-}
-async function callImagen() {
-  alert('AI icons are not configured yet.');
-  return null;
-}
-async function smartSuggestItem() {
-  alert('AI suggestions are not configured yet. Please enter the item manually.');
-  return null;
-}
-const smartSuggestAppliance = smartSuggestItem;
-const resizeBase64 = async (value) => `data:image/png;base64,${value}`;
 
 // --- Main App Component ---
 export default function App() {
@@ -40,16 +31,21 @@ export default function App() {
   const [inventory, setInventory] = useState([]);
   const [shoppingList, setShoppingList] = useState([]);
   const [appliances, setAppliances] = useState([]);
+  const [reminders, setReminders] = useState([]);
+  const [checklistChecks, setChecklistChecks] = useState([]);
+  const [kits, setKits] = useState([]);
+  const [medications, setMedications] = useState([]);
   const [plan, setPlan] = useState(null);
   const [consumption, setConsumption] = useState([]);
   const [loading, setLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
   const [showSyncModal, setShowSyncModal] = useState(false);
-  const [aiContent, setAiContent] = useState(null);
-  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [showBinder, setShowBinder] = useState(false);
+  const [outage, setOutage] = useState(null);
   const [globalError, setGlobalError] = useState(null);
   const [settings, setSettings] = useState(() => settingsSchema.parse({}));
   const [pendingImport, setPendingImport] = useState(null);
+  const [pendingImportSource, setPendingImportSource] = useState(null);
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
   const [online, setOnline] = useState(() => typeof navigator === 'undefined' ? true : navigator.onLine);
   const [pendingSync, setPendingSync] = useState(() => loadQueuedActions().length);
@@ -61,7 +57,9 @@ export default function App() {
     if (version < revision.current) return;
     revision.current = version;
     setInventory(data.inventory); setShoppingList(data.shoppingList);
-    setAppliances(data.appliances); setPlan(data.plan); setConsumption(data.consumption ?? []); setSettings(settingsSchema.parse(data.settings ?? {}));
+    setAppliances(data.appliances); setReminders(data.reminders ?? []); setChecklistChecks(data.checklistChecks ?? []);
+    setKits(data.kits ?? []); setMedications(data.medications ?? []);
+    setPlan(data.plan); setConsumption(data.consumption ?? []); setSettings(settingsSchema.parse(data.settings ?? {}));
     saveCachedState({data,version});
     if (synced) setLastSyncedAt(Date.now());
   };
@@ -119,7 +117,7 @@ export default function App() {
   }, [user, online]);
   const queueOffline = action => {
     try {
-      const next = applyAction({inventory, shoppingList, appliances, plan, consumption, settings}, action);
+      const next = applyAction({inventory, shoppingList, appliances, reminders, checklistChecks, kits, medications, plan, consumption, settings}, action);
       const count = enqueueAction(action);
       accept({data:next,version:revision.current}, false);
       setPendingSync(count); setGlobalError('Offline: saved on this device and queued for sync.');
@@ -139,11 +137,11 @@ export default function App() {
     finally {busy.current=false;setIsSyncing(false);}
   };
   const logout = async () => {
-    try {await request('session',{},'DELETE');epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    try {await request('session',{},'DELETE');epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
-    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,plan,consumption,settings},null,2)],{type:'application/json'});
+    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,reminders,checklistChecks,kits,medications,plan,consumption,settings},null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob);const link=document.createElement('a');
     link.href=url;link.download=`northstar-backup-${new Date().toISOString().slice(0,10)}.json`;link.click();
     setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -154,15 +152,48 @@ export default function App() {
       if(file.size>2_000_000)throw new Error('Backup must be smaller than 2 MB.');
       const backup=normalizeBackup(JSON.parse(await file.text()),()=>crypto.randomUUID());
       setPendingImport(backup);
+      setPendingImportSource({kind:'backup'});
       setGlobalError(null);
     } catch(error){setGlobalError(`Import failed: ${error.message}`);}
   };
+  const downloadCsv = () => {
+    const blob = new Blob([backupToCsv(inventory, shoppingList)], {type:'text/csv'});
+    const url=URL.createObjectURL(blob);const link=document.createElement('a');
+    link.href=url;link.download=`northstar-inventory-${new Date().toISOString().slice(0,10)}.csv`;link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  };
+  const handleCsvUpload = async event => {
+    const file=event.target.files[0];event.target.value='';if(!file)return;
+    try {
+      if(file.size>2_000_000)throw new Error('CSV must be smaller than 2 MB.');
+      const {backup,errors}=csvToBackupPreview(await file.text(),()=>crypto.randomUUID());
+      setPendingImport(backup);
+      setPendingImportSource({kind:'csv', errors});
+      setGlobalError(null);
+    } catch(error){setGlobalError(`CSV import failed: ${error.message}`);}
+  };
+  // Starter templates go through the same non-destructive preview as a JSON backup, so nothing
+  // is written until it is confirmed and existing rows merge by ID rather than being replaced.
+  const previewTemplate = (templateId) => {
+    const template = findSupplyTemplate(templateId);
+    if (!template) return;
+    try {
+      setPendingImport(normalizeBackup(templateToBackup(template, settings), () => crypto.randomUUID()));
+      setPendingImportSource({kind:'template', label: template.label});
+      setGlobalError(null);
+    } catch(error){setGlobalError(`Template failed: ${error.message}`);}
+  };
+  const cancelImport = () => { setPendingImport(null); setPendingImportSource(null); };
   const confirmImport = async () => {
     if (!pendingImport) return false;
     if (!await mutate({type:'import',backup:pendingImport})) return false;
+    const wasTemplate = pendingImportSource?.kind === 'template';
     setPendingImport(null);
+    setPendingImportSource(null);
     setShowSyncModal(false);
-    alert('Backup imported. Existing records were merged by ID.');
+    alert(wasTemplate
+      ? 'Starter supplies added. Adjust the quantities to what your household actually keeps.'
+      : 'Backup imported. Existing records were merged by ID.');
     return true;
   };
   const restoreFromBackup = async (id) => {
@@ -174,47 +205,25 @@ export default function App() {
   };
 
   // --- Logic Helpers ---
-  const stats = useMemo(() => computeReadiness({ inventory, appliances }, settings), [inventory, appliances, settings]);
+  const stats = useMemo(() => computeReadiness({ inventory, appliances, plan }, settings), [inventory, appliances, plan, settings]);
+  const gaps = useMemo(() => computeReadinessGaps(stats, settings), [stats, settings]);
+  const overdueReminders = useMemo(() => reminders.filter(r => isReminderOverdue(r)), [reminders]);
+  const refillDueMedications = useMemo(() => medications.filter(m => isMedicationRefillDue(m)), [medications]);
   const handleUpdateSettings = (next) => mutate({ type: 'settings', settings: next });
 
-  const generateMealPlan = async () => {
-    setIsAiLoading(true);
-    const inventoryText = inventory.map(i => `${i.name}: ${i.quantity} ${i.unit}`).join(', ');
-    const prompt = `Based on this survival inventory: ${inventoryText}, create a 3-day meal plan for a family of 4 in a power outage. Daily calorie target 8,000. Provide concise daily summaries.`;
-    try {
-      const result = await callGemini(prompt);
-      setAiContent({ title: "AI Survival Meal Plan ✨", text: result });
-    } catch (e) {
-      setAiContent({ title: "Error", text: e.message });
-    }
-    setIsAiLoading(false);
+  // Queues a generic supply representing a readiness shortfall onto the shopping list; the
+  // household edits it afterward (specific product, price, store) like any other item.
+  const handleAddGapShortfall = (gap) => {
+    if (gap.key === 'water') return handleAdd('shopping_list', { name: 'Drinking water (readiness shortfall)', category: 'Water', quantity: gap.suggestedQuantity, unit: 'gal', gallonsPerUnit: 1 });
+    if (gap.key === 'food') return handleAdd('shopping_list', { name: 'Emergency food (readiness shortfall)', category: 'Food', quantity: 1, unit: 'servings', caloriesPerUnit: gap.suggestedCalories });
+    if (gap.key === 'power') return handleAdd('shopping_list', { name: 'Backup power storage (readiness shortfall)', category: 'Power', quantity: 1, unit: 'units', capacityPerUnit: gap.suggestedRawKwh });
+    return Promise.resolve(false);
   };
 
-  const analyzeInventory = async () => {
-    setIsAiLoading(true);
-    const inventoryText = inventory.map(i => `${i.name}: ${i.quantity} ${i.unit} (${i.category})`).join(', ');
-    const prompt = `Analyze this survival inventory list for a family of 4 in a winter climate: ${inventoryText}. Identify 3 critical gaps or missing categories to reach 14 days self-sufficiency. Be specific and concise.`;
-    try {
-      const result = await callGemini(prompt);
-      setAiContent({ title: "AI Gap Analysis ✨", text: result });
-    } catch (e) {
-      setAiContent({ title: "Error", text: e.message });
-    }
-    setIsAiLoading(false);
-  };
-
-  const generateDrill = async () => {
-    setIsAiLoading(true);
-    const familyNames = plan?.family?.map(f => f.name).join(', ') || "the family";
-    const shelter = plan?.shelterSpot || "basement";
-    const prompt = `Create a realistic 10-minute emergency drill scenario for a family in suburban Minnesota (Winter). Family: ${familyNames}. Safe spot: ${shelter}. Scenario: Severe blizzard with power loss or tornado siren. Give 3 immediate action steps for the household to practice.`;
-    try {
-      const result = await callGemini(prompt);
-      setAiContent({ title: "🚨 AI Emergency Drill", text: result });
-    } catch (e) {
-      setAiContent({ title: "Error", text: e.message });
-    }
-    setIsAiLoading(false);
+  // Replaces the old "Run Emergency Simulation" AI stub: the same question answered as plain
+  // arithmetic over what the household has actually recorded, so it works offline.
+  const runOutageSimulation = (hours) => {
+    setOutage(simulateOutage({inventory, appliances, plan}, settings, {hours}));
   };
 
   const handleAdd = (collection,item) => mutate({type:'add',collection,id:crypto.randomUUID(),item});
@@ -232,6 +241,12 @@ export default function App() {
     }
     return true;
   };
+  const handleCompleteReminder = (reminder) => handleUpdate('reminders', reminder.id, {...reminder, lastCompletedDate: todayLocal(), snoozedUntil: ''});
+  const handleSnoozeReminder = (reminder, days) => handleUpdate('reminders', reminder.id, {...reminder, snoozedUntil: addDaysISO(todayLocal(), days)});
+  const handleToggleChecklistItem = (season, itemId, checked) => {
+    const id = `${season}__${itemId}`;
+    return checked ? mutate({type:'add', collection:'checklist', id, item:{completedAt: todayLocal()}}) : mutate({type:'delete', collection:'checklist', id});
+  };
 
   const handleAuthenticated = (profile) => {
     epoch.current++;revision.current=-1;setLoading(true);setUser(profile);setGlobalError(null);
@@ -240,11 +255,15 @@ export default function App() {
 
   if (!authReady) return <LoadingScreen />;
   if (!user) {
-    const inviteToken = new URLSearchParams(window.location.search).get('invite');
+    const params = new URLSearchParams(window.location.search);
+    const inviteToken = params.get('invite');
     if (inviteToken) return <AcceptInvite token={inviteToken} onJoined={handleAuthenticated} />;
+    const resetToken = params.get('reset');
+    if (resetToken) return <ResetPassword token={resetToken} onReset={handleAuthenticated} />;
     return <Login configured={configured} error={globalError} onLogin={handleAuthenticated} />;
   }
   if (loading && !inventory.length && !globalError) return <LoadingScreen />;
+  if (showBinder) return <EmergencyBinder plan={plan} inventory={inventory} stats={stats} settings={settings} checklistChecks={checklistChecks} medications={medications} onClose={() => setShowBinder(false)} />;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans select-none">
@@ -253,7 +272,7 @@ export default function App() {
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
-        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} onGeneratePlan={generateMealPlan} onAnalyzeGaps={analyzeInventory} isAiLoading={isAiLoading} />}
+        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} refillDueMedications={refillDueMedications} onViewReminders={() => setActiveTab('plan')} onViewRotation={() => setActiveTab('inventory')} />}
         {activeTab === 'inventory' && (
           <InventoryManager
             title="Supply Hub"
@@ -262,6 +281,7 @@ export default function App() {
             consumption={consumption}
             stats={stats}
             settings={settings}
+            kits={kits}
             onAdd={(i) => handleAdd('inventory', i)}
             onUpdate={(id, i) => handleUpdate('inventory', id, i)}
             onDelete={(id) => handleDelete('inventory', id)}
@@ -270,8 +290,9 @@ export default function App() {
             onRestock={handleRestockRecurring}
             onConsume={handleConsume}
             onDeleteConsumption={handleDeleteConsumption}
-            onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)}
-            isAiLoading={isAiLoading}
+            onAddKit={(i) => handleAdd('kits', i)}
+            onUpdateKit={(id, i) => handleUpdate('kits', id, i)}
+            onDeleteKit={(id) => handleDelete('kits', id)}
           />
         )}
         {activeTab === 'shopping' && (
@@ -287,8 +308,6 @@ export default function App() {
             onBulkDelete={(ids) => handleBulkDelete('shopping_list', ids)}
             onBulkUpdate={(ids, changes) => handleBulkUpdate('shopping_list', ids, changes)}
             onBuy={handleBuyItem}
-            onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)}
-            isAiLoading={isAiLoading}
           />
         )}
         {activeTab === 'power' && (
@@ -299,25 +318,60 @@ export default function App() {
             onAdd={(i) => handleAdd('appliances', i)}
             onUpdate={(id, i) => handleUpdate('appliances', id, i)}
             onDelete={(id) => handleDelete('appliances', id)}
-            onSmartSuggest={(txt) => smartSuggestAppliance(txt, setIsAiLoading)}
-            isAiLoading={isAiLoading}
           />
         )}
-        {activeTab === 'plan' && <EmergencyPlan plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunDrill={generateDrill} isAiLoading={isAiLoading} />}
+        {activeTab === 'plan' && (
+          <EmergencyPlan
+            plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunSimulation={runOutageSimulation} settings={settings}
+            onOpenBinder={() => setShowBinder(true)}
+            reminders={reminders} checklistChecks={checklistChecks} medications={medications}
+            onAddReminder={(i) => handleAdd('reminders', i)}
+            onUpdateReminder={(id, i) => handleUpdate('reminders', id, i)}
+            onDeleteReminder={(id) => handleDelete('reminders', id)}
+            onCompleteReminder={handleCompleteReminder}
+            onSnoozeReminder={handleSnoozeReminder}
+            onToggleChecklistItem={handleToggleChecklistItem}
+            onAddMedication={(i) => handleAdd('medications', i)}
+            onUpdateMedication={(id, i) => handleUpdate('medications', id, i)}
+            onDeleteMedication={(id) => handleDelete('medications', id)}
+          />
+        )}
       </main>
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} />}
-      {aiContent && <AiModal content={aiContent} onClose={() => setAiContent(null)} />}
+      {showSyncModal && <SyncModal onClose={() => { cancelImport(); setShowSyncModal(false); }} onImport={handleFileUpload} onImportCsv={handleCsvUpload} onDownloadCsv={downloadCsv} pendingImport={pendingImport} pendingImportSource={pendingImportSource} onConfirmImport={confirmImport} onCancelImport={cancelImport} onApplyTemplate={previewTemplate} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
+      {outage && <OutageSimulationModal result={outage} settings={settings} onClose={() => setOutage(null)} />}
     </div>
   );
 }
 
 // --- Dashboard ---
-function Dashboard({ stats, settings, onGeneratePlan, onAnalyzeGaps, isAiLoading }) {
+function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueReminders = [], refillDueMedications = [], onViewReminders, onViewRotation }) {
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
+      {(overdueReminders.length > 0 || refillDueMedications.length > 0) && (
+        <button onClick={onViewReminders} className="w-full flex items-center justify-between gap-3 bg-red-50 border border-red-100 rounded-2xl px-4 py-3 text-sm text-left active:scale-95 transition-all">
+          <span className="flex items-center gap-2 font-bold text-red-800">
+            <AlertOctagon size={16}/>
+            {overdueReminders.length > 0 && <>{overdueReminders.length} overdue maintenance {overdueReminders.length > 1 ? 'reminders' : 'reminder'}</>}
+            {overdueReminders.length > 0 && refillDueMedications.length > 0 && <> · </>}
+            {refillDueMedications.length > 0 && <>{refillDueMedications.length} medication{refillDueMedications.length > 1 ? 's' : ''} due for refill</>}
+          </span>
+          <ChevronRight size={16} className="text-red-400"/>
+        </button>
+      )}
+      {(stats.expiringSoon > 0 || stats.expired > 0) && (
+        <button onClick={onViewRotation} className="w-full flex items-center justify-between gap-3 bg-orange-50 border border-orange-100 rounded-2xl px-4 py-3 text-sm text-left active:scale-95 transition-all">
+          <span className="flex items-center gap-2 font-bold text-orange-800">
+            <Calendar size={16}/>
+            {stats.expiringSoon > 0 && <>{stats.expiringSoon} item{stats.expiringSoon === 1 ? '' : 's'} expiring within 90 days</>}
+            {stats.expiringSoon > 0 && stats.expired > 0 && <> · </>}
+            {stats.expired > 0 && <>{stats.expired} already expired</>}
+          </span>
+          <ChevronRight size={16} className="text-orange-400"/>
+        </button>
+      )}
       <div className="grid grid-cols-2 gap-4">
         <StatusCard icon={<Droplets size={24}/>} color="blue" value={stats.waterDays.toFixed(1)} label="Water Days" />
         <StatusCard icon={<Utensils size={24}/>} color="emerald" value={stats.foodDays.toFixed(1)} label="Food Days" />
@@ -336,37 +390,166 @@ function Dashboard({ stats, settings, onGeneratePlan, onAnalyzeGaps, isAiLoading
             <ProgressBar label={`Power (Goal: ${settings.powerGoalKwh} kWh)`} percent={progressPercent(stats.totalPowerKwh, settings.powerGoalKwh)} color="bg-violet-500" />
           </div>
           <p className="mt-5 text-[10px] leading-relaxed text-slate-400">
-            Assumes {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} needing {settings.caloriesPerPersonPerDay.toLocaleString()} kcal
-            and {settings.waterGallonsPerPersonPerDay} gal water per person/day ({stats.dailyCalorieNeed.toLocaleString()} kcal
-            and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household). Stored power counts {Math.round(settings.batteryUsableFraction * 100)}%
+            {stats.needsMode === 'members' ? (
+              <>
+                Adds up each household member's own needs: {stats.people} {stats.people === 1 ? 'person' : 'people'}
+                {stats.pets > 0 && <> and {stats.pets} {stats.pets === 1 ? 'pet' : 'pets'}</>} in the Family Hub
+                ({stats.dailyCalorieNeed.toLocaleString()} kcal and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household).
+                Members left blank count at {settings.caloriesPerPersonPerDay.toLocaleString()} kcal and {settings.waterGallonsPerPersonPerDay} gal;
+                a pet counts for nothing until you enter its figures. Edit members in the Family Hub.
+              </>
+            ) : (
+              <>
+                Assumes {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} needing {settings.caloriesPerPersonPerDay.toLocaleString()} kcal
+                and {settings.waterGallonsPerPersonPerDay} gal water per person/day ({stats.dailyCalorieNeed.toLocaleString()} kcal
+                and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household). Give a member their own figures in the Family Hub
+                to count everyone individually instead.
+              </>
+            )} Stored power counts {Math.round(settings.batteryUsableFraction * 100)}%
             usable capacity after a {Math.round(settings.inverterEfficiency * 100)}% efficient inverter conversion.
             Edit these in Household settings.
           </p>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
-          <button aria-label="Generate meal plan" onClick={onGeneratePlan} disabled={isAiLoading} className="bg-emerald-50 text-emerald-700 py-4 rounded-[2rem] flex flex-col items-center justify-center gap-1 font-black text-[10px] uppercase tracking-widest border border-emerald-100 shadow-sm active:scale-95 transition-all disabled:opacity-50">
-          {isAiLoading ? <RefreshCw className="animate-spin" size={20}/> : <Sparkles size={20}/>}
-          Meal Plan
-        </button>
-        <button aria-label="Analyze inventory gaps" onClick={onAnalyzeGaps} disabled={isAiLoading} className="bg-blue-50 text-blue-700 py-4 rounded-[2rem] flex flex-col items-center justify-center gap-1 font-black text-[10px] uppercase tracking-widest border border-blue-100 shadow-sm active:scale-95 transition-all disabled:opacity-50">
-          {isAiLoading ? <RefreshCw className="animate-spin" size={20}/> : <SearchCheck size={20}/>}
-          Analyze Gaps
-        </button>
+      <ReadinessGaps gaps={gaps} onAddShortfall={onAddGapShortfall} />
+      <ReadinessTrend settings={settings} />
+    </div>
+  );
+}
+
+// Progress over time, from the daily snapshot the backup cron records (see api/backup.js).
+// Aggregate figures only, so nothing here reveals what the household actually keeps.
+function ReadinessTrend({ settings }) {
+  const [entries, setEntries] = useState(null);
+  const [error, setError] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    request('readiness-history')
+      .then(data => { if (!cancelled) setEntries(data.entries || []); })
+      .catch(err => { if (!cancelled) setError(err.message); });
+    return () => { cancelled = true; };
+  }, []);
+
+  if (error) return null;
+  if (entries === null) return null;
+  if (entries.length < 2) {
+    return (
+      <section className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm">
+        <h3 className="text-[10px] font-black uppercase tracking-widest text-slate-600 mb-2">Readiness over time</h3>
+        <p className="text-xs text-slate-500 leading-relaxed">
+          A snapshot is recorded once a day. {entries.length === 0 ? 'The first one will appear after the next daily run.' : 'Come back tomorrow to see a trend.'}
+        </p>
+      </section>
+    );
+  }
+
+  const first = entries[0];
+  const latest = entries.at(-1);
+  const series = [
+    {key: 'waterDays', label: 'Water days', color: 'bg-blue-500'},
+    {key: 'foodDays', label: 'Food days', color: 'bg-emerald-500'},
+    {key: 'powerDays', label: 'Power days', color: 'bg-violet-500'},
+  ];
+  const peak = Math.max(settings.survivalGoalDays, ...entries.flatMap(entry => series.map(item => Number(entry[item.key]) || 0)));
+
+  return (
+    <section className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-4">
+      <div className="flex items-baseline justify-between gap-3">
+        <h3 className="text-[10px] font-black uppercase tracking-widest text-slate-600">Readiness over time</h3>
+        <span className="text-[10px] font-bold text-slate-500">{entries.length} days</span>
       </div>
+      {series.map(item => {
+        const from = Number(first[item.key]) || 0;
+        const to = Number(latest[item.key]) || 0;
+        const change = to - from;
+        return (
+          <div key={item.key} className="space-y-1">
+            <div className="flex items-baseline justify-between gap-3 text-xs">
+              <span className="font-bold text-slate-700">{item.label}</span>
+              <span className="font-bold text-slate-700">
+                {to.toFixed(1)}
+                <span className={`ml-2 font-black ${change > 0.05 ? 'text-emerald-600' : change < -0.05 ? 'text-red-600' : 'text-slate-400'}`}>
+                  {change > 0.05 ? '▲' : change < -0.05 ? '▼' : '—'} {Math.abs(change).toFixed(1)}
+                </span>
+              </span>
+            </div>
+            <div className="flex items-end gap-px h-8" role="img" aria-label={`${item.label}: ${from.toFixed(1)} ${entries.length} days ago, ${to.toFixed(1)} now`}>
+              {entries.map(entry => (
+                <div key={entry.day} className="flex-1 bg-slate-100 rounded-sm flex items-end" style={{height: '100%'}}>
+                  <div className={`w-full ${item.color} rounded-sm`} style={{height: `${peak > 0 ? Math.min(100, ((Number(entry[item.key]) || 0) / peak) * 100) : 0}%`}} />
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      <p className="text-[10px] text-slate-500 leading-relaxed">
+        Recorded once a day alongside the encrypted backup. Aggregate figures only — no item details are kept in this history.
+      </p>
+    </section>
+  );
+}
+
+// Deterministic gap analysis: what each readiness goal is short by, and a one-tap way to queue
+// a generic replacement item for it onto the shopping list. Replaces the old AI "Analyze Gaps".
+function ReadinessGaps({ gaps, onAddShortfall }) {
+  const [addingKey, setAddingKey] = useState(null);
+  const shortfalls = gaps.filter(gap => !gap.met);
+  const addableKeys = new Set(['water', 'food', 'power']);
+
+  const describe = (gap) => {
+    if (gap.key === 'water') return `${gap.shortfallDays.toFixed(1)} days short of goal — about ${gap.suggestedQuantity.toLocaleString()} more gallons needed.`;
+    if (gap.key === 'food') return `${gap.shortfallDays.toFixed(1)} days short of goal — about ${gap.suggestedCalories.toLocaleString()} more kcal needed.`;
+    if (gap.key === 'heat') return `${gap.shortfallHours.toFixed(0)} more heat hours needed to reach the goal.`;
+    if (gap.key === 'power') return `${gap.shortfallKwh.toFixed(1)} more usable kWh needed (about ${gap.suggestedRawKwh.toLocaleString()} kWh of stored capacity).`;
+    return '';
+  };
+
+  const addShortfall = async (gap) => {
+    setAddingKey(gap.key);
+    await onAddShortfall(gap);
+    setAddingKey(null);
+  };
+
+  return (
+    <div className="bg-white p-6 rounded-[2.5rem] border border-slate-200 shadow-sm space-y-4">
+      <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest flex items-center gap-2"><SearchCheck size={14}/> Readiness Gaps</h3>
+      {shortfalls.length === 0 ? (
+        <p className="text-sm font-bold text-emerald-600">Every readiness goal is currently met.</p>
+      ) : (
+        <div className="space-y-3">
+          {shortfalls.map(gap => (
+            <div key={gap.key} className="flex items-start justify-between gap-3 bg-slate-50 rounded-2xl p-4">
+              <div>
+                <div className="font-black text-slate-800 text-sm">{gap.label}</div>
+                <div className="text-xs text-slate-600 font-bold">{describe(gap)}</div>
+              </div>
+              {addableKeys.has(gap.key) && (
+                <button
+                  aria-label={`Add ${gap.label.toLowerCase()} shortfall to shopping list`}
+                  onClick={() => addShortfall(gap)}
+                  disabled={addingKey === gap.key}
+                  className="shrink-0 text-[10px] font-black px-3 py-2.5 rounded-full bg-blue-600 text-white uppercase tracking-widest active:scale-95 transition-all disabled:opacity-50"
+                >
+                  {addingKey === gap.key ? <RefreshCw className="animate-spin" size={14}/> : 'Add to list'}
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
 // --- Appliance Manager ---
-function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmartSuggest, isAiLoading }) {
+function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingId, setEditingId] = useState(null);
-  const [smartText, setSmartText] = useState('');
-  const [form, setForm] = useState({ name: '', watts: '', hours: '', active: true });
+  const [form, setForm] = useState({ name: '', watts: '', hours: '', active: true, priority: 'normal' });
 
-  const reset = () => { setForm({ name: '', watts: '', hours: '', active: true }); setEditingId(null); setShowAdd(false); };
+  const reset = () => { setForm({ name: '', watts: '', hours: '', active: true, priority: 'normal' }); setEditingId(null); setShowAdd(false); };
 
   const submit = async (e) => {
     e.preventDefault();
@@ -377,7 +560,6 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
   };
 
   const handleEdit = (item) => { setForm(item); setEditingId(item.id); setShowAdd(true); window.scrollTo({ top: 0, behavior: 'smooth' }); };
-  const runSmart = async () => { const res = await onSmartSuggest(smartText); if (res) { setForm(prev => ({...prev, ...res})); setSmartText(''); } };
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
@@ -407,14 +589,6 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
 
       {showAdd && (
         <div className="space-y-4 mb-6 animate-in slide-in-from-top-4 duration-300">
-          {!editingId && (
-            <div className="bg-indigo-50 p-4 rounded-[2rem] border border-indigo-100 flex gap-2">
-              <input className="flex-1 bg-white border border-indigo-100 rounded-xl px-4 py-2 text-sm outline-none" placeholder="e.g. 'Standard Fridge' or 'CPAP'" value={smartText} onChange={e => setSmartText(e.target.value)} />
-              <button onClick={runSmart} disabled={isAiLoading} className="p-3 bg-indigo-600 text-white rounded-xl shadow-lg active:scale-95 disabled:opacity-50">
-                {isAiLoading ? <RefreshCw size={16} className="animate-spin" /> : <Zap size={16}/>}
-              </button>
-            </div>
-          )}
           <form onSubmit={submit} className="bg-white border-2 border-violet-100 rounded-[2.5rem] p-7 shadow-2xl space-y-4">
              <div className="flex justify-between items-center mb-2">
                 <h3 className="text-xs font-black uppercase text-violet-600 tracking-widest">{editingId ? 'Edit Device' : 'New Appliance'}</h3>
@@ -424,6 +598,13 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
                 <div className="col-span-2"><Label>Device Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Fridge" /></div>
                 <div><Label>Watts (Running)</Label><Input val={form.watts} set={v => setForm({...form, watts: v})} type="number" placeholder="150" /></div>
                 <div><Label>Hours/Day</Label><Input val={form.hours} set={v => setForm({...form, hours: v})} type="number" placeholder="24" /></div>
+                <div className="col-span-2">
+                  <Label>Outage priority</Label>
+                  <select aria-label="Outage priority" value={form.priority || 'normal'} onChange={e => setForm({...form, priority: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold text-slate-700">
+                    {appliancePriorities.map(level => <option key={level} value={level}>{appliancePriorityLabels[level]}</option>)}
+                  </select>
+                  <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">Lowest priority loads are shed first when the outage simulator works out what to turn off.</p>
+                </div>
              </div>
              <button type="submit" className="w-full bg-violet-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl active:bg-violet-700 transition-colors mt-2">
                {editingId ? 'Update Device' : 'Add to Load'}
@@ -446,7 +627,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
                 <div onClick={() => handleEdit(app)} className="cursor-pointer">
                    <h4 className="font-black text-slate-800 leading-tight">{app.name}</h4>
                    <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
-                    {app.watts}W • {app.hours} hrs/day • {((app.watts * app.hours)/1000).toFixed(2)} kWh
+                    {app.watts}W • {app.hours} hrs/day • {((app.watts * app.hours)/1000).toFixed(2)} kWh • {appliancePriorityLabels[app.priority || 'normal']} priority
                    </p>
                 </div>
              </div>
@@ -464,14 +645,15 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
 }
 
 // --- Inventory Manager (Reused for Shop) ---
-function InventoryManager({ title, items, shoppingList = [], consumption = [], stats, settings, onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onConsume, onDeleteConsumption, onBuy, onSmartSuggest, isAiLoading, isShoppingMode }) {
+function InventoryManager({ title, items, shoppingList = [], consumption = [], stats, settings, kits = [], onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onConsume, onDeleteConsumption, onBuy, isShoppingMode, onAddKit, onUpdateKit, onDeleteKit }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
-  const [smartText, setSmartText] = useState('');
-  const [isImgLoading, setIsImgLoading] = useState(false);
   const [sortBy, setSortBy] = useState(''); // 'expiry', 'calories', 'date'
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [groupBy, setGroupBy] = useState('category'); // 'category', 'location', 'kit'
+  const [locationFilter, setLocationFilter] = useState('');
+  const [kitFilter, setKitFilter] = useState('');
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [formError, setFormError] = useState(null);
   const [bulkCategory, setBulkCategory] = useState('');
@@ -479,11 +661,11 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
   const [bulkQuantityValue, setBulkQuantityValue] = useState('');
 
   const [form, setForm] = useState({
-    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: ''
+    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '', location: '', kitId: ''
   });
 
   const reset = () => {
-    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '' });
+    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '', location: '', kitId: '' });
     setEditingItem(null);
     setShowAdd(false);
     setFormError(null);
@@ -529,20 +711,16 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
   };
 
   const handleEdit = (item) => { setForm(item); setEditingItem(item); setShowAdd(true); window.scrollTo({ top: 0, behavior: 'smooth' }); };
-  const runSmart = async () => { const res = await onSmartSuggest(smartText); if (res) { setForm(prev => ({...prev, ...res})); setSmartText(''); } };
-
-  const handleGenerateImage = async () => {
-    if (!form.name) return;
-    setIsImgLoading(true);
-    const base64 = await callImagen(form.name);
-    if (base64) {
-       const resized = await resizeBase64(base64);
-       setForm(prev => ({ ...prev, image: resized }));
-    }
-    setIsImgLoading(false);
-  };
 
   const totalShopCost = useMemo(() => items.reduce((acc, i) => acc + (Number(i.price||0) * Number(i.quantity||0)), 0), [items]);
+
+  // Supplies that have not lapsed yet but will within 90 days, soonest first. Items already on
+  // the shopping list are left out so "replace" does not queue a second copy of the same thing.
+  const rotationQueue = useMemo(() => {
+    if (isShoppingMode) return [];
+    return expirationQueue(items).filter(row => !shoppingList.some(existing =>
+      existing.category === row.item.category && String(existing.name || '').trim().toLowerCase() === String(row.item.name || '').trim().toLowerCase()));
+  }, [items, shoppingList, isShoppingMode]);
 
   const dueRecurringItems = useMemo(() => {
     if (isShoppingMode) return [];
@@ -556,13 +734,15 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
   const filteredItems = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return items.filter(item => {
-      if (needle && ![item.name, item.category, item.store, item.unit].some(value => String(value || '').toLowerCase().includes(needle))) return false;
+      if (needle && ![item.name, item.category, item.store, item.unit, item.location].some(value => String(value || '').toLowerCase().includes(needle))) return false;
       if (statusFilter === 'expired' && !isExpired(item.expiryDate)) return false;
       if (statusFilter === 'expiring' && (isExpired(item.expiryDate) || !item.expiryDate || new Date(item.expiryDate) > new Date(Date.now() + 30 * 24 * 60 * 60 * 1000))) return false;
       if (statusFilter === 'low' && Number(item.quantity || 0) >= Number(item.target || 1) * 0.25) return false;
+      if (!isShoppingMode && locationFilter && (item.location || '') !== locationFilter) return false;
+      if (!isShoppingMode && kitFilter && (item.kitId || '') !== (kitFilter === '__none__' ? '' : kitFilter)) return false;
       return true;
     });
-  }, [items, query, statusFilter]);
+  }, [items, query, statusFilter, locationFilter, kitFilter, isShoppingMode]);
 
   const sortedItems = useMemo(() => {
     let sorted = [...filteredItems];
@@ -576,17 +756,23 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
     return sorted;
   }, [filteredItems, sortBy]);
 
+  // Built as a plain object, not a Map: `Map` here is the lucide-react icon imported above, which
+  // shadows the global constructor within this module.
+  const kitNameById = useMemo(() => Object.fromEntries(kits.map(kit => [kit.id, kit.name])), [kits]);
+  const locations = useMemo(() => [...new Set(items.map(item => item.location).filter(Boolean))].sort(), [items]);
+
   const groupedItems = useMemo(() => {
     const groups = Object.create(null);
     const source = sortedItems;
-
-    if (isShoppingMode) {
-      source.forEach(item => { const s = item.store || 'Uncategorized'; if (!groups[s]) groups[s] = []; groups[s].push(item); });
-    } else {
-      source.forEach(item => { const c = item.category || 'Uncategorized'; if (!groups[c]) groups[c] = []; groups[c].push(item); });
-    }
+    const keyOf = item => {
+      if (isShoppingMode) return item.store || 'Uncategorized';
+      if (groupBy === 'location') return item.location || 'No location set';
+      if (groupBy === 'kit') return item.kitId ? (kitNameById[item.kitId] || 'Unknown kit') : 'Not in a kit';
+      return item.category || 'Uncategorized';
+    };
+    source.forEach(item => { const k = keyOf(item); if (!groups[k]) groups[k] = []; groups[k].push(item); });
     return groups;
-  }, [sortedItems, isShoppingMode]);
+  }, [sortedItems, isShoppingMode, groupBy, kitNameById]);
 
   const waterPct = settings.survivalGoalDays ? Math.min(Math.round((stats.waterDays / settings.survivalGoalDays) * 100), 100) : 0;
   const foodPct = settings.survivalGoalDays ? Math.min(Math.round((stats.foodDays / settings.survivalGoalDays) * 100), 100) : 0;
@@ -606,11 +792,29 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
       </div>
 
       <div className="grid grid-cols-[1fr_auto] gap-2">
-        <input aria-label={`Search ${title.toLowerCase()}`} value={query} onChange={event => setQuery(event.target.value)} placeholder="Search name, category or store" className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-3 text-sm outline-none focus:border-blue-400" />
+        <input aria-label={`Search ${title.toLowerCase()}`} value={query} onChange={event => setQuery(event.target.value)} placeholder="Search name, category, store or location" className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-3 text-sm outline-none focus:border-blue-400" />
         <select aria-label="Filter items" value={statusFilter} onChange={event => setStatusFilter(event.target.value)} className="bg-white border border-slate-200 rounded-2xl px-3 text-xs font-bold">
           <option value="all">All</option><option value="low">Low stock</option><option value="expiring">Expiring</option><option value="expired">Expired</option>
         </select>
       </div>
+      {!isShoppingMode && (
+        <div className="grid grid-cols-3 gap-2">
+          <select aria-label="Group items by" value={groupBy} onChange={event => setGroupBy(event.target.value)} className="bg-white border border-slate-200 rounded-2xl px-2 py-2.5 text-[11px] font-bold">
+            <option value="category">Group: Category</option>
+            <option value="location">Group: Location</option>
+            <option value="kit">Group: Kit</option>
+          </select>
+          <select aria-label="Filter by location" value={locationFilter} onChange={event => setLocationFilter(event.target.value)} className="bg-white border border-slate-200 rounded-2xl px-2 py-2.5 text-[11px] font-bold">
+            <option value="">All locations</option>
+            {locations.map(location => <option key={location} value={location}>{location}</option>)}
+          </select>
+          <select aria-label="Filter by kit" value={kitFilter} onChange={event => setKitFilter(event.target.value)} className="bg-white border border-slate-200 rounded-2xl px-2 py-2.5 text-[11px] font-bold">
+            <option value="">All kits</option>
+            <option value="__none__">Not in a kit</option>
+            {kits.map(kit => <option key={kit.id} value={kit.id}>{kit.name}</option>)}
+          </select>
+        </div>
+      )}
       {selectedIds.size > 0 && (
         <div className="bg-blue-50 border border-blue-100 rounded-2xl px-4 py-3 text-sm space-y-3">
           <div className="flex items-center justify-between gap-3">
@@ -642,16 +846,30 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
         </div>
       )}
 
+      {rotationQueue.length > 0 && (
+        <section aria-labelledby="rotation-queue-heading" className="bg-orange-50 border border-orange-100 rounded-2xl px-4 py-3 mb-4 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <h3 id="rotation-queue-heading" className="text-[10px] font-black uppercase tracking-widest text-orange-800 flex items-center gap-2"><Calendar size={12}/> Rotation queue — use these first</h3>
+            <button aria-label="Add every item in the rotation queue to the shopping list" onClick={async () => { if (await onRestock(rotationQueue.map(row => row.item))) alert('Queued replacements onto your shopping list.'); }} className="text-orange-700 font-black text-[10px] uppercase">Replace all</button>
+          </div>
+          <ul className="space-y-2">
+            {rotationQueue.map(({ item, daysRemaining, window: windowDays }) => (
+              <li key={item.id} className="flex items-center justify-between gap-3 text-sm">
+                <span className="font-bold text-slate-700 truncate">
+                  {item.name}
+                  <span className="ml-2 text-[9px] font-black uppercase bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded">
+                    {daysRemaining === 0 ? 'Today' : `${daysRemaining}d`} · ≤{windowDays}d
+                  </span>
+                </span>
+                <button aria-label={`Queue a replacement for ${item.name}`} onClick={async () => { if (await onRestock([item])) alert(`Queued a replacement for ${item.name}.`); }} className="text-orange-700 font-black text-[10px] uppercase shrink-0">Replace</button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {showAdd && (
         <div className="space-y-4 mb-6 animate-in slide-in-from-top-4 duration-300">
-          {!editingItem && (
-            <div className="bg-indigo-50 p-4 rounded-[2rem] border border-indigo-100 flex gap-2">
-              <input className="flex-1 bg-white border border-indigo-100 rounded-xl px-4 py-2 text-sm outline-none" placeholder="e.g. '5lbs of rice at Costco'" value={smartText} onChange={e => setSmartText(e.target.value)} />
-              <button onClick={runSmart} disabled={isAiLoading} className="p-3 bg-indigo-600 text-white rounded-xl shadow-lg active:scale-95 disabled:opacity-50">
-                {isAiLoading ? <RefreshCw size={16} className="animate-spin" /> : <Zap size={16}/>}
-              </button>
-            </div>
-          )}
           <form onSubmit={submit} className="bg-white border-2 border-blue-100 rounded-[2.5rem] p-6 shadow-2xl space-y-4">
             <div className="flex justify-between mb-2">
               <h3 className="text-xs font-black uppercase text-blue-600">{editingItem ? 'Edit Item' : 'New Supply'}</h3>
@@ -663,9 +881,6 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
                  {form.image ? <img src={form.image} alt="icon" className="w-full h-full object-cover"/> : <span className="text-3xl">{form.emoji || '📦'}</span>}
                </div>
             </div>
-            <button type="button" onClick={handleGenerateImage} disabled={isImgLoading} className="w-full py-2 bg-slate-50 text-slate-500 text-xs font-bold rounded-xl mb-4 flex items-center justify-center gap-2 hover:bg-slate-100">
-               {isImgLoading ? <RefreshCw size={12} className="animate-spin"/> : <ImageIcon size={12}/>} Generate AI Icon
-            </button>
 
             <div className="grid grid-cols-2 gap-4">
               <div className="col-span-2"><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} /></div>
@@ -679,6 +894,18 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
               <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={categories} /></div>
 
               {isShoppingMode && <div className="col-span-2"><Label>Store</Label><Input val={form.store} set={v => setForm({...form, store: v})} placeholder="e.g. Costco" /></div>}
+              {!isShoppingMode && (
+                <>
+                  <div><Label>Location (optional)</Label><Input val={form.location} set={v => setForm({...form, location: v})} placeholder="e.g. Basement, Go-bag, Vehicle" /></div>
+                  <div>
+                    <Label>Kit (optional)</Label>
+                    <select className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none border border-transparent" value={form.kitId} onChange={e => setForm({...form, kitId: e.target.value})}>
+                      <option value="">Unassigned</option>
+                      {kits.map(kit => <option key={kit.id} value={kit.id}>{kit.name}</option>)}
+                    </select>
+                  </div>
+                </>
+              )}
 
               <div className="col-span-2">
                 <Label>Barcode (optional)</Label>
@@ -748,6 +975,8 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
         </div>
       )}
 
+      {!isShoppingMode && <KitsSection kits={kits} inventory={items} onAdd={onAddKit} onUpdate={onUpdateKit} onDelete={onDeleteKit} />}
+
       {isShoppingMode && (
          <div className="bg-emerald-50 border border-emerald-100 rounded-[2.5rem] p-5 shadow-sm flex items-center justify-between mb-6">
            <div>
@@ -790,39 +1019,299 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
   );
 }
 
+// --- Storage kits (go-bag, basement, vehicle, ...) ---
+const emptyKitForm = () => ({ name: '', purpose: '', targetContents: [] });
+
+function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState(emptyKitForm);
+
+  const reset = () => { setForm(emptyKitForm()); setEditingId(null); setShowAdd(false); };
+  const updateRow = (i, patch) => setForm(prev => ({...prev, targetContents: prev.targetContents.map((row, idx) => idx === i ? {...row, ...patch} : row)}));
+  const removeRow = (i) => setForm(prev => ({...prev, targetContents: prev.targetContents.filter((_, idx) => idx !== i)}));
+  const addRow = () => setForm(prev => ({...prev, targetContents: [...prev.targetContents, { name: '', quantity: 1, unit: 'units' }]}));
+
+  const submit = async (e) => {
+    e.preventDefault();
+    const data = {
+      name: form.name, purpose: form.purpose,
+      targetContents: form.targetContents.filter(row => String(row.name || '').trim()).map(row => ({ name: row.name.trim(), quantity: Number(row.quantity) || 0, unit: row.unit || 'units' })),
+    };
+    if (editingId) { if (!await onUpdate(editingId, data)) return; }
+    else if (!await onAdd(data)) return;
+    reset();
+  };
+  const handleEdit = (kit) => {
+    setForm({ name: kit.name, purpose: kit.purpose, targetContents: kit.targetContents.map(row => ({...row})) });
+    setEditingId(kit.id);
+    setShowAdd(true);
+  };
+
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm mb-6">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest flex items-center gap-2"><Layers size={14}/> Kits</h3>
+        <button aria-label={showAdd ? 'Cancel adding kit' : 'Add kit'} onClick={() => showAdd ? reset() : setShowAdd(true)} className="bg-slate-900 text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase flex items-center gap-1">
+          {showAdd ? 'Cancel' : <><Plus size={14}/> Add Kit</>}
+        </button>
+      </div>
+
+      {showAdd && (
+        <form onSubmit={submit} className="space-y-3 bg-slate-50 rounded-2xl p-5 mb-4">
+          <div className="flex justify-between items-center">
+            <h4 className="text-[10px] font-black uppercase text-blue-600">{editingId ? 'Edit Kit' : 'New Kit'}</h4>
+            {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
+          </div>
+          <div><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Go-bag — Dad" /></div>
+          <div><Label>Purpose (optional)</Label><Input val={form.purpose} set={v => setForm({...form, purpose: v})} placeholder="e.g. Grab-and-go bag for evacuation" /></div>
+          <div>
+            <Label>Target contents</Label>
+            <div className="space-y-2">
+              {form.targetContents.map((row, i) => (
+                <div key={i} className="flex gap-2 items-center">
+                  <div className="flex-1"><Input val={row.name} set={v => updateRow(i, {name: v})} placeholder="Item name" /></div>
+                  <div className="w-16"><Input val={row.quantity} set={v => updateRow(i, {quantity: v})} type="number" /></div>
+                  <div className="w-20"><Input val={row.unit} set={v => updateRow(i, {unit: v})} placeholder="unit" /></div>
+                  <button type="button" aria-label={`Remove ${row.name || 'target item'}`} onClick={() => removeRow(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
+                </div>
+              ))}
+              {form.targetContents.length === 0 && <p className="text-xs text-slate-500">No target items yet — the kit is "ready" once at least one item is assigned to it.</p>}
+            </div>
+            <button type="button" onClick={addRow} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1 mt-2"><Plus size={12}/> Add target item</button>
+          </div>
+          <button type="submit" className="w-full bg-blue-600 text-white py-3 rounded-xl font-black text-sm">{editingId ? 'Save Changes' : 'Add Kit'}</button>
+        </form>
+      )}
+
+      <div className="space-y-3">
+        {kits.map(kit => {
+          const completeness = kitCompleteness(kit, inventory);
+          const ready = completeness.percent >= 100;
+          return (
+            <div key={kit.id} className="border border-slate-200 rounded-2xl p-4 cursor-pointer" onClick={() => handleEdit(kit)}>
+              <div className="flex justify-between items-center gap-3">
+                <div className="min-w-0">
+                  <div className="font-black text-slate-800 text-sm truncate">{kit.name}</div>
+                  {kit.purpose && <div className="text-[10px] text-slate-500 truncate">{kit.purpose}</div>}
+                </div>
+                <div className={`text-[10px] font-black uppercase shrink-0 ${ready ? 'text-emerald-600' : 'text-amber-600'}`}>
+                  {completeness.totalCount > 0 ? `${completeness.metCount}/${completeness.totalCount} packed` : `${completeness.assignedCount} item${completeness.assignedCount === 1 ? '' : 's'}`}
+                </div>
+              </div>
+              <div className="mt-3 h-2 bg-slate-100 rounded-full overflow-hidden">
+                <div className={`h-full ${ready ? 'bg-emerald-500' : 'bg-amber-500'}`} style={{width: `${completeness.percent}%`}}/>
+              </div>
+            </div>
+          );
+        })}
+        {kits.length === 0 && !showAdd && <p className="text-center py-6 text-slate-600 text-xs font-bold uppercase tracking-widest">No kits yet</p>}
+      </div>
+    </section>
+  );
+}
+
 // --- Emergency Plan ---
-function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
+function FamilyMembersSection({ family, isEditing, onChange }) {
+  const updateMember = (i, patch) => onChange(family.map((m, idx) => idx === i ? { ...m, ...patch } : m));
+  const removeMember = (i) => onChange(family.filter((_, idx) => idx !== i));
+  const addMember = (kind) => onChange([...family, { name: '', role: kind === 'pet' ? 'Pet' : '', dob: '', kind, caloriesPerDay: '', waterGallonsPerDay: '' }]);
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <div className="flex justify-between items-center mb-6">
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest">Household Tracking</h3>
+        {isEditing && (
+          <div className="flex items-center gap-3">
+            <button type="button" onClick={() => addMember('person')} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add person</button>
+            <button type="button" onClick={() => addMember('pet')} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add pet</button>
+          </div>
+        )}
+      </div>
+      {family.length === 0 && !isEditing && <p className="text-xs text-slate-500 font-bold">No household members added yet.</p>}
+      <div className="space-y-4">
+        {family.map((m, i) => isEditing ? (
+          <div key={i} className="bg-slate-50 rounded-2xl p-4 space-y-3 border border-slate-100">
+            <div className="flex justify-between items-center">
+              <span className="text-[10px] font-black uppercase text-slate-500">{m.kind === 'pet' ? 'Pet' : 'Person'} {i + 1}</span>
+              <button type="button" aria-label={`Remove ${m.name || 'member'}`} onClick={() => removeMember(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><Label>Name</Label><Input val={m.name} set={v => updateMember(i, { name: v })} /></div>
+              <div><Label>Role</Label><Input val={m.role} set={v => updateMember(i, { role: v })} placeholder={m.kind === 'pet' ? 'Dog, Cat…' : 'Adult, Child…'} /></div>
+              <div className="col-span-2"><Label>{m.kind === 'pet' ? 'Date of birth (optional)' : 'Date of birth'}</Label><Input val={m.dob} set={v => updateMember(i, { dob: v })} type="date" /></div>
+              <div><Label>Calories per day</Label><Input val={m.caloriesPerDay ?? ''} set={v => updateMember(i, { caloriesPerDay: v })} type="number" placeholder={m.kind === 'pet' ? 'e.g. 700' : 'Household default'} /></div>
+              <div><Label>Water gal per day</Label><Input val={m.waterGallonsPerDay ?? ''} set={v => updateMember(i, { waterGallonsPerDay: v })} type="number" placeholder={m.kind === 'pet' ? 'e.g. 0.25' : 'Household default'} /></div>
+            </div>
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              {m.kind === 'pet'
+                ? 'Enter what this animal actually eats and drinks — a pet with blank figures counts for nothing in readiness.'
+                : 'Leave blank to count this person at the household defaults from Household settings.'}
+            </p>
+          </div>
+        ) : (
+          <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-4 last:border-0 last:pb-0">
+             <div className="flex items-center gap-4">
+                <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-3xl flex items-center justify-center font-black text-xl">{m.name[0]}</div>
+                <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-600 font-bold uppercase">{[m.role, m.dob, m.kind === 'pet' ? 'Pet' : ''].filter(Boolean).join(' • ')}</div></div>
+             </div>
+             {m.role === 'Child' && <div className="bg-indigo-50 text-indigo-700 text-[9px] font-black uppercase px-3 py-1 rounded-full">Priority</div>}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MeetingPointsSection({ primary, secondary, isEditing, onPrimaryChange, onSecondaryChange }) {
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Meeting Points</h3>
+      {isEditing ? (
+        <div className="grid grid-cols-1 gap-4">
+          <div><Label>Primary</Label><Input val={primary} set={onPrimaryChange} placeholder="e.g. End of the driveway" /></div>
+          <div><Label>Secondary (out of neighborhood)</Label><Input val={secondary} set={onSecondaryChange} placeholder="e.g. Community center on Main St" /></div>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div className="p-4 bg-slate-50 rounded-2xl">
+            <div className="text-[10px] font-black uppercase text-slate-500">Primary</div>
+            <div className="font-black text-slate-800 text-sm">{primary || 'Not set'}</div>
+          </div>
+          <div className="p-4 bg-slate-50 rounded-2xl">
+            <div className="text-[10px] font-black uppercase text-slate-500">Secondary</div>
+            <div className="font-black text-slate-800 text-sm">{secondary || 'Not set'}</div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ContactsSection({ contacts, isEditing, onChange }) {
+  const updateContact = (i, patch) => onChange(contacts.map((c, idx) => idx === i ? { ...c, ...patch } : c));
+  const removeContact = (i) => onChange(contacts.filter((_, idx) => idx !== i));
+  const addContact = () => onChange([...contacts, { name: '', phone: '', type: '' }]);
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <div className="flex justify-between items-center mb-6">
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest">Emergency Contacts</h3>
+        {isEditing && <button type="button" onClick={addContact} className="text-blue-600 text-[10px] font-black uppercase flex items-center gap-1"><Plus size={12}/> Add contact</button>}
+      </div>
+      {contacts.length === 0 && !isEditing && <p className="text-xs text-slate-500 font-bold">No emergency contacts added yet.</p>}
+      <div className="space-y-4">
+        {contacts.map((c, i) => isEditing ? (
+          <div key={i} className="bg-slate-50 rounded-2xl p-4 space-y-3 border border-slate-100">
+            <div className="flex justify-between items-center">
+              <span className="text-[10px] font-black uppercase text-slate-500">Contact {i + 1}</span>
+              <button type="button" aria-label={`Remove ${c.name || 'contact'}`} onClick={() => removeContact(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><Label>Name</Label><Input val={c.name} set={v => updateContact(i, { name: v })} /></div>
+              <div><Label>Phone</Label><Input val={c.phone} set={v => updateContact(i, { phone: v })} type="tel" /></div>
+              <div className="col-span-2"><Label>Type</Label><Input val={c.type} set={v => updateContact(i, { type: v })} placeholder="Out-of-area, Neighbor, Doctor…" /></div>
+            </div>
+          </div>
+        ) : (
+          <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-4 last:border-0 last:pb-0">
+             <div>
+               <div className="font-black text-slate-800">{c.name}</div>
+               <div className="text-[10px] text-slate-600 font-bold uppercase">{[c.type, c.phone].filter(Boolean).join(' • ')}</div>
+             </div>
+             {c.phone && <a aria-label={`Call ${c.name || c.phone}`} href={`tel:${c.phone.replace(/[^0-9+]/g, '')}`} className="p-2 text-blue-500"><Phone size={16}/></a>}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder, reminders = [], checklistChecks = [], medications = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem, onAddMedication, onUpdateMedication, onDeleteMedication }) {
   const [isEditing, setIsEditing] = useState(false);
   const [spot, setSpot] = useState(plan?.shelterSpot || '');
-  useEffect(() => { if (!isEditing) setSpot(plan?.shelterSpot || ''); }, [plan, isEditing]);
+  const [family, setFamily] = useState(plan?.family || []);
+  const [contacts, setContacts] = useState(plan?.contacts || []);
+  const [meetingPrimary, setMeetingPrimary] = useState(plan?.meetingPoints?.primary || '');
+  const [meetingSecondary, setMeetingSecondary] = useState(plan?.meetingPoints?.secondary || '');
+  const [saveError, setSaveError] = useState(null);
+  const resetFromPlan = () => {
+    setSpot(plan?.shelterSpot || '');
+    setFamily(plan?.family || []);
+    setContacts(plan?.contacts || []);
+    setMeetingPrimary(plan?.meetingPoints?.primary || '');
+    setMeetingSecondary(plan?.meetingPoints?.secondary || '');
+  };
+  useEffect(() => { if (!isEditing) resetFromPlan(); }, [plan, isEditing]);
+
+  const startEditing = () => setIsEditing(true);
+  const cancelEditing = () => { resetFromPlan(); setSaveError(null); setIsEditing(false); };
+  const saveEditing = async () => {
+    setSaveError(null);
+    const cleanedFamily = family.map(m => ({
+      name: (m.name || '').trim(), role: (m.role || '').trim(), dob: (m.dob || '').trim(),
+      kind: m.kind === 'pet' ? 'pet' : 'person',
+      // A blank field stays blank rather than becoming 0: it means "use the household default"
+      // for a person and "not counted yet" for a pet (see householdNeeds in shared/readiness.js).
+      caloriesPerDay: String(m.caloriesPerDay ?? '').trim() === '' ? '' : Number(m.caloriesPerDay),
+      waterGallonsPerDay: String(m.waterGallonsPerDay ?? '').trim() === '' ? '' : Number(m.waterGallonsPerDay),
+    }));
+    const cleanedContacts = contacts.map(c => ({ name: (c.name || '').trim(), phone: (c.phone || '').trim(), type: (c.type || '').trim() }));
+    // A row with some fields filled in but no name (family) or no name/phone (contacts) is
+    // refused rather than silently dropped below — only a row nothing was ever typed into
+    // (e.g. "Add member" clicked but never filled in) is safe to discard without telling anyone.
+    if (cleanedFamily.some(m => !m.name && (m.role || m.dob))) { setSaveError('Give each household member a name, or remove the empty row, before saving.'); return; }
+    if (cleanedContacts.some(c => !c.name && !c.phone && c.type)) { setSaveError('Give each contact a name or phone number, or remove the empty row, before saving.'); return; }
+    try {
+      const ok = await onUpdate({
+        ...plan,
+        shelterSpot: spot,
+        family: cleanedFamily.filter(m => m.name || m.role || m.dob || m.caloriesPerDay !== '' || m.waterGallonsPerDay !== ''),
+        contacts: cleanedContacts.filter(c => c.name || c.phone || c.type),
+        meetingPoints: { primary: meetingPrimary.trim(), secondary: meetingSecondary.trim() },
+      });
+      if (!ok) { setSaveError('Could not save plan. Please retry.'); return; }
+      setIsEditing(false);
+    } catch { setSaveError('Could not save plan. Please retry.'); }
+  };
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       <div className="flex justify-between items-center px-1">
         <h2 className="text-xl font-black text-slate-800">Family Hub</h2>
-        <button onClick={async () => { try { if(isEditing && !await onUpdate({...plan, shelterSpot: spot})) return; setIsEditing(!isEditing); } catch { alert("Could not save plan. Please retry."); } }} className="text-[10px] font-black px-6 py-2.5 rounded-full bg-blue-50 text-blue-600 uppercase tracking-widest">
-          {isEditing ? "Save" : "Edit"}
-        </button>
+        <div className="flex items-center gap-2">
+          {isEditing && (
+            <button onClick={cancelEditing} className="text-[10px] font-black px-5 py-2.5 rounded-full bg-slate-100 text-slate-600 uppercase tracking-widest">
+              Cancel
+            </button>
+          )}
+          <button onClick={isEditing ? saveEditing : startEditing} className="text-[10px] font-black px-6 py-2.5 rounded-full bg-blue-50 text-blue-600 uppercase tracking-widest">
+            {isEditing ? "Save" : "Edit"}
+          </button>
+        </div>
       </div>
+      {saveError && <p role="alert" className="text-xs font-bold text-red-600 px-1">{saveError}</p>}
 
-      <button onClick={onRunDrill} disabled={isAiLoading} className="w-full bg-indigo-50 text-indigo-700 py-4 rounded-[2.5rem] flex items-center justify-center gap-2 font-black text-xs uppercase tracking-widest border border-indigo-100 active:scale-95 transition-all">
-        {isAiLoading ? <RefreshCw className="animate-spin" size={16}/> : <Siren size={16}/>}
-        Run Emergency Simulation
-      </button>
-
-      <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
-        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-6">Household Tracking</h3>
-        <div className="space-y-5">
-          {plan?.family?.map((m, i) => (
-            <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-4 last:border-0 last:pb-0">
-               <div className="flex items-center gap-4">
-                  <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-3xl flex items-center justify-center font-black text-xl">{m.name[0]}</div>
-                  <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-600 font-bold uppercase">{m.role} • {m.dob}</div></div>
-               </div>
-               {m.role === 'Child' && <div className="bg-indigo-50 text-indigo-700 text-[9px] font-black uppercase px-3 py-1 rounded-full">Priority</div>}
-            </div>
+      <div className="bg-indigo-50 border border-indigo-100 rounded-[2.5rem] p-6 space-y-3">
+        <h3 className="text-[10px] font-black uppercase tracking-widest text-indigo-700 flex items-center gap-2"><Siren size={14}/> Outage simulator</h3>
+        <p className="text-[11px] text-slate-600 leading-relaxed">
+          Draws your stored power, heating fuel and water down over an outage of a given length, using the figures
+          you have recorded. Runs entirely on this device.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {[24, 72, settings.survivalGoalDays * 24].map(hours => (
+            <button key={hours} onClick={() => onRunSimulation(hours)} className="px-4 py-2.5 rounded-2xl bg-white border border-indigo-200 text-indigo-700 text-[10px] font-black uppercase tracking-widest active:scale-95 transition-all">
+              {hours < 48 ? `${hours} hours` : `${Math.round(hours / 24)} days`}
+            </button>
           ))}
         </div>
-      </section>
+      </div>
+
+      <button onClick={onOpenBinder} className="w-full bg-slate-50 text-slate-700 py-4 rounded-[2.5rem] flex items-center justify-center gap-2 font-black text-xs uppercase tracking-widest border border-slate-200 active:scale-95 transition-all">
+        <BookOpen size={16}/>
+        Printable Emergency Binder
+      </button>
+
+      <FamilyMembersSection family={isEditing ? family : (plan?.family || [])} isEditing={isEditing} onChange={setFamily} />
+
       <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
         <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Storm Point</h3>
         {isEditing ? (
@@ -831,6 +1320,20 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
           <div className="p-5 bg-orange-50 rounded-3xl border border-orange-100 font-black text-slate-700 italic text-sm">"{plan?.shelterSpot}"</div>
         )}
       </section>
+
+      <MeetingPointsSection
+        primary={isEditing ? meetingPrimary : (plan?.meetingPoints?.primary || '')}
+        secondary={isEditing ? meetingSecondary : (plan?.meetingPoints?.secondary || '')}
+        isEditing={isEditing}
+        onPrimaryChange={setMeetingPrimary}
+        onSecondaryChange={setMeetingSecondary}
+      />
+
+      <ContactsSection contacts={isEditing ? contacts : (plan?.contacts || [])} isEditing={isEditing} onChange={setContacts} />
+
+      <RemindersSection reminders={reminders} onAdd={onAddReminder} onUpdate={onUpdateReminder} onDelete={onDeleteReminder} onComplete={onCompleteReminder} onSnooze={onSnoozeReminder} />
+      <MedicationsSection medications={medications} onAdd={onAddMedication} onUpdate={onUpdateMedication} onDelete={onDeleteMedication} />
+      <ChecklistsSection checklistChecks={checklistChecks} onToggle={onToggleChecklistItem} />
 
       {/* Survival Sync Links Moved Here */}
       <div className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm mt-6">
@@ -853,6 +1356,234 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
         </div>
       </div>
     </div>
+  );
+}
+
+// --- Maintenance Reminders ---
+function getReminderIcon(category) {
+  switch (category) {
+    case 'Water Rotation': return <Droplets size={20}/>;
+    case 'Batteries': return <Battery size={20}/>;
+    case 'Generator Test': return <Zap size={20}/>;
+    case 'Medication': return <Shield size={20}/>;
+    default: return <ClipboardList size={20}/>;
+  }
+}
+const emptyReminderForm = () => ({ title: '', category: 'Water Rotation', recurringDays: 90, notes: '', startDate: todayLocal() });
+
+function RemindersSection({ reminders, onAdd, onUpdate, onDelete, onComplete, onSnooze }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState(emptyReminderForm);
+
+  const reset = () => { setForm(emptyReminderForm()); setEditingId(null); setShowAdd(false); };
+  const submit = async (e) => {
+    e.preventDefault();
+    const data = { ...form, recurringDays: Number(form.recurringDays) };
+    if (editingId) { if (!await onUpdate(editingId, data)) return; }
+    else if (!await onAdd(data)) return;
+    reset();
+  };
+  const handleEdit = (reminder) => {
+    setForm({ title: reminder.title, category: reminder.category, recurringDays: reminder.recurringDays, notes: reminder.notes, startDate: reminder.startDate || todayLocal() });
+    setEditingId(reminder.id);
+    setShowAdd(true);
+  };
+
+  const sorted = useMemo(() => [...reminders].sort((a, b) => (effectiveReminderDueDate(a) || '9999-99-99').localeCompare(effectiveReminderDueDate(b) || '9999-99-99')), [reminders]);
+
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest flex items-center gap-2"><ClipboardList size={14}/> Maintenance Reminders</h3>
+        <button aria-label={showAdd ? 'Cancel adding reminder' : 'Add reminder'} onClick={() => showAdd ? reset() : setShowAdd(true)} className="bg-slate-900 text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase flex items-center gap-1">
+          {showAdd ? 'Cancel' : <><Plus size={14}/> Add</>}
+        </button>
+      </div>
+
+      {showAdd && (
+        <form onSubmit={submit} className="space-y-3 bg-slate-50 rounded-2xl p-5 mb-4">
+          <div className="flex justify-between items-center">
+            <h4 className="text-[10px] font-black uppercase text-blue-600">{editingId ? 'Edit Reminder' : 'New Reminder'}</h4>
+            {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
+          </div>
+          <div><Label>Title</Label><Input val={form.title} set={v => setForm({...form, title: v})} placeholder="e.g. Rotate stored water" /></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={reminderCategories} /></div>
+            <div><Label>Repeat every (days)</Label><Input val={form.recurringDays} set={v => setForm({...form, recurringDays: v})} type="number" /></div>
+          </div>
+          <div><Label>Start date</Label><Input val={form.startDate} set={v => setForm({...form, startDate: v})} type="date" /></div>
+          <div><Label>Notes (optional)</Label><Input val={form.notes} set={v => setForm({...form, notes: v})} placeholder="Any details" /></div>
+          <button type="submit" className="w-full bg-blue-600 text-white py-3 rounded-xl font-black text-sm">{editingId ? 'Save Changes' : 'Add Reminder'}</button>
+        </form>
+      )}
+
+      <div className="space-y-3">
+        {sorted.map(reminder => {
+          const due = effectiveReminderDueDate(reminder);
+          const overdue = isReminderOverdue(reminder);
+          return (
+            <div key={reminder.id} className={`border p-4 rounded-2xl ${overdue ? 'bg-red-50 border-red-200' : 'bg-white border-slate-200'}`}>
+              <div className="flex items-center gap-3 min-w-0 cursor-pointer" onClick={() => handleEdit(reminder)}>
+                <div className={`p-2.5 rounded-xl shrink-0 ${overdue ? 'bg-red-100 text-red-600' : 'bg-slate-100 text-slate-600'}`}>{getReminderIcon(reminder.category)}</div>
+                <div className="min-w-0">
+                  <div className="font-black text-slate-800 text-sm truncate">{reminder.title}</div>
+                  <div className="text-[10px] font-bold text-slate-600 uppercase">{reminder.category} • Every {reminder.recurringDays}d</div>
+                  <div className={`text-[10px] font-black uppercase mt-0.5 ${overdue ? 'text-red-600' : 'text-slate-500'}`}>
+                    {due ? (overdue ? `Overdue since ${due}` : `Due ${due}`) : 'No start date set'}
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-2 mt-3">
+                <button aria-label={`Mark ${reminder.title} complete`} onClick={() => onComplete(reminder)} className="flex-1 bg-emerald-50 text-emerald-700 py-2 rounded-xl text-[10px] font-black uppercase flex items-center justify-center gap-1"><CheckCircle size={12}/> Mark Complete</button>
+                <button aria-label={`Snooze ${reminder.title} 7 days`} onClick={() => onSnooze(reminder, 7)} className="flex-1 bg-amber-50 text-amber-700 py-2 rounded-xl text-[10px] font-black uppercase">Snooze 7d</button>
+              </div>
+            </div>
+          );
+        })}
+        {reminders.length === 0 && !showAdd && <p className="text-center py-6 text-slate-600 text-xs font-bold uppercase tracking-widest">No reminders yet</p>}
+      </div>
+      <ReminderHistoryPanel />
+    </section>
+  );
+}
+
+function ReminderHistoryPanel() {
+  const [entries, setEntries] = useState(null);
+  useEffect(() => { request('reminder-history').then(r => setEntries(r.entries)).catch(() => setEntries([])); }, []);
+  if (!entries) return null;
+  return (
+    <div className="mt-5 pt-4 border-t border-slate-100">
+      <h4 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-2 flex items-center gap-2"><History size={12}/> Recent checks</h4>
+      {entries.length === 0 ? <p className="text-xs text-slate-500">No completed or snoozed reminders yet.</p> : (
+        <ul className="space-y-1 max-h-40 overflow-y-auto text-xs text-slate-600">
+          {entries.map((entry, i) => (
+            <li key={i}>
+              <span className="font-bold text-slate-800">{entry.reminderTitle || 'A reminder'}</span> was {entry.event}
+              {entry.event === 'snoozed' ? ` until ${entry.eventDate}` : ` on ${entry.eventDate}`} by {entry.actorEmail || 'someone'}
+              · <span className="text-slate-400">{new Date(entry.createdAt).toLocaleString()}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// --- Medications and prescriptions ---
+const emptyMedicationForm = () => ({ person: '', name: '', dose: '', quantityOnHand: '', refillDate: '', prescriber: '', notes: '' });
+
+function MedicationsSection({ medications, onAdd, onUpdate, onDelete }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState(emptyMedicationForm);
+
+  const reset = () => { setForm(emptyMedicationForm()); setEditingId(null); setShowAdd(false); };
+  const submit = async (e) => {
+    e.preventDefault();
+    const data = { ...form, quantityOnHand: Number(form.quantityOnHand) || 0 };
+    if (editingId) { if (!await onUpdate(editingId, data)) return; }
+    else if (!await onAdd(data)) return;
+    reset();
+  };
+  const handleEdit = (medication) => {
+    setForm({ person: medication.person, name: medication.name, dose: medication.dose, quantityOnHand: medication.quantityOnHand, refillDate: medication.refillDate, prescriber: medication.prescriber, notes: medication.notes });
+    setEditingId(medication.id);
+    setShowAdd(true);
+  };
+
+  const sorted = useMemo(() => [...medications].sort((a, b) => (a.refillDate || '9999-99-99').localeCompare(b.refillDate || '9999-99-99')), [medications]);
+
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest flex items-center gap-2"><Shield size={14}/> Medications</h3>
+        <button aria-label={showAdd ? 'Cancel adding medication' : 'Add medication'} onClick={() => showAdd ? reset() : setShowAdd(true)} className="bg-slate-900 text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase flex items-center gap-1">
+          {showAdd ? 'Cancel' : <><Plus size={14}/> Add</>}
+        </button>
+      </div>
+
+      {showAdd && (
+        <form onSubmit={submit} className="space-y-3 bg-slate-50 rounded-2xl p-5 mb-4">
+          <div className="flex justify-between items-center">
+            <h4 className="text-[10px] font-black uppercase text-blue-600">{editingId ? 'Edit Medication' : 'New Medication'}</h4>
+            {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
+          </div>
+          <div><Label>Medication name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Lisinopril" /></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Person</Label><Input val={form.person} set={v => setForm({...form, person: v})} placeholder="Who takes this" /></div>
+            <div><Label>Dose</Label><Input val={form.dose} set={v => setForm({...form, dose: v})} placeholder="e.g. 10mg daily" /></div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Quantity on hand</Label><Input val={form.quantityOnHand} set={v => setForm({...form, quantityOnHand: v})} type="number" /></div>
+            <div><Label>Refill date</Label><Input val={form.refillDate} set={v => setForm({...form, refillDate: v})} type="date" /></div>
+          </div>
+          <div><Label>Prescriber (optional)</Label><Input val={form.prescriber} set={v => setForm({...form, prescriber: v})} placeholder="Doctor or pharmacy" /></div>
+          <div><Label>Notes (optional)</Label><Input val={form.notes} set={v => setForm({...form, notes: v})} placeholder="Any details" /></div>
+          <button type="submit" className="w-full bg-blue-600 text-white py-3 rounded-xl font-black text-sm">{editingId ? 'Save Changes' : 'Add Medication'}</button>
+        </form>
+      )}
+
+      <div className="space-y-3">
+        {sorted.map(medication => {
+          const dueForRefill = isMedicationRefillDue(medication);
+          return (
+            <div key={medication.id} className={`border p-4 rounded-2xl cursor-pointer ${dueForRefill ? 'bg-red-50 border-red-200' : 'bg-white border-slate-200'}`} onClick={() => handleEdit(medication)}>
+              <div className="flex items-center gap-3 min-w-0">
+                <div className={`p-2.5 rounded-xl shrink-0 ${dueForRefill ? 'bg-red-100 text-red-600' : 'bg-slate-100 text-slate-600'}`}><Shield size={20}/></div>
+                <div className="min-w-0">
+                  <div className="font-black text-slate-800 text-sm truncate">{medication.name}{medication.dose ? ` — ${medication.dose}` : ''}</div>
+                  <div className="text-[10px] font-bold text-slate-600 uppercase">{[medication.person, `${medication.quantityOnHand} on hand`].filter(Boolean).join(' • ')}</div>
+                  <div className={`text-[10px] font-black uppercase mt-0.5 ${dueForRefill ? 'text-red-600' : 'text-slate-500'}`}>
+                    {medication.refillDate ? (dueForRefill ? `Refill due since ${medication.refillDate}` : `Refill by ${medication.refillDate}`) : 'No refill date set'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {medications.length === 0 && !showAdd && <p className="text-center py-6 text-slate-600 text-xs font-bold uppercase tracking-widest">No medications tracked yet</p>}
+      </div>
+    </section>
+  );
+}
+
+// --- Seasonal Checklists ---
+function ChecklistsSection({ checklistChecks, onToggle }) {
+  const checkedIds = useMemo(() => new Set(checklistChecks.map(c => c.id)), [checklistChecks]);
+  const [openSeason, setOpenSeason] = useState(null);
+  return (
+    <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
+      <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4 flex items-center gap-2"><Layers size={14}/> Seasonal Checklists</h3>
+      <div className="space-y-3">
+        {checklistCatalog.map(({season, label, items}) => {
+          const doneCount = items.filter(item => checkedIds.has(`${season}__${item.id}`)).length;
+          const open = openSeason === season;
+          return (
+            <div key={season} className="border border-slate-100 rounded-2xl overflow-hidden">
+              <button type="button" aria-expanded={open} onClick={() => setOpenSeason(open ? null : season)} className="w-full flex justify-between items-center px-4 py-3 bg-slate-50">
+                <span className="font-black text-slate-800 text-sm">{label}</span>
+                <span className={`text-[10px] font-black uppercase ${doneCount === items.length ? 'text-emerald-600' : 'text-slate-500'}`}>{doneCount}/{items.length}</span>
+              </button>
+              {open && (
+                <div className="p-4 space-y-2">
+                  {items.map(item => {
+                    const id = `${season}__${item.id}`;
+                    const checked = checkedIds.has(id);
+                    return (
+                      <label key={item.id} className="flex items-center gap-3 text-sm">
+                        <input type="checkbox" checked={checked} onChange={e => onToggle(season, item.id, e.target.checked)} className="h-4 w-4 accent-blue-600 shrink-0" />
+                        <span className={checked ? 'line-through text-slate-400' : 'text-slate-700'}>{item.text}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -1011,7 +1742,7 @@ function SummaryCard({ icon, color, label, value, unit, pct }) {
   );
 }
 
-function InventoryItem({ item, forecast, onClick, onBuy, selected, onSelect }) {
+export function InventoryItem({ item, forecast, onClick, onBuy, selected, onSelect }) {
   const { icon, style } = getCategoryIcon(item.category);
   const price = item.price ? Number(item.price) : 0;
   const totalVal = price * (Number(item.quantity) || 0);
@@ -1030,47 +1761,51 @@ function InventoryItem({ item, forecast, onClick, onBuy, selected, onSelect }) {
   const expired = isExpired(item.expiryDate);
 
   return (
-    <div role="button" tabIndex="0" aria-label={`Edit ${item.name}`} onClick={onClick} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onClick(); } }} className={`bg-white border border-slate-200 p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm active:scale-95 transition-all cursor-pointer ${expired ? 'border-red-300 bg-red-50' : ''}`}>
+    <div className={`bg-white border border-slate-200 p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm active:scale-95 transition-all ${expired ? 'border-red-300 bg-red-50' : ''}`}>
        <div className="flex items-center gap-3 min-w-0">
-          {onSelect && <input aria-label={`Select ${item.name}`} type="checkbox" checked={selected} onChange={event => { event.stopPropagation(); onSelect(event.target.checked); }} onClick={event => event.stopPropagation()} className="h-4 w-4 accent-blue-600" />}
-          <div className={`w-12 h-12 rounded-2xl flex items-center justify-center overflow-hidden ${style}`}>
-            {item.image ? (
-               <img src={item.image} alt="" className="w-full h-full object-cover"/>
-            ) : (
-               item.emoji ? <span className="text-2xl">{item.emoji}</span> : icon
-            )}
-          </div>
-          <div>
-             <div className="flex items-center gap-2">
-               <h4 className="font-black text-slate-800 leading-tight">{item.name}</h4>
-               {item.macroTag && (
-                 <span className={`text-[8px] font-bold uppercase px-1.5 py-0.5 rounded-md ${getTagColor(item.macroTag)}`}>
-                   {item.macroTag}
-                 </span>
+          {onSelect && <input aria-label={`Select ${item.name}`} type="checkbox" checked={selected} onChange={event => onSelect(event.target.checked)} className="h-4 w-4 accent-blue-600" />}
+          {/* Edit control is scoped to just the icon/name so it doesn't nest the
+              checkbox or buy button above inside a single focusable "button" region. */}
+          <div role="button" tabIndex="0" aria-label={`Edit ${item.name}`} onClick={onClick} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onClick(); } }} className="flex items-center gap-3 min-w-0 cursor-pointer">
+            <div className={`w-12 h-12 rounded-2xl flex items-center justify-center overflow-hidden ${style}`}>
+              {item.image ? (
+                 <img src={item.image} alt="" className="w-full h-full object-cover"/>
+              ) : (
+                 item.emoji ? <span className="text-2xl">{item.emoji}</span> : icon
+              )}
+            </div>
+            <div>
+               <div className="flex items-center gap-2">
+                 <h4 className="font-black text-slate-800 leading-tight">{item.name}</h4>
+                 {item.macroTag && (
+                   <span className={`text-[8px] font-bold uppercase px-1.5 py-0.5 rounded-md ${getTagColor(item.macroTag)}`}>
+                     {item.macroTag}
+                   </span>
+                 )}
+               </div>
+               <div className="flex gap-2 mt-1">
+                 {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
+                 <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
+                  {item.quantity} {item.unit}
+                 </p>
+               </div>
+               {price > 0 && (
+                 <p className="text-[9px] font-black text-emerald-600 mt-1">
+                   ${price.toFixed(2)}/ea • Total: ${totalVal.toFixed(2)}
+                 </p>
                )}
-             </div>
-             <div className="flex gap-2 mt-1">
-               {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
-               <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
-                {item.quantity} {item.unit}
-               </p>
-             </div>
-             {price > 0 && (
-               <p className="text-[9px] font-black text-emerald-600 mt-1">
-                 ${price.toFixed(2)}/ea • Total: ${totalVal.toFixed(2)}
-               </p>
-             )}
              {forecast?.projectedDepletionDate && (
                <p className="text-[9px] font-black text-violet-700 mt-1">
-                 Burns ~${forecast.ratePerDay.toFixed(2)} {item.unit}/day · depleted {formatCalendarDate(forecast.projectedDepletionDate)}
+                 Burns ~{forecast.ratePerDay.toFixed(2)} {item.unit}/day · depleted {formatCalendarDate(forecast.projectedDepletionDate)}
                </p>
              )}
+            </div>
           </div>
        </div>
        <div className="flex items-center gap-2">
          {onBuy && (
            <button aria-label={`Move ${item.name} to inventory`}
-             onClick={(e) => { e.stopPropagation(); onBuy(item); }}
+             onClick={() => onBuy(item)}
              className="p-2 bg-slate-100 text-slate-500 hover:bg-emerald-100 hover:text-emerald-600 rounded-full transition-colors"
              title="Buy & Move to Inventory"
            >
@@ -1124,7 +1859,119 @@ function formatRelativeTime(timestamp) {
   return `Saved ${minutes}m ago`;
 }
 
-function Header({ hubId, isSyncing, online, pendingSync, lastSyncedAt, onSyncClick, error, onDownload }) {
+// Printable/offline fallback for when the app itself is unreachable (dead phone, no network):
+// everything a household would need on paper, rendered from the same state already held in
+// memory (which itself came from the local cache when offline), with nothing fetched here.
+// Replaces the normal app shell entirely while open, so printing needs no print stylesheet to
+// hide anything else — this is the only content on the page.
+export function EmergencyBinder({ plan, inventory = [], stats, settings, checklistChecks = [], medications = [], onClose }) {
+  const checkedIds = useMemo(() => new Set(checklistChecks.map(c => c.id)), [checklistChecks]);
+  const categoryCounts = useMemo(() => {
+    const counts = {};
+    inventory.forEach(item => { const cat = item.category || 'Uncategorized'; counts[cat] = (counts[cat] || 0) + 1; });
+    return counts;
+  }, [inventory]);
+  const family = plan?.family || [];
+  const contacts = plan?.contacts || [];
+  const generatedAt = new Date().toLocaleString();
+
+  return (
+    <div className="min-h-screen bg-white text-slate-900 p-6 max-w-2xl mx-auto font-sans print:p-0">
+      <div className="print:hidden flex justify-between items-center gap-3 mb-8">
+        <h1 className="text-lg font-black">Emergency Binder</h1>
+        <div className="flex gap-2">
+          <button onClick={() => window.print()} className="px-5 py-2.5 rounded-full bg-blue-600 text-white text-xs font-black uppercase tracking-widest">Print</button>
+          <button onClick={onClose} className="px-5 py-2.5 rounded-full bg-slate-100 text-slate-600 text-xs font-black uppercase tracking-widest">Close</button>
+        </div>
+      </div>
+      <div className="hidden print:block mb-6">
+        <h1 className="text-2xl font-black">NorthStar Prep — Emergency Binder</h1>
+        <p className="text-xs text-slate-500">Generated {generatedAt}. Keep a copy where power and network aren't required to read it.</p>
+      </div>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Shelter spot</h2>
+        <p className="text-sm">{plan?.shelterSpot || 'Not set.'}</p>
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Meeting points</h2>
+        <p className="text-sm"><strong>Primary:</strong> {plan?.meetingPoints?.primary || 'Not set'}</p>
+        <p className="text-sm"><strong>Secondary:</strong> {plan?.meetingPoints?.secondary || 'Not set'}</p>
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Household members</h2>
+        {family.length === 0 ? <p className="text-sm text-slate-500">None recorded.</p> : (
+          <ul className="text-sm space-y-1">
+            {family.map((m, i) => <li key={i}>{m.name} — {m.role || 'Household member'}{m.dob ? `, born ${m.dob}` : ''}</li>)}
+          </ul>
+        )}
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Emergency contacts</h2>
+        {contacts.length === 0 ? <p className="text-sm text-slate-500">None recorded.</p> : (
+          <ul className="text-sm space-y-1">
+            {contacts.map((c, i) => <li key={i}>{c.name}{c.type ? ` (${c.type})` : ''} — {c.phone || 'no phone on file'}</li>)}
+          </ul>
+        )}
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Medications</h2>
+        {medications.length === 0 ? <p className="text-sm text-slate-500">None recorded.</p> : (
+          <ul className="text-sm space-y-1">
+            {medications.map(m => (
+              <li key={m.id}>
+                {m.name}{m.dose ? ` (${m.dose})` : ''} — {m.person || 'Unassigned'}, {m.quantityOnHand} on hand
+                {m.refillDate ? `, refill by ${m.refillDate}` : ''}{m.prescriber ? `, ${m.prescriber}` : ''}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Readiness summary</h2>
+        <ul className="text-sm space-y-1">
+          <li>Water: {stats.waterDays.toFixed(1)} of {settings.survivalGoalDays} goal days</li>
+          <li>Food: {stats.foodDays.toFixed(1)} of {settings.survivalGoalDays} goal days</li>
+          <li>Heat: {stats.totalFuelHours.toFixed(0)} of {settings.heatGoalHours} goal hours</li>
+          <li>Power: {stats.totalPowerKwh.toFixed(1)} of {settings.powerGoalKwh} goal kWh</li>
+          <li>{stats.lowStock} item{stats.lowStock === 1 ? '' : 's'} low stock, {stats.expired} item{stats.expired === 1 ? '' : 's'} expired</li>
+        </ul>
+      </section>
+
+      <section className="mb-8 break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Inventory summary</h2>
+        {Object.keys(categoryCounts).length === 0 ? <p className="text-sm text-slate-500">No supplies recorded.</p> : (
+          <ul className="text-sm space-y-1">
+            {Object.entries(categoryCounts).map(([cat, count]) => <li key={cat}>{cat}: {count} item{count === 1 ? '' : 's'}</li>)}
+          </ul>
+        )}
+      </section>
+
+      <section className="break-inside-avoid">
+        <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Seasonal checklists</h2>
+        <div className="space-y-4">
+          {checklistCatalog.map(season => (
+            <div key={season.season}>
+              <h3 className="text-xs font-black uppercase text-slate-600 mb-1">{season.label}</h3>
+              <ul className="text-sm space-y-0.5">
+                {season.items.map(item => (
+                  <li key={item.id}>{checkedIds.has(`${season.season}__${item.id}`) ? '☑' : '☐'} {item.text}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+export function Header({ hubId, isSyncing, online, pendingSync, lastSyncedAt, onSyncClick, error, onDownload }) {
   return (
     <header className="bg-slate-900 text-white p-4 sticky top-0 z-50 shadow-xl border-b border-white/5">
       <div className="max-w-xl mx-auto flex justify-between items-center text-white">
@@ -1137,7 +1984,7 @@ function Header({ hubId, isSyncing, online, pendingSync, lastSyncedAt, onSyncCli
           <button aria-label="Open household settings" onClick={onSyncClick} className="flex flex-col items-end">
             <div aria-live="polite" className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[9px] font-black uppercase transition-all ${error ? 'bg-red-500/20 text-red-300' : isSyncing ? 'bg-blue-500/20 text-blue-300' : 'bg-green-500/20 text-green-300'}`}>
               {error ? <AlertOctagon size={10}/> : isSyncing ? <RefreshCw size={10} className="animate-spin" /> : <CheckCircle size={10} />}
-              {online ? (pendingSync ? `${pendingSync} queued` : formatRelativeTime(lastSyncedAt)) : 'Offline'}
+              {error ? 'Sync error' : online ? (pendingSync ? `${pendingSync} queued` : formatRelativeTime(lastSyncedAt)) : 'Offline'}
             </div>
           </button>
         </div>
@@ -1179,7 +2026,7 @@ function getCategoryIcon(cat) {
 }
 
 // --- Modals ---
-function useDialogFocus(dialogRef, onClose) {
+export function useDialogFocus(dialogRef, onClose) {
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   useEffect(() => {
@@ -1263,6 +2110,7 @@ function MembersPanel({ currentUserId }) {
   const [error, setError] = useState(null);
   const [inviteForm, setInviteForm] = useState({ email: '', role: 'member' });
   const [inviteLink, setInviteLink] = useState(null);
+  const [resetLink, setResetLink] = useState(null);
   const [busy, setBusy] = useState(false);
 
   const load = () => request('members').then(setData).catch(err => setError(err.message));
@@ -1286,7 +2134,15 @@ function MembersPanel({ currentUserId }) {
     setError(null);
     try { await request('members', { type: 'revoke', invitationId }); await load(); } catch (err) { setError(err.message); }
   };
+  const sendResetLink = async userId => {
+    setError(null);
+    try {
+      const result = await request('members', { type: 'reset-link', userId });
+      setResetLink({ userId, url: `${window.location.origin}${window.location.pathname}?reset=${result.token}` });
+    } catch (err) { setError(err.message); }
+  };
   const copyLink = () => { if (inviteLink) navigator.clipboard?.writeText(inviteLink).catch(() => {}); };
+  const copyResetLink = () => { if (resetLink) navigator.clipboard?.writeText(resetLink.url).catch(() => {}); };
 
   if (!data) return <p className="text-xs text-slate-500">Loading household members…</p>;
   return (
@@ -1297,12 +2153,23 @@ function MembersPanel({ currentUserId }) {
         {data.members.map(m => (
           <li key={m.user_id} className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2 text-sm">
             <span className="truncate">{m.email} <span className="text-[10px] font-black uppercase text-slate-500">{m.role}</span></span>
-            {data.role === 'owner' && m.user_id !== currentUserId && (
-              <button onClick={() => remove(m.user_id)} className="text-red-600 text-[10px] font-black uppercase ml-2 shrink-0">Remove</button>
+            {data.role === 'owner' && (
+              <span className="flex items-center gap-2 ml-2 shrink-0">
+                <button onClick={() => sendResetLink(m.user_id)} className="text-blue-700 text-[10px] font-black uppercase">Reset link</button>
+                {m.user_id !== currentUserId && <button onClick={() => remove(m.user_id)} className="text-red-600 text-[10px] font-black uppercase">Remove</button>}
+              </span>
             )}
           </li>
         ))}
       </ul>
+      {resetLink && (
+        <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 space-y-2 text-xs">
+          <p className="font-black text-blue-900">Send this password reset link to {data.members.find(m => m.user_id === resetLink.userId)?.email || 'the member'}:</p>
+          <input readOnly value={resetLink.url} onFocus={e => e.target.select()} className="w-full bg-white rounded-lg p-2 text-[10px] font-mono border border-blue-200" />
+          <button type="button" onClick={copyResetLink} className="rounded-lg bg-blue-600 text-white px-3 py-1.5 font-black">Copy link</button>
+          <p className="text-blue-800">Expires in 1 hour and can only be used once.</p>
+        </div>
+      )}
       {data.role === 'owner' && (
         <>
           <form onSubmit={invite} className="space-y-2">
@@ -1336,6 +2203,34 @@ function MembersPanel({ currentUserId }) {
   );
 }
 
+// Self-service password change for a signed-in user who still knows their current password.
+// A locked-out member instead needs a reset link from an owner (see MembersPanel).
+function ChangePasswordPanel() {
+  const [form, setForm] = useState({ currentPassword: '', newPassword: '' });
+  const [message, setMessage] = useState(null);
+  const [saved, setSaved] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async e => {
+    e.preventDefault(); setMessage(null); setSaved(false); setBusy(true);
+    try {
+      await request('password', form);
+      setForm({ currentPassword: '', newPassword: '' }); setSaved(true);
+    } catch (err) { setMessage(err.message); } finally { setBusy(false); }
+  };
+
+  return (
+    <form onSubmit={submit} className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Change your password</h3>
+      {message && <p role="alert" className="text-xs font-bold text-red-600">{message}</p>}
+      {saved && <p className="text-xs font-bold text-emerald-600">Password changed.</p>}
+      <label className="block text-sm">Current password<input autoComplete="current-password" type="password" required value={form.currentPassword} onChange={e => setForm({...form, currentPassword: e.target.value})} className="mt-1 w-full rounded-xl border border-slate-200 p-2.5 text-sm" /></label>
+      <label className="block text-sm">New password<input autoComplete="new-password" type="password" required minLength={8} value={form.newPassword} onChange={e => setForm({...form, newPassword: e.target.value})} className="mt-1 w-full rounded-xl border border-slate-200 p-2.5 text-sm" /></label>
+      <button type="submit" disabled={busy} className="w-full rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">{busy ? 'Saving…' : 'Change password'}</button>
+    </form>
+  );
+}
+
 function ActivityPanel() {
   const [entries, setEntries] = useState(null);
   useEffect(() => { request('audit').then(r => setEntries(r.entries)).catch(() => setEntries([])); }, []);
@@ -1357,28 +2252,124 @@ function ActivityPanel() {
   );
 }
 
-function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId}) {
+function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pendingImportSource,onConfirmImport,onCancelImport,onApplyTemplate,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,onOpenBinder}) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
     <section ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="settings-title" className="bg-white w-full max-w-sm rounded-3xl p-8 space-y-5 max-h-[85vh] overflow-y-auto">
       <h2 id="settings-title" className="text-xl font-black">Household settings</h2>
       <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances, consumption history and your family plan.</p>
+      <button type="button" onClick={onOpenBinder} className="w-full rounded-xl p-3 bg-slate-50 border border-slate-200 text-sm font-bold flex items-center justify-center gap-2"><BookOpen size={16}/> Printable emergency binder</button>
       <label className="block text-sm font-bold">Import JSON backup<input type="file" accept=".json,application/json" onChange={onImport} className="block mt-2 w-full text-xs" /></label>
+      <div className="space-y-2">
+        <label className="block text-sm font-bold">Import inventory/shopping CSV<input type="file" accept=".csv,text/csv" onChange={onImportCsv} className="block mt-2 w-full text-xs" /></label>
+        <button type="button" onClick={onDownloadCsv} className="w-full rounded-xl p-3 bg-slate-50 border border-slate-200 text-sm font-bold flex items-center justify-center gap-2"><Download size={16}/> Export inventory/shopping CSV</button>
+      </div>
+      <StarterTemplatesPanel settings={settings} onApply={onApplyTemplate} disabled={Boolean(pendingImport)} />
       {pendingImport && <div role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-2 text-sm">
-        <p className="font-black text-amber-900">Backup ready to review</p>
-        <p className="text-amber-800">{pendingImport.inventory.length} inventory items, {pendingImport.shoppingList.length} shopping items, {pendingImport.appliances.length} appliances, {pendingImport.consumption.length} consumption events and {pendingImport.plan ? 'a family plan' : 'no family plan'} will be merged by ID.</p>
+        <p className="font-black text-amber-900">{pendingImportSource?.kind === 'template' ? `${pendingImportSource.label} ready to review` : pendingImportSource?.kind === 'csv' ? 'CSV ready to review' : 'Backup ready to review'}</p>
+        <p className="text-amber-800">{pendingImport.inventory.length} inventory items, {pendingImport.shoppingList.length} shopping items, {pendingImport.appliances.length} appliances, {pendingImport.consumption?.length ?? 0} consumption events and {pendingImport.plan ? 'a family plan' : 'no family plan'} will be merged by ID.</p>
+        {pendingImport.reminders?.length > 0 && <p className="text-amber-800">{pendingImport.reminders.length} maintenance reminders will be merged.</p>}
         {pendingImport.settings && <p className="text-amber-800">Readiness assumptions are included.</p>}
-        <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">Merge backup</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
+        {pendingImportSource?.kind === 'csv' && pendingImportSource.errors?.length > 0 && (
+          <div className="rounded-xl border border-red-200 bg-red-50 p-3 space-y-1">
+            <p className="font-black text-red-900">{pendingImportSource.errors.length} row{pendingImportSource.errors.length === 1 ? '' : 's'} skipped</p>
+            <ul className="text-xs text-red-800 space-y-0.5 max-h-32 overflow-y-auto">
+              {pendingImportSource.errors.map((err, index) => <li key={index}>Row {err.row}: {err.message}</li>)}
+            </ul>
+          </div>
+        )}
+        {pendingImportSource?.kind === 'template' && (
+          <>
+            <ul className="text-amber-800 text-xs space-y-0.5 max-h-40 overflow-y-auto">
+              {pendingImport.inventory.map(row => <li key={row.id}>{row.name} — {row.quantity} {row.unit}</li>)}
+            </ul>
+            <p className="text-amber-900 font-bold">These quantities are a starting point scaled to {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} for {settings.survivalGoalDays} days — adjust them to what your household actually keeps. They are not a recommendation to follow exactly.</p>
+          </>
+        )}
+        <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">{pendingImportSource?.kind === 'template' ? 'Add these supplies' : 'Merge backup'}</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
       </div>}
       <SettingsForm settings={settings} onSave={onUpdateSettings} />
+      <ServiceHealthPanel />
       <BackupsPanel onRestore={onRestoreBackup} />
       <MembersPanel currentUserId={currentUserId} />
+      <ChangePasswordPanel />
       <ActivityPanel />
       <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>
       <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>
     </section>
   </div>;
+}
+
+// Starter supply templates for a household staring at an empty screen. Applying one runs through
+// the same preview-and-merge path as a JSON backup, so nothing is overwritten without confirmation.
+function StarterTemplatesPanel({ settings, onApply, disabled }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <section className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
+      <button type="button" onClick={() => setOpen(value => !value)} aria-expanded={open} className="w-full flex items-center justify-between text-sm font-bold text-slate-700">
+        <span className="flex items-center gap-2"><Layers size={16}/> Starter supply templates</span>
+        <ChevronRight size={16} className={`transition-transform ${open ? 'rotate-90' : ''}`}/>
+      </button>
+      {open && (
+        <div className="space-y-3">
+          <p className="text-xs text-slate-600 leading-relaxed">
+            Quantities are scaled to {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} for {settings.survivalGoalDays} days.
+            They are a starting point to adjust, not a recommendation to follow exactly — every household's needs differ.
+            You will see exactly what gets added before anything is saved.
+          </p>
+          <ul className="space-y-2">
+            {supplyTemplateCatalog.map(template => (
+              <li key={template.id} className="bg-white border border-slate-200 rounded-xl p-3 flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-xs font-black text-slate-800">{template.label}</div>
+                  <p className="text-[11px] text-slate-600 leading-relaxed">{template.description}</p>
+                  <p className="text-[10px] text-slate-500 mt-1">{template.items.length} items</p>
+                </div>
+                <button type="button" disabled={disabled} onClick={() => onApply(template.id)} className="shrink-0 rounded-xl bg-slate-900 px-3 py-2 text-[10px] font-black uppercase text-white disabled:opacity-40">Preview</button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// Operational visibility for whoever runs the deployment: API/database availability now, plus
+// the last 24 hours of failed writes, sign-in failures and database latency. Everything shown
+// comes from content-free counters (route, outcome, status, latency), never household data.
+function ServiceHealthPanel() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  useEffect(() => { request('health').then(setData).catch(err => setError(err.message)); }, []);
+  const metrics = data?.metrics;
+  const failing = metrics ? metrics.totals.failedWrites + metrics.totals.serverErrors : 0;
+
+  return (
+    <div className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Service health</h3>
+      {error && <p role="alert" className="text-xs font-bold text-red-600">API or database unavailable: {error}</p>}
+      {!data && !error && <p className="text-xs text-slate-500">Checking service health…</p>}
+      {data && <p className="text-xs text-slate-600">API and database reachable · {data.latencyMs} ms database round trip.</p>}
+      {metrics && <>
+        <p className={`text-xs font-bold ${failing ? 'text-red-700' : 'text-emerald-700'}`}>
+          {failing ? `${failing} failed request${failing === 1 ? '' : 's'} in the last 24 hours` : 'No failed requests in the last 24 hours'}
+        </p>
+        <ul className="text-xs text-slate-600 space-y-1">
+          <li>{metrics.totals.requests} requests measured · {metrics.totals.failedWrites} failed saves · {metrics.totals.serverErrors} server errors</li>
+          <li>{metrics.totals.authFailures} sign-in failures · {metrics.totals.rateLimited} rate-limited attempts</li>
+          {metrics.database.probes > 0 && <li>Database latency: {metrics.database.averageLatencyMs} ms average, {metrics.database.maxLatencyMs} ms peak</li>}
+          <li>
+            {metrics.alerting.webhookConfigured
+              ? `Alerts on ${metrics.alerting.thresholdFailures} failures in ${metrics.alerting.windowMinutes} minutes.`
+              : 'No alert webhook configured; failures are recorded in the server logs only.'}
+          </li>
+        </ul>
+        <p className="text-[10px] text-slate-500">Counters cover routes, outcomes and timings only — no household contents — and are kept for {metrics.retentionDays} days.</p>
+      </>}
+    </div>
+  );
 }
 
 function BackupsPanel({ onRestore }) {
@@ -1476,17 +2467,137 @@ function AcceptInvite({token,onJoined}) {
   </main>;
 }
 
-function AiModal({ content, onClose }) {
+// Consumes a single-use reset link an owner generated for a locked-out member (the 'reset-link'
+// action in MembersPanel); mirrors AcceptInvite but sets a password on an existing account.
+function ResetPassword({token,onReset}) {
+  const [status,setStatus]=useState('checking');
+  const [email,setEmail]=useState(null);
+  const [password,setPassword]=useState('');
+  const [message,setMessage]=useState(null);
+  const [pending,setPending]=useState(false);
+  useEffect(() => {
+    request(`password-reset?token=${encodeURIComponent(token)}`).then(result => {
+      if (!result.valid) { setStatus('invalid'); return; }
+      setEmail(result.email); setStatus('ready');
+    }).catch(() => setStatus('invalid'));
+  }, [token]);
+  const submit = async event => {
+    event.preventDefault(); setPending(true); setMessage(null);
+    try { const result = await request('password-reset', {token, password}); onReset(result.user); }
+    catch (error) { setMessage(error.message); }
+    finally { setPending(false); }
+  };
+  return <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
+    <div className="w-full max-w-sm space-y-6">
+      <Shield className="text-blue-400" size={40}/><h1 className="text-3xl font-black">NorthStar Prep</h1>
+      {status === 'checking' && <p className="text-slate-300">Checking your reset link…</p>}
+      {status === 'invalid' && <p role="alert" className="text-red-300">This reset link is invalid, expired or already used. Ask a household owner for a new one.</p>}
+      {status === 'ready' && (
+        <form onSubmit={submit} className="space-y-6">
+          <p className="text-slate-300">Choose a new password for {email}.</p>
+          {message && <p role="alert" className="text-red-300">{message}</p>}
+          <label className="block">New password<input autoComplete="new-password" type="password" required minLength={8} value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+          <button disabled={pending} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{pending?'Saving…':'Set new password'}</button>
+        </form>
+      )}
+    </div>
+  </main>;
+}
+
+// Results of a deterministic outage simulation (shared/outage.js). This replaced the old AI
+// "Run Emergency Simulation" stub, so everything shown here is arithmetic over recorded figures.
+export function OutageSimulationModal({ result, settings, onClose }) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
+  const hours = result.hours;
+  const label = hours < 48 ? `${Math.round(hours)}-hour` : `${Math.round(hours / 24)}-day`;
+  const formatRunway = value => value === null ? 'Not consumed' : value >= 48 ? `${(value / 24).toFixed(1)} days` : `${value.toFixed(0)} hours`;
+  const units = {power: 'kWh', fuel: 'h', water: 'gal'};
+
   return (
     <div className="fixed inset-0 z-[110] bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-6 text-slate-900">
-      <div ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title" className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[80vh]">
-        <div className="flex justify-between items-center mb-6">
-          <h3 id="ai-modal-title" className="text-xl font-black text-slate-900">{content.title}</h3>
-          <button aria-label="Close AI result" onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-500"><X aria-hidden="true" size={16}/></button>
+      <div ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="outage-modal-title" className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[85vh]">
+        <div className="flex justify-between items-center mb-4">
+          <h3 id="outage-modal-title" className="text-xl font-black text-slate-900">{label} outage</h3>
+          <button aria-label="Close simulation result" onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-500"><X aria-hidden="true" size={16}/></button>
         </div>
-        <div className="overflow-y-auto text-sm text-slate-600 leading-relaxed whitespace-pre-wrap flex-1">{content.text}</div>
+
+        <div className="overflow-y-auto flex-1 space-y-5 text-sm text-slate-600">
+          <p className={`font-bold ${result.survives ? 'text-emerald-700' : 'text-red-700'}`}>
+            {result.survives
+              ? `Nothing you track runs out within ${label.toLowerCase().replace('-', ' ')}.`
+              : `${result.firstExhausted.label} runs out first, after ${formatRunway(result.firstExhausted.runwayHours)}.`}
+          </p>
+
+          <section>
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">How long each lasts</h4>
+            <ul className="space-y-1">
+              {result.runways.map(resource => (
+                <li key={resource.key} className="flex justify-between gap-3">
+                  <span className="font-bold text-slate-700">{resource.label}</span>
+                  <span className={resource.runwayHours !== null && resource.runwayHours < hours ? 'text-red-700 font-bold' : ''}>{formatRunway(resource.runwayHours)}</span>
+                </li>
+              ))}
+              {result.runways.length === 0 && <li className="text-slate-500">Nothing recorded is being consumed — add appliances, water and fuel to see a drawdown.</li>}
+            </ul>
+          </section>
+
+          <section>
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">Drawdown</h4>
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px]">
+                <thead>
+                  <tr className="text-slate-500 text-left">
+                    <th scope="col" className="font-black uppercase py-1">Hour</th>
+                    <th scope="col" className="font-black uppercase py-1 text-right">Power</th>
+                    <th scope="col" className="font-black uppercase py-1 text-right">Fuel</th>
+                    <th scope="col" className="font-black uppercase py-1 text-right">Water</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.timeline.map(point => (
+                    <tr key={point.hour} className="border-t border-slate-100">
+                      <td className="py-1 font-bold text-slate-700">{Math.round(point.hour)}h</td>
+                      <td className="py-1 text-right">{point.power.toFixed(1)} {units.power}</td>
+                      <td className="py-1 text-right">{point.fuel.toFixed(0)} {units.fuel}</td>
+                      <td className="py-1 text-right">{point.water.toFixed(1)} {units.water}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section>
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">Loads to shed</h4>
+            {result.shedding.shed.length === 0 ? (
+              <p>{result.resources.dailyLoadKwh > 0
+                ? 'Stored power already lasts the whole outage with every active appliance running.'
+                : 'No active appliances are recorded, so there is nothing to shed.'}</p>
+            ) : (
+              <>
+                <p className="mb-2">Turn these off, lowest priority first, so stored power lasts the full {label.toLowerCase().replace('-', ' ')}:</p>
+                <ol className="space-y-1 list-decimal list-inside">
+                  {result.shedding.shed.map(appliance => (
+                    <li key={appliance.id} className="font-bold text-slate-700">
+                      {appliance.name} <span className="font-normal text-slate-500">({appliancePriorityLabels[appliance.priority || 'normal']} priority, {(((appliance.watts || 0) * (appliance.hours || 0)) / 1000).toFixed(2)} kWh/day)</span>
+                    </li>
+                  ))}
+                </ol>
+                {result.shedding.shedsCritical && (
+                  <p className="mt-2 text-red-700 font-bold">Reaching the full duration means turning off loads you marked critical.</p>
+                )}
+              </>
+            )}
+          </section>
+
+          <p className="text-[10px] leading-relaxed text-slate-500">
+            Stored power counts {Math.round(settings.batteryUsableFraction * 100)}% usable capacity after a {Math.round(settings.inverterEfficiency * 100)}% efficient
+            inverter conversion. Heating fuel is drawn down at one recorded hour per hour. Water uses the same daily
+            need as the Dashboard. Expired water is excluded; fuel is counted whatever its date.
+          </p>
+        </div>
+
         <button onClick={onClose} className="mt-6 w-full bg-slate-900 text-white py-4 rounded-2xl font-black">Close</button>
       </div>
     </div>

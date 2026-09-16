@@ -1,7 +1,7 @@
 import { acceptInvitation, findInvitationByTokenHash, findUserByEmail } from '../server/db.js';
 import { cookie, hashPassword, hashToken, sameOrigin, token as sessionToken } from '../server/auth.js';
 import { emailSchema, passwordSchema } from '../shared/schema.js';
-import { beginRequest, logFailure } from '../server/observability.js';
+import { beginRequest, logFailure, observe } from '../server/observability.js';
 
 function invitationStillValid(invitation) {
   return Boolean(invitation) && !invitation.accepted_at && new Date(invitation.expires_at) > new Date();
@@ -44,4 +44,4 @@ export function createHandler(repository = {findInvitationByTokenHash, acceptInv
     }
   };
 }
-export default createHandler();
+export default observe('/api/invite', createHandler());

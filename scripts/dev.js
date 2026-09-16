@@ -7,11 +7,14 @@ import members from '../api/members.js';
 import invite from '../api/invite.js';
 import audit from '../api/audit.js';
 import backup from '../api/backup.js';
+import reminderHistory from '../api/reminder-history.js';
+import readinessHistory from '../api/readiness-history.js';
+const port = Number(process.env.PORT) || 5173;
 const vite = await createViteServer({server:{middlewareMode:true},appType:'spa'});
 createServer(async(req,res)=>{
   const path = new URL(req.url,'http://localhost').pathname;
   if (!path.startsWith('/api/')) return vite.middlewares(req,res);
-  const handler = {'/api/session':session,'/api/hub':hub,'/api/health':health,'/api/members':members,'/api/invite':invite,'/api/audit':audit,'/api/backup':backup}[path];
+  const handler = {'/api/session':session,'/api/hub':hub,'/api/health':health,'/api/members':members,'/api/invite':invite,'/api/audit':audit,'/api/backup':backup,'/api/reminder-history':reminderHistory,'/api/readiness-history':readinessHistory}[path];
   res.status = code => {res.statusCode=code;return res;};
   res.json = data => {res.setHeader('Content-Type','application/json');res.end(JSON.stringify(data));};
   if (!handler) return res.status(404).json({error:'Not found.'});
@@ -21,4 +24,4 @@ createServer(async(req,res)=>{
     if(body) req.body=JSON.parse(body);
     await handler(req,res);
   } catch {res.status(400).json({error:'Invalid request.'});}
-}).listen(5173,'127.0.0.1',()=>console.log('NorthStar Prep: http://127.0.0.1:5173'));
+}).listen(port,'127.0.0.1',()=>console.log(`NorthStar Prep: http://127.0.0.1:${port}`));

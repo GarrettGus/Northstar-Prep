@@ -8,8 +8,11 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test",
+    "test:e2e": "playwright test --config tests/e2e/playwright.config.js",
+    "test:e2e:app": "playwright test --config tests/e2e/app.config.js",
     "db:migrate": "node --env-file-if-exists=.env.local scripts/migrate.js",
-    "db:migrate-images": "node --env-file-if-exists=.env.local scripts/migrate-images.js"
+    "db:migrate-images": "node --env-file-if-exists=.env.local scripts/migrate-images.js",
+    "smoke-test": "node scripts/smoketest.js"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
@@ -20,7 +23,10 @@
     "zod": "^4.6.2"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
+    "@playwright/test": "^1.63.0",
     "@tailwindcss/vite": "^4.0.0",
+    "pg": "^8.23.0",
     "tailwindcss": "^4.0.0",
     "vite": "^7.0.0"
   },

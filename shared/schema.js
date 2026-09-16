@@ -55,6 +55,9 @@ export const itemSchema = z.object({
   category: categorySchema.default('Gear'),
   caloriesPerUnit: number, hoursPerUnit: number, capacityPerUnit: number, price: number,
   gallonsPerUnit: number, target: number, store: text.default(''), emoji: z.string().max(30).default(''),
+  // Where the item is physically kept (go-bag, basement, vehicle, ...) and which kit (if any)
+  // it counts toward. Both are additive/optional so existing rows keep parsing unchanged.
+  location: text.default(''), kitId: z.union([z.literal(''), idSchema]).default(''),
   // Legacy/offline-queued rows may still carry a base64 data URL; the server converts those to
   // an object storage URL (https://*.public.blob.vercel-storage.com/...) before persisting.
   image: z.string().max(180000).regex(/^(?:|data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+|https:\/\/[a-z0-9-]+\.public\.blob\.vercel-storage\.com\/[A-Za-z0-9/_.-]+)$/).default(''),
@@ -74,25 +77,75 @@ export const consumptionEventSchema = z.object({
   quantity: consumptionQuantity,
   note: text.default(''),
 });
-export const applianceSchema = z.object({ id: idSchema, name: z.string().trim().min(1).max(200), watts: number, hours: z.coerce.number().finite().min(0).max(24), active: z.boolean().default(true) });
+// Load-shedding order during an outage: 'low' sheds first, 'critical' last. Existing appliances
+// default to 'normal' so the column is additive (see simulateOutage in shared/outage.js).
+export const appliancePrioritySchema = z.enum(['critical', 'high', 'normal', 'low']).default('normal');
+export const applianceSchema = z.object({ id: idSchema, name: z.string().trim().min(1).max(200), watts: number, hours: z.coerce.number().finite().min(0).max(24), active: z.boolean().default(true), priority: appliancePrioritySchema });
+
+// --- Recurring maintenance reminders (water rotation, medication expiry, batteries, generator tests, etc). ---
+export const reminderCategories = ['Water Rotation', 'Medication', 'Batteries', 'Generator Test', 'Other'];
+export const reminderSchema = z.object({
+  id: idSchema, title: z.string().trim().min(1).max(200),
+  category: z.enum(reminderCategories).default('Other'),
+  // Days between checks; the reminder recurs from lastCompletedDate (or startDate if never completed).
+  recurringDays: z.coerce.number().int().min(1).max(3650).default(90),
+  notes: text.default(''), startDate: date, lastCompletedDate: date, snoozedUntil: date,
+});
+// One row per checked seasonal checklist item; id is `${season}__${itemId}` from shared/checklists.js.
+// Unchecking an item deletes its row instead of storing a false flag.
+export const checklistCheckSchema = z.object({ id: idSchema, completedAt: date });
+// A blank override means "use the configured per-person default" for a person, and "counts for
+// nothing" for a pet — the app has no business inventing how much a given animal eats or drinks,
+// so a pet contributes to readiness only once its figures are actually entered. Null is accepted
+// so a nullable database column round-trips back to blank.
+const memberNeed = max => z.preprocess(
+  value => value === null || value === undefined ? '' : value,
+  z.union([z.literal(''), z.coerce.number().finite().nonnegative().max(max)]),
+);
+export const memberKinds = ['person', 'pet'];
+export const familyMemberSchema = z.object({
+  name: z.string().max(100), role: z.string().max(100), dob: z.string().max(30),
+  kind: z.enum(memberKinds).default('person'),
+  caloriesPerDay: memberNeed(20000),
+  waterGallonsPerDay: memberNeed(50),
+});
+// --- Storage kits (go-bag, basement, vehicle, ...): a target contents list to pack against. ---
+// Items are assigned to a kit via itemSchema.kitId; completeness is computed client-side by
+// matching each target row's name against assigned items (see shared/kits.js).
+export const kitTargetItemSchema = z.object({
+  name: z.string().trim().min(1).max(200), quantity: number, unit: z.string().max(80).default('units'),
+});
+export const kitSchema = z.object({
+  id: idSchema, name: z.string().trim().min(1).max(200), purpose: text.default(''),
+  targetContents: z.array(kitTargetItemSchema).max(200).default([]),
+});
+
+// --- Medications and prescriptions: who takes what, at what dose, and when it needs a refill. ---
+export const medicationSchema = z.object({
+  id: idSchema, person: z.string().trim().max(200).default(''), name: z.string().trim().min(1).max(200),
+  dose: z.string().trim().max(200).default(''), quantityOnHand: number, refillDate: date,
+  prescriber: z.string().trim().max(200).default(''), notes: text.default(''),
+});
 export const planSchema = z.object({
   shelterSpot: z.string().max(3000).default(''),
-  family: z.array(z.object({name: z.string().max(100), role: z.string().max(100), dob: z.string().max(30)})).max(30).default([]),
+  family: z.array(familyMemberSchema).max(30).default([]),
   contacts: z.array(z.object({name: text, phone: z.string().max(80), type: text.default('')})).max(50).default([]),
   meetingPoints: z.object({primary: text.default(''), secondary: text.default('')}).default({primary:'',secondary:''}),
 });
 export const consumptionSchema = z.array(consumptionEventSchema).max(10000).default([]);
-export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable(), consumption: consumptionSchema, settings: settingsSchema.default(() => settingsSchema.parse({})) });
-export const backupSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), plan: planSchema.nullable().default(null), consumption: consumptionSchema, settings: settingsInputSchema.optional() });
-export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], plan:null, consumption:[], settings:settingsSchema.parse({})});
-export const collectionKey = {inventory:'inventory', shopping_list:'shoppingList', appliances:'appliances'};
+export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), reminders: z.array(reminderSchema).max(300), checklistChecks: z.array(checklistCheckSchema).max(500), kits: z.array(kitSchema).max(200).default([]), medications: z.array(medicationSchema).max(300).default([]), plan: planSchema.nullable(), consumption: consumptionSchema, settings: settingsSchema.default(() => settingsSchema.parse({})) });
+export const backupSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), reminders: z.array(reminderSchema).max(300).default([]), checklistChecks: z.array(checklistCheckSchema).max(500).default([]), kits: z.array(kitSchema).max(200).default([]), medications: z.array(medicationSchema).max(300).default([]), plan: planSchema.nullable().default(null), consumption: consumptionSchema, settings: settingsInputSchema.optional() });
+export const emptyState = () => ({inventory:[], shoppingList:[], appliances:[], reminders:[], checklistChecks:[], kits:[], medications:[], plan:null, consumption:[], settings:settingsSchema.parse({})});
+export const collectionKey = {inventory:'inventory', shopping_list:'shoppingList', appliances:'appliances', reminders:'reminders', checklist:'checklistChecks', kits:'kits', medications:'medications'};
+const schemaByKey = {inventory: itemSchema, shoppingList: itemSchema, appliances: applianceSchema, reminders: reminderSchema, checklistChecks: checklistCheckSchema, kits: kitSchema, medications: medicationSchema};
 const bulkQuantitySchema = z.object({mode: z.enum(['set', 'delta']), value: z.coerce.number().finite().max(1e9)});
+const collectionKeys = ['inventory','shoppingList','appliances','reminders','checklistChecks','kits','medications'];
 
 export function normalizeBackup(input, makeId) {
   if (Array.isArray(input)) input = {inventory:input};
   if (!input || typeof input !== 'object') throw new Error('Expected a backup object.');
   const result = {};
-  for (const key of ['inventory','shoppingList','appliances']) {
+  for (const key of collectionKeys) {
     const rows = input[key] ?? [];
     if (!Array.isArray(rows)) throw new Error(`${key} must be an array.`);
     result[key] = rows.map(row => ({...row, id: row.id || makeId()}));
@@ -112,7 +165,7 @@ export function applyAction(state, action) {
   if (!Array.isArray(next.consumption)) next.consumption = [];
   if (action.type === 'import') {
     const backup = backupSchema.parse(action.backup);
-    for (const key of ['inventory','shoppingList','appliances']) {
+    for (const key of collectionKeys) {
       const merged = new Map(next[key].map(row => [row.id,row]));
       backup[key].forEach(row => merged.set(row.id,row));
       next[key] = [...merged.values()];
@@ -182,7 +235,7 @@ export function applyAction(state, action) {
     else if (action.type === 'add' || action.type === 'update') {
       if (action.type === 'update' && index < 0) throw new Error('Item no longer exists. Refresh and retry.');
       if (action.type === 'add' && index >= 0) throw new Error('Item already exists.');
-      const schema = key === 'appliances' ? applianceSchema : itemSchema;
+      const schema = schemaByKey[key];
       const value = schema.parse({...next[key][index], ...action.item, id});
       if (index < 0) next[key].push(value); else next[key][index] = value;
     } else throw new Error('Unknown action.');

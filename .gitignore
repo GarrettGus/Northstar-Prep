@@ -6,3 +6,5 @@ dist/
 .DS_Store
 .agents/
 skills-lock.json
+test-results/
+playwright-report/

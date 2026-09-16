@@ -14,24 +14,32 @@ export const householdId = 1;
 // rows that actually changed, inside one transaction guarded by the household's version.
 export async function readState() {
   const sql = database();
-  const [households, inventory, shoppingList, appliances, planRows, familyRows, contactRows, settingsRows, consumption] = await Promise.all([
+  const [households, inventory, shoppingList, appliances, reminders, checklistChecks, kitRows, medications, planRows, familyRows, contactRows, settingsRows, consumption] = await Promise.all([
     sql`SELECT version FROM northstar_household WHERE id = ${householdId}`,
     sql`SELECT id, name, quantity, unit, category,
           calories_per_unit AS "caloriesPerUnit", hours_per_unit AS "hoursPerUnit", capacity_per_unit AS "capacityPerUnit",
           price, gallons_per_unit AS "gallonsPerUnit", target, store, emoji, image,
           macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate",
-          barcode, recurring_days AS "recurringDays"
+          barcode, recurring_days AS "recurringDays", location, kit_id AS "kitId"
         FROM northstar_inventory WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, name, quantity, unit, category,
           calories_per_unit AS "caloriesPerUnit", hours_per_unit AS "hoursPerUnit", capacity_per_unit AS "capacityPerUnit",
           price, gallons_per_unit AS "gallonsPerUnit", target, store, emoji, image,
           macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate",
-          barcode, recurring_days AS "recurringDays"
+          barcode, recurring_days AS "recurringDays", location, kit_id AS "kitId"
         FROM northstar_shopping_items WHERE household_id = ${householdId} ORDER BY seq`,
-    sql`SELECT id, name, watts, hours, active FROM northstar_appliances WHERE household_id = ${householdId} ORDER BY seq`,
+    sql`SELECT id, name, watts, hours, active, priority FROM northstar_appliances WHERE household_id = ${householdId} ORDER BY seq`,
+    sql`SELECT id, title, category, recurring_days AS "recurringDays", notes, start_date AS "startDate",
+          last_completed_date AS "lastCompletedDate", snoozed_until AS "snoozedUntil"
+        FROM northstar_reminders WHERE household_id = ${householdId} ORDER BY seq`,
+    sql`SELECT id, completed_at AS "completedAt" FROM northstar_checklist_checks WHERE household_id = ${householdId}`,
+    sql`SELECT id, name, purpose, target_contents AS "targetContents" FROM northstar_kits WHERE household_id = ${householdId} ORDER BY seq`,
+    sql`SELECT id, person, name, dose, quantity_on_hand AS "quantityOnHand", refill_date AS "refillDate", prescriber, notes
+        FROM northstar_medications WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary"
         FROM northstar_plan WHERE household_id = ${householdId}`,
-    sql`SELECT name, role, dob FROM northstar_family_members WHERE household_id = ${householdId} ORDER BY position`,
+    sql`SELECT name, role, dob, kind, calories_per_day AS "caloriesPerDay", water_gallons_per_day AS "waterGallonsPerDay"
+        FROM northstar_family_members WHERE household_id = ${householdId} ORDER BY position`,
     sql`SELECT name, phone, type FROM northstar_contacts WHERE household_id = ${householdId} ORDER BY position`,
     sql`SELECT household_size AS "householdSize", calories_per_person_per_day AS "caloriesPerPersonPerDay",
           water_gallons_per_person_per_day AS "waterGallonsPerPersonPerDay", survival_goal_days AS "survivalGoalDays",
@@ -50,7 +58,8 @@ export async function readState() {
     contacts: contactRows,
     meetingPoints: {primary: planRow.meetingPrimary, secondary: planRow.meetingSecondary},
   } : null;
-  const data = stateSchema.parse({inventory, shoppingList, appliances, plan, consumption, settings: settingsRows[0]});
+  const kits = kitRows.map(row => ({...row, targetContents: row.targetContents ?? []}));
+  const data = stateSchema.parse({inventory, shoppingList, appliances, reminders, checklistChecks, kits, medications, plan, consumption, settings: settingsRows[0]});
   return {data, version: households[0].version};
 }
 
@@ -62,26 +71,58 @@ function diffById(currentRows, nextRows) {
   return {toDelete, toUpsert};
 }
 function upsertInventoryItem(tx, item, guard) {
-  return tx`INSERT INTO northstar_inventory (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date, barcode, recurring_days)
-    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}, ${item.barcode}, ${item.recurringDays}
+  return tx`INSERT INTO northstar_inventory (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date, barcode, recurring_days, location, kit_id)
+    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}, ${item.barcode}, ${item.recurringDays}, ${item.location}, ${item.kitId}
     WHERE ${guard}
     ON CONFLICT (household_id, id) DO UPDATE SET
       name = EXCLUDED.name, quantity = EXCLUDED.quantity, unit = EXCLUDED.unit, category = EXCLUDED.category,
       calories_per_unit = EXCLUDED.calories_per_unit, hours_per_unit = EXCLUDED.hours_per_unit, capacity_per_unit = EXCLUDED.capacity_per_unit,
       price = EXCLUDED.price, gallons_per_unit = EXCLUDED.gallons_per_unit, target = EXCLUDED.target, store = EXCLUDED.store,
       emoji = EXCLUDED.emoji, image = EXCLUDED.image, macro_tag = EXCLUDED.macro_tag, fuel_type = EXCLUDED.fuel_type,
-      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days`;
+      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days,
+      location = EXCLUDED.location, kit_id = EXCLUDED.kit_id`;
 }
 function upsertShoppingItem(tx, item, guard) {
-  return tx`INSERT INTO northstar_shopping_items (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date, barcode, recurring_days)
-    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}, ${item.barcode}, ${item.recurringDays}
+  return tx`INSERT INTO northstar_shopping_items (household_id, id, name, quantity, unit, category, calories_per_unit, hours_per_unit, capacity_per_unit, price, gallons_per_unit, target, store, emoji, image, macro_tag, fuel_type, purchase_date, expiry_date, barcode, recurring_days, location, kit_id)
+    SELECT ${householdId}, ${item.id}, ${item.name}, ${item.quantity}, ${item.unit}, ${item.category}, ${item.caloriesPerUnit}, ${item.hoursPerUnit}, ${item.capacityPerUnit}, ${item.price}, ${item.gallonsPerUnit}, ${item.target}, ${item.store}, ${item.emoji}, ${item.image}, ${item.macroTag}, ${item.fuelType}, ${item.purchaseDate}, ${item.expiryDate}, ${item.barcode}, ${item.recurringDays}, ${item.location}, ${item.kitId}
     WHERE ${guard}
     ON CONFLICT (household_id, id) DO UPDATE SET
       name = EXCLUDED.name, quantity = EXCLUDED.quantity, unit = EXCLUDED.unit, category = EXCLUDED.category,
       calories_per_unit = EXCLUDED.calories_per_unit, hours_per_unit = EXCLUDED.hours_per_unit, capacity_per_unit = EXCLUDED.capacity_per_unit,
       price = EXCLUDED.price, gallons_per_unit = EXCLUDED.gallons_per_unit, target = EXCLUDED.target, store = EXCLUDED.store,
       emoji = EXCLUDED.emoji, image = EXCLUDED.image, macro_tag = EXCLUDED.macro_tag, fuel_type = EXCLUDED.fuel_type,
-      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days`;
+      purchase_date = EXCLUDED.purchase_date, expiry_date = EXCLUDED.expiry_date, barcode = EXCLUDED.barcode, recurring_days = EXCLUDED.recurring_days,
+      location = EXCLUDED.location, kit_id = EXCLUDED.kit_id`;
+}
+
+function upsertReminder(tx, reminder, guard) {
+  return tx`INSERT INTO northstar_reminders (household_id, id, title, category, recurring_days, notes, start_date, last_completed_date, snoozed_until)
+    SELECT ${householdId}, ${reminder.id}, ${reminder.title}, ${reminder.category}, ${reminder.recurringDays}, ${reminder.notes}, ${reminder.startDate}, ${reminder.lastCompletedDate}, ${reminder.snoozedUntil}
+    WHERE ${guard}
+    ON CONFLICT (household_id, id) DO UPDATE SET
+      title = EXCLUDED.title, category = EXCLUDED.category, recurring_days = EXCLUDED.recurring_days, notes = EXCLUDED.notes,
+      start_date = EXCLUDED.start_date, last_completed_date = EXCLUDED.last_completed_date, snoozed_until = EXCLUDED.snoozed_until`;
+}
+function upsertChecklistCheck(tx, check, guard) {
+  return tx`INSERT INTO northstar_checklist_checks (household_id, id, completed_at)
+    SELECT ${householdId}, ${check.id}, ${check.completedAt}
+    WHERE ${guard}
+    ON CONFLICT (household_id, id) DO UPDATE SET completed_at = EXCLUDED.completed_at`;
+}
+function upsertKit(tx, kit, guard) {
+  return tx`INSERT INTO northstar_kits (household_id, id, name, purpose, target_contents)
+    SELECT ${householdId}, ${kit.id}, ${kit.name}, ${kit.purpose}, ${JSON.stringify(kit.targetContents)}::jsonb
+    WHERE ${guard}
+    ON CONFLICT (household_id, id) DO UPDATE SET
+      name = EXCLUDED.name, purpose = EXCLUDED.purpose, target_contents = EXCLUDED.target_contents`;
+}
+function upsertMedication(tx, medication, guard) {
+  return tx`INSERT INTO northstar_medications (household_id, id, person, name, dose, quantity_on_hand, refill_date, prescriber, notes)
+    SELECT ${householdId}, ${medication.id}, ${medication.person}, ${medication.name}, ${medication.dose}, ${medication.quantityOnHand}, ${medication.refillDate}, ${medication.prescriber}, ${medication.notes}
+    WHERE ${guard}
+    ON CONFLICT (household_id, id) DO UPDATE SET
+      person = EXCLUDED.person, name = EXCLUDED.name, dose = EXCLUDED.dose, quantity_on_hand = EXCLUDED.quantity_on_hand,
+      refill_date = EXCLUDED.refill_date, prescriber = EXCLUDED.prescriber, notes = EXCLUDED.notes`;
 }
 function upsertConsumptionEvent(tx, event, guard) {
   return tx`INSERT INTO northstar_consumption_events (household_id, id, item_id, event_date, quantity, note)
@@ -95,16 +136,26 @@ function upsertConsumptionEvent(tx, event, guard) {
 export async function compareAndSave(version, next, current = emptyState()) {
   const sql = database();
   const targetVersion = version + 1;
+  const writerToken = randomUUID();
   const inventoryDiff = diffById(current.inventory, next.inventory);
   const shoppingDiff = diffById(current.shoppingList, next.shoppingList);
+  // priority is written as `|| 'normal'` below: the column is NOT NULL, and compareAndSave must
+  // not depend on every caller having parsed its input through applianceSchema first.
   const applianceDiff = diffById(current.appliances, next.appliances);
   const consumptionDiff = diffById(current.consumption, next.consumption);
+  const reminderDiff = diffById(current.reminders, next.reminders);
+  const checklistDiff = diffById(current.checklistChecks, next.checklistChecks);
+  const kitDiff = diffById(current.kits, next.kits);
+  const medicationDiff = diffById(current.medications, next.medications);
   const planChanged = JSON.stringify(current.plan) !== JSON.stringify(next.plan);
   const settingsChanged = JSON.stringify(current.settings) !== JSON.stringify(next.settings);
 
   const results = await sql.transaction(tx => {
-    const statements = [tx`UPDATE northstar_household SET version = ${targetVersion} WHERE id = ${householdId} AND version = ${version} RETURNING version`];
-    const guard = tx`EXISTS (SELECT 1 FROM northstar_household WHERE id = ${householdId} AND version = ${targetVersion})`;
+    const statements = [tx`UPDATE northstar_household SET version = ${targetVersion}, writer_token = ${writerToken} WHERE id = ${householdId} AND version = ${version} RETURNING version`];
+    // The guard must match the token this save wrote, not just the target version: a save that
+    // lost the compare-and-swap to a concurrent writer sees that writer's version and would
+    // otherwise still apply its own (stale) row writes on top of the edit that won.
+    const guard = tx`EXISTS (SELECT 1 FROM northstar_household WHERE id = ${householdId} AND version = ${targetVersion} AND writer_token = ${writerToken})`;
 
     for (const id of inventoryDiff.toDelete) statements.push(tx`DELETE FROM northstar_inventory WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
     for (const item of inventoryDiff.toUpsert) statements.push(upsertInventoryItem(tx, item, guard));
@@ -112,12 +163,20 @@ export async function compareAndSave(version, next, current = emptyState()) {
     for (const item of shoppingDiff.toUpsert) statements.push(upsertShoppingItem(tx, item, guard));
     for (const id of applianceDiff.toDelete) statements.push(tx`DELETE FROM northstar_appliances WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
     for (const appliance of applianceDiff.toUpsert) statements.push(tx`
-      INSERT INTO northstar_appliances (household_id, id, name, watts, hours, active)
-      SELECT ${householdId}, ${appliance.id}, ${appliance.name}, ${appliance.watts}, ${appliance.hours}, ${appliance.active}
+      INSERT INTO northstar_appliances (household_id, id, name, watts, hours, active, priority)
+      SELECT ${householdId}, ${appliance.id}, ${appliance.name}, ${appliance.watts}, ${appliance.hours}, ${appliance.active}, ${appliance.priority || 'normal'}
       WHERE ${guard}
-      ON CONFLICT (household_id, id) DO UPDATE SET name = EXCLUDED.name, watts = EXCLUDED.watts, hours = EXCLUDED.hours, active = EXCLUDED.active`);
+      ON CONFLICT (household_id, id) DO UPDATE SET name = EXCLUDED.name, watts = EXCLUDED.watts, hours = EXCLUDED.hours, active = EXCLUDED.active, priority = EXCLUDED.priority`);
     for (const id of consumptionDiff.toDelete) statements.push(tx`DELETE FROM northstar_consumption_events WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
     for (const event of consumptionDiff.toUpsert) statements.push(upsertConsumptionEvent(tx, event, guard));
+    for (const id of reminderDiff.toDelete) statements.push(tx`DELETE FROM northstar_reminders WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
+    for (const reminder of reminderDiff.toUpsert) statements.push(upsertReminder(tx, reminder, guard));
+    for (const id of checklistDiff.toDelete) statements.push(tx`DELETE FROM northstar_checklist_checks WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
+    for (const check of checklistDiff.toUpsert) statements.push(upsertChecklistCheck(tx, check, guard));
+    for (const id of kitDiff.toDelete) statements.push(tx`DELETE FROM northstar_kits WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
+    for (const kit of kitDiff.toUpsert) statements.push(upsertKit(tx, kit, guard));
+    for (const id of medicationDiff.toDelete) statements.push(tx`DELETE FROM northstar_medications WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
+    for (const medication of medicationDiff.toUpsert) statements.push(upsertMedication(tx, medication, guard));
 
     if (planChanged) {
       if (next.plan === null) {
@@ -132,8 +191,12 @@ export async function compareAndSave(version, next, current = emptyState()) {
         statements.push(tx`DELETE FROM northstar_family_members WHERE household_id = ${householdId} AND ${guard}`);
         for (let position = 0; position < next.plan.family.length; position++) {
           const member = next.plan.family[position];
-          statements.push(tx`INSERT INTO northstar_family_members (household_id, position, name, role, dob)
-            SELECT ${householdId}, ${position}, ${member.name}, ${member.role}, ${member.dob} WHERE ${guard}`);
+          // A blank per-member override is stored as NULL so it round-trips back to '' (see
+          // familyMemberSchema), keeping "use the default" distinct from an explicit zero.
+          const calories = member.caloriesPerDay === '' ? null : member.caloriesPerDay;
+          const water = member.waterGallonsPerDay === '' ? null : member.waterGallonsPerDay;
+          statements.push(tx`INSERT INTO northstar_family_members (household_id, position, name, role, dob, kind, calories_per_day, water_gallons_per_day)
+            SELECT ${householdId}, ${position}, ${member.name}, ${member.role}, ${member.dob}, ${member.kind}, ${calories}, ${water} WHERE ${guard}`);
         }
         statements.push(tx`DELETE FROM northstar_contacts WHERE household_id = ${householdId} AND ${guard}`);
         for (let position = 0; position < next.plan.contacts.length; position++) {
@@ -180,6 +243,17 @@ export async function findUserById(userId) {
   const sql = database();
   const rows = await sql`SELECT id, email FROM northstar_users WHERE id = ${userId}`;
   return rows[0];
+}
+// Only used for verifying a currently-held password (self-service change); every other
+// lookup above deliberately omits password_hash.
+export async function findCredentialsById(userId) {
+  const sql = database();
+  const rows = await sql`SELECT id, email, password_hash FROM northstar_users WHERE id = ${userId}`;
+  return rows[0];
+}
+export async function setPassword(userId, passwordHash) {
+  const sql = database();
+  await sql`UPDATE northstar_users SET password_hash = ${passwordHash} WHERE id = ${userId}`;
 }
 export async function getMembership(userId, householdId = 1) {
   const sql = database();
@@ -243,6 +317,28 @@ export async function acceptInvitation({invitationId, householdId, role, email, 
   ]);
   return userId;
 }
+export async function createPasswordReset({userId, tokenHash, expiresAt}) {
+  const sql = database();
+  const id = randomUUID();
+  await sql`INSERT INTO northstar_password_resets (id, user_id, token_hash, expires_at) VALUES (${id}, ${userId}, ${tokenHash}, ${expiresAt})`;
+  return id;
+}
+export async function findPasswordResetByTokenHash(tokenHash) {
+  const sql = database();
+  const rows = await sql`SELECT r.id, r.user_id, r.expires_at, r.used_at, u.email
+    FROM northstar_password_resets r JOIN northstar_users u ON u.id = r.user_id
+    WHERE r.token_hash = ${tokenHash}`;
+  return rows[0];
+}
+// Sets the new password and consumes every pending reset for this user (not just the one used),
+// so a second, still-unexpired link generated earlier for the same person stops working too.
+export async function resetPassword({userId, passwordHash}) {
+  const sql = database();
+  await sql.transaction(tx => [
+    tx`UPDATE northstar_users SET password_hash = ${passwordHash} WHERE id = ${userId}`,
+    tx`UPDATE northstar_password_resets SET used_at = now() WHERE user_id = ${userId} AND used_at IS NULL`,
+  ]);
+}
 export async function insertAuditLog({householdId = 1, userId, action, collection = null, itemId = null, itemName = null}) {
   const sql = database();
   await sql`INSERT INTO northstar_audit_log (household_id, user_id, action, collection, item_id, item_name)
@@ -253,6 +349,20 @@ export async function listAuditLog(householdId = 1, limit = 50) {
   return sql`SELECT a.action, a.collection, a.item_id, a.item_name, a.created_at, u.email AS actor_email
     FROM northstar_audit_log a LEFT JOIN northstar_users u ON u.id = a.user_id
     WHERE a.household_id = ${householdId} ORDER BY a.created_at DESC LIMIT ${limit}`;
+}
+
+// --- Reminder completion/snooze history, so recurring maintenance checks can be verified over time. ---
+export async function insertReminderHistory({householdId = 1, reminderId, reminderTitle, category, event, eventDate, userId}) {
+  const sql = database();
+  await sql`INSERT INTO northstar_reminder_history (household_id, reminder_id, reminder_title, category, event, event_date, user_id)
+    VALUES (${householdId}, ${reminderId}, ${reminderTitle}, ${category}, ${event}, ${eventDate}, ${userId})`;
+}
+export async function listReminderHistory(householdId = 1, limit = 100) {
+  const sql = database();
+  return sql`SELECT r.reminder_id AS "reminderId", r.reminder_title AS "reminderTitle", r.category, r.event,
+        r.event_date AS "eventDate", r.created_at AS "createdAt", u.email AS "actorEmail"
+    FROM northstar_reminder_history r LEFT JOIN northstar_users u ON u.id = r.user_id
+    WHERE r.household_id = ${householdId} ORDER BY r.created_at DESC LIMIT ${limit}`;
 }
 
 // --- Encrypted household backups. Ciphertext/IV/auth tag never leave insertBackupRecord/getBackupRecord. ---
@@ -268,7 +378,7 @@ export async function listBackupRecords(householdId = 1, limit = 20) {
 }
 export async function getBackupRecord(id, householdId = 1) {
   const sql = database();
-  const rows = await sql`SELECT id, created_at, checksum, iv, auth_tag, ciphertext
+  const rows = await sql`SELECT id, created_at, checksum, iv, auth_tag AS "authTag", ciphertext
     FROM northstar_backups WHERE id = ${id} AND household_id = ${householdId} AND status = 'success'`;
   return rows[0];
 }
@@ -277,4 +387,77 @@ export async function pruneBackups(householdId = 1, keep = 30) {
   await sql`DELETE FROM northstar_backups WHERE household_id = ${householdId} AND id NOT IN (
     SELECT id FROM northstar_backups WHERE household_id = ${householdId} ORDER BY created_at DESC LIMIT ${keep}
   )`;
+}
+
+// --- Request metrics and alert state. ---
+// Rows are per-minute aggregates keyed by route/outcome/status only: no household contents,
+// user IDs, emails, IP addresses or request bodies are stored, so the operational history is
+// safe to read and to retain independently of the data it protects.
+export async function recordRequestMetric({route, outcome, status, latencyMs, at = new Date()}) {
+  const sql = database();
+  const bucket = new Date(Math.floor(at.getTime() / 60000) * 60000).toISOString();
+  const latency = Math.max(0, Math.round(latencyMs));
+  await sql`INSERT INTO northstar_request_metrics (bucket, route, outcome, status, requests, latency_ms_total, latency_ms_max)
+    VALUES (${bucket}, ${route}, ${outcome}, ${status}, 1, ${latency}, ${latency})
+    ON CONFLICT (bucket, route, outcome, status) DO UPDATE SET
+      requests = northstar_request_metrics.requests + 1,
+      latency_ms_total = northstar_request_metrics.latency_ms_total + EXCLUDED.latency_ms_total,
+      latency_ms_max = GREATEST(northstar_request_metrics.latency_ms_max, EXCLUDED.latency_ms_max)`;
+}
+export async function countRecentFailures(route, windowMinutes = 15) {
+  const sql = database();
+  const rows = await sql`SELECT coalesce(sum(requests), 0)::int AS failures FROM northstar_request_metrics
+    WHERE route = ${route} AND outcome IN ('write_failure', 'server_error')
+      AND bucket > now() - make_interval(mins => ${Math.round(windowMinutes)})`;
+  return rows[0].failures;
+}
+export async function summarizeRequestMetrics(windowMinutes = 1440) {
+  const sql = database();
+  return sql`SELECT route, outcome, sum(requests)::int AS requests,
+      (sum(latency_ms_total) / nullif(sum(requests), 0))::int AS average_latency_ms,
+      max(latency_ms_max)::int AS max_latency_ms, max(bucket) AS last_seen
+    FROM northstar_request_metrics
+    WHERE bucket > now() - make_interval(mins => ${Math.round(windowMinutes)})
+    GROUP BY route, outcome ORDER BY route, outcome`;
+}
+export async function pruneRequestMetrics(retentionDays = 14) {
+  const sql = database();
+  await sql`DELETE FROM northstar_request_metrics WHERE bucket < now() - make_interval(days => ${Math.round(retentionDays)})`;
+  await sql`DELETE FROM northstar_alert_state WHERE last_sent_at < now() - make_interval(days => ${Math.round(retentionDays)})`;
+}
+// --- Readiness history. ---
+// Aggregate figures only (days of supply, totals, counts): no item names, quantities or
+// categories are stored, so this history carries no household contents and can be retained
+// on its own schedule. One row per household per day; the daily cron upserts today's row.
+export async function recordReadinessSnapshot({householdId: id = householdId, day, waterDays, foodDays, powerDays, fuelHours, itemCount, lowStock, expired}) {
+  const sql = database();
+  await sql`INSERT INTO northstar_readiness_history (household_id, day, water_days, food_days, power_days, fuel_hours, item_count, low_stock, expired)
+    VALUES (${id}, ${day}, ${waterDays}, ${foodDays}, ${powerDays}, ${fuelHours}, ${itemCount}, ${lowStock}, ${expired})
+    ON CONFLICT (household_id, day) DO UPDATE SET
+      water_days = EXCLUDED.water_days, food_days = EXCLUDED.food_days, power_days = EXCLUDED.power_days,
+      fuel_hours = EXCLUDED.fuel_hours, item_count = EXCLUDED.item_count,
+      low_stock = EXCLUDED.low_stock, expired = EXCLUDED.expired, created_at = now()`;
+}
+export async function listReadinessHistory(householdId = 1, limit = 90) {
+  const sql = database();
+  const rows = await sql`SELECT day, water_days AS "waterDays", food_days AS "foodDays", power_days AS "powerDays",
+      fuel_hours AS "fuelHours", item_count AS "itemCount", low_stock AS "lowStock", expired
+    FROM northstar_readiness_history WHERE household_id = ${householdId} ORDER BY day DESC LIMIT ${limit}`;
+  // Oldest first so the client can plot it straight through without reversing.
+  return rows.slice().reverse();
+}
+export async function pruneReadinessHistory(retentionDays = 90, householdId = 1) {
+  const sql = database();
+  await sql`DELETE FROM northstar_readiness_history WHERE household_id = ${householdId} AND day < (now() - make_interval(days => ${Math.round(retentionDays)}))::date`;
+}
+
+// Returns true only for the caller that wins the row, so concurrent instances hitting the
+// same failure burst send one alert between them rather than one each.
+export async function claimAlert(key, cooldownMinutes = 60) {
+  const sql = database();
+  const rows = await sql`INSERT INTO northstar_alert_state (key, last_sent_at) VALUES (${key}, now())
+    ON CONFLICT (key) DO UPDATE SET last_sent_at = now()
+    WHERE northstar_alert_state.last_sent_at < now() - make_interval(mins => ${Math.round(cooldownMinutes)})
+    RETURNING key`;
+  return Boolean(rows[0]);
 }

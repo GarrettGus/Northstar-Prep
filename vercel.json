@@ -1,1 +1,1 @@
-{"framework":"vite","buildCommand":"npm run build","outputDirectory":"dist"}
+{"framework":"vite","buildCommand":"npm run build","outputDirectory":"dist","crons":[{"path":"/api/backup","schedule":"0 8 * * *"}]}

@@ -8,19 +8,13 @@ import {
   Siren, SearchCheck, Power, Tag, Calendar, ArrowUpDown
 } from 'lucide-react';
 import { request } from './api.js';
-import { waterGallons, isExpired } from '../shared/readiness.js';
-import { normalizeBackup } from '../shared/schema.js';
+import { computeReadiness, consumptionForecast, isExpired, isRecurringDue } from '../shared/readiness.js';
+import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories } from '../shared/schema.js';
+import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
 
 // --- Constants ---
 const SYSTEM_ID = 'Household';
-const HOUSEHOLD_SIZE = 4;
-const CALORIES_PER_PERSON_DAY = 2000;
-const WATER_PER_PERSON_DAY = 1;
-const TOTAL_DAILY_CALORIE_NEED = HOUSEHOLD_SIZE * CALORIES_PER_PERSON_DAY;
-const TOTAL_DAILY_WATER_NEED = HOUSEHOLD_SIZE * WATER_PER_PERSON_DAY;
-const SURVIVAL_GOAL_DAYS = 14;
-const HEAT_GOAL_HOURS = 36;
-const POWER_GOAL_KWH = 20;
+const progressPercent = (value, goal) => goal > 0 ? (value / goal) * 100 : 0;
 
 // AI remains unavailable until an authenticated server endpoint is configured.
 async function callGemini() {
@@ -39,7 +33,7 @@ const resizeBase64 = async (value) => `data:image/png;base64,${value}`;
 
 // --- Main App Component ---
 export default function App() {
-  const [user, setUser] = useState(false);
+  const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [configured, setConfigured] = useState(true);
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -47,24 +41,39 @@ export default function App() {
   const [shoppingList, setShoppingList] = useState([]);
   const [appliances, setAppliances] = useState([]);
   const [plan, setPlan] = useState(null);
+  const [consumption, setConsumption] = useState([]);
   const [loading, setLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
   const [showSyncModal, setShowSyncModal] = useState(false);
   const [aiContent, setAiContent] = useState(null);
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [globalError, setGlobalError] = useState(null);
+  const [settings, setSettings] = useState(() => settingsSchema.parse({}));
+  const [pendingImport, setPendingImport] = useState(null);
+  const [lastSyncedAt, setLastSyncedAt] = useState(null);
+  const [online, setOnline] = useState(() => typeof navigator === 'undefined' ? true : navigator.onLine);
+  const [pendingSync, setPendingSync] = useState(() => loadQueuedActions().length);
   const revision = useRef(-1);
   const busy = useRef(false);
   const epoch = useRef(0);
   const hubId = SYSTEM_ID;
-  const accept = ({data,version}) => {
+  const accept = ({data,version}, synced = true) => {
     if (version < revision.current) return;
     revision.current = version;
     setInventory(data.inventory); setShoppingList(data.shoppingList);
-    setAppliances(data.appliances); setPlan(data.plan);
+    setAppliances(data.appliances); setPlan(data.plan); setConsumption(data.consumption ?? []); setSettings(settingsSchema.parse(data.settings ?? {}));
+    saveCachedState({data,version});
+    if (synced) setLastSyncedAt(Date.now());
   };
   useEffect(() => {
-    request('session').then(value => { setUser(value.authenticated); setConfigured(value.configured); })
+    const handleOnline = () => setOnline(true);
+    const handleOffline = () => setOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
+  }, []);
+  useEffect(() => {
+    request('session').then(value => { setUser(value.authenticated ? value.user : null); setConfigured(value.configured); })
       .catch(error=>setGlobalError(error.message)).finally(()=>setAuthReady(true));
   }, []);
   useEffect(() => {
@@ -74,29 +83,67 @@ export default function App() {
     const refresh = async () => {
       if (running || busy.current) return;
       running = true;
-      try { const state = await request('hub'); if (!cancelled) {accept(state); setGlobalError(null);} }
-      catch(error) { if (!cancelled) {setGlobalError(error.message); if(error.status===401) setUser(false);} }
+      try { const state = await request('hub'); if (!cancelled) {accept(state); setPendingSync(loadQueuedActions().length); setGlobalError(null);} }
+      catch(error) {
+        if (!cancelled && !error.status) {
+          const cached = loadCachedState();
+          if (cached) { accept(cached, false); setLastSyncedAt(cached.savedAt ?? null); setGlobalError('Offline mode: showing the last saved copy. Changes will sync when you reconnect.'); }
+          else setGlobalError('Offline and no saved copy is available. Download a backup after reconnecting.');
+        } else if (!cancelled) { setGlobalError(error.message); if(error.status===401) setUser(null); }
+      }
       finally {running=false;if(!cancelled) setLoading(false);}
     };
     refresh();
     const timer = setInterval(refresh,15000);
     window.addEventListener('focus',refresh);
     return () => {cancelled=true;clearInterval(timer);window.removeEventListener('focus',refresh);};
-  }, [user]);
+  }, [user, online]);
+  useEffect(() => {
+    if (!user || !online || busy.current || !loadQueuedActions().length) return;
+    let cancelled = false;
+    const flush = async () => {
+      const queue = loadQueuedActions();
+      busy.current = true; setIsSyncing(true);
+      try {
+        while (queue.length && !cancelled) {
+          const result = await request('hub', queue[0]);
+          accept(result); queue.shift(); saveQueuedActions(queue); setPendingSync(queue.length);
+        }
+        if (!cancelled && !queue.length) setGlobalError(null);
+      } catch (error) {
+        if (!cancelled) setGlobalError(error.status === 409 ? 'Queued changes conflict with another device. Refresh and review before retrying.' : 'Could not sync queued changes yet. We will retry when you reconnect.');
+      } finally { busy.current = false; setIsSyncing(false); }
+    };
+    flush();
+    return () => { cancelled = true; };
+  }, [user, online]);
+  const queueOffline = action => {
+    try {
+      const next = applyAction({inventory, shoppingList, appliances, plan, consumption, settings}, action);
+      const count = enqueueAction(action);
+      accept({data:next,version:revision.current}, false);
+      setPendingSync(count); setGlobalError('Offline: saved on this device and queued for sync.');
+      return true;
+    } catch (error) { setGlobalError(error.message); return false; }
+  };
   const mutate = async action => {
+    if (!online) return queueOffline(action);
     if (busy.current) return false;
     busy.current=true; setIsSyncing(true);
     const started = epoch.current;
-    try { const result=await request('hub',action); if(started===epoch.current){accept(result);setGlobalError(null);} return true; }
-    catch(error) {if(started===epoch.current){setGlobalError(error.message);if(error.status===401)setUser(false);} return false;}
+    try { const result=await request('hub',action); if(started===epoch.current){accept(result);setPendingSync(loadQueuedActions().length);setGlobalError(null);} return true; }
+    catch(error) {
+      if(started===epoch.current && !error.status) return queueOffline(action);
+      if(started===epoch.current){setGlobalError(error.message);if(error.status===401)setUser(null);} return false;
+    }
     finally {busy.current=false;setIsSyncing(false);}
   };
   const logout = async () => {
-    try {await request('session',{},'DELETE');epoch.current++;setUser(false);setInventory([]);setShoppingList([]);setAppliances([]);setPlan(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    try {await request('session',{},'DELETE');epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
-    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,plan},null,2)],{type:'application/json'});
+    const blob = new Blob([JSON.stringify({inventory,shoppingList,appliances,plan,consumption,settings},null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob);const link=document.createElement('a');
     link.href=url;link.download=`northstar-backup-${new Date().toISOString().slice(0,10)}.json`;link.click();
     setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -106,62 +153,29 @@ export default function App() {
     try {
       if(file.size>2_000_000)throw new Error('Backup must be smaller than 2 MB.');
       const backup=normalizeBackup(JSON.parse(await file.text()),()=>crypto.randomUUID());
-      if(await mutate({type:'import',backup})) {setShowSyncModal(false);alert('Backup imported. Existing records were merged by ID.');}
+      setPendingImport(backup);
+      setGlobalError(null);
     } catch(error){setGlobalError(`Import failed: ${error.message}`);}
+  };
+  const confirmImport = async () => {
+    if (!pendingImport) return false;
+    if (!await mutate({type:'import',backup:pendingImport})) return false;
+    setPendingImport(null);
+    setShowSyncModal(false);
+    alert('Backup imported. Existing records were merged by ID.');
+    return true;
+  };
+  const restoreFromBackup = async (id) => {
+    try {
+      const result = await request('backup', {type:'restore', id});
+      setPendingImport(result.backup);
+      setGlobalError(null);
+    } catch (error) { setGlobalError(`Restore failed: ${error.message}`); }
   };
 
   // --- Logic Helpers ---
-  const stats = useMemo(() => {
-    let waterQty = 0, totalCals = 0, fuelHours = 0, powerKwh = 0, lowStock = 0, expired = 0, totalValue = 0;
-    const buckets = { Water: 0, Pasta: 0, Rice: 0, Beans: 0, 'Energy Bars': 0 };
-
-    inventory.forEach(item => {
-      const qty = Number(item.quantity) || 0;
-      const cals = Number(item.caloriesPerUnit) || 0;
-      const hours = Number(item.hoursPerUnit) || 0;
-      const kwh = Number(item.capacityPerUnit) || 0;
-      const price = Number(item.price) || 0;
-
-      if (item.category === 'Water' && !isExpired(item.expiryDate)) waterQty += waterGallons(item);
-      if (item.category === 'Food' && !isExpired(item.expiryDate)) totalCals += (qty * cals);
-      if (item.category === 'Fuel') fuelHours += (qty * hours);
-      if (item.category === 'Power') powerKwh += (qty * kwh);
-
-      totalValue += (qty * price);
-
-      if (qty < (item.target || 1) * 0.25) lowStock++;
-      if (isExpired(item.expiryDate)) expired++;
-
-      const nameLower = item.name?.toLowerCase() || '';
-      for (const key in buckets) {
-        if (!isExpired(item.expiryDate) && nameLower.includes(key.toLowerCase())) buckets[key] += (key === 'Water' && item.category === 'Water' ? waterGallons(item) : item.category === 'Food' ? qty * cals : 0);
-      }
-    });
-
-    const waterDays = waterQty / TOTAL_DAILY_WATER_NEED;
-    const foodDays = totalCals / TOTAL_DAILY_CALORIE_NEED;
-
-    const coreStatus = Object.keys(buckets).map(name => {
-      const val = buckets[name];
-      const dailyNeed = name === 'Water' ? TOTAL_DAILY_WATER_NEED : TOTAL_DAILY_CALORIE_NEED;
-      const days = val / dailyNeed;
-      return { name, found: val > 0, days, percentage: Math.min(Math.round((days / SURVIVAL_GOAL_DAYS) * 100), 100) };
-    });
-
-    const dailyLoadKwh = appliances.reduce((acc, curr) => {
-        if (curr.active === false) return acc;
-        return acc + (((Number(curr.watts) || 0) * (Number(curr.hours) || 0)) / 1000);
-    }, 0);
-
-    const powerDays = dailyLoadKwh > 0 ? (powerKwh / dailyLoadKwh) : 0;
-
-    return {
-        waterDays, foodDays, totalFuelHours: fuelHours,
-        totalPowerKwh: powerKwh, totalCalories: totalCals, totalValue,
-        lowStock, expired, coreStatus,
-        dailyLoadKwh, powerDays
-    };
-  }, [inventory, appliances]);
+  const stats = useMemo(() => computeReadiness({ inventory, appliances }, settings), [inventory, appliances, settings]);
+  const handleUpdateSettings = (next) => mutate({ type: 'settings', settings: next });
 
   const generateMealPlan = async () => {
     setIsAiLoading(true);
@@ -206,28 +220,56 @@ export default function App() {
   const handleAdd = (collection,item) => mutate({type:'add',collection,id:crypto.randomUUID(),item});
   const handleUpdate = (collection,id,item) => mutate({type:'update',collection,id,item});
   const handleDelete = (collection,id) => mutate({type:'delete',collection,id});
+  const handleBulkDelete = (collection, ids) => mutate({type:'bulk_delete',collection,ids});
+  const handleBulkUpdate = (collection, ids, changes) => mutate({type:'bulk_update',collection,ids,...changes});
   const handleBuyItem = item => mutate({type:'buy',id:item.id});
+  const handleConsume = (itemId, event) => mutate({type:'consume', id:crypto.randomUUID(), itemId, event});
+  const handleDeleteConsumption = id => mutate({type:'delete_consumption', id});
+  const handleRestockRecurring = async (dueItems) => {
+    for (const item of dueItems) {
+      const {id, purchaseDate, expiryDate, quantity, target, ...rest} = item;
+      if (!await handleAdd('shopping_list', {...rest, quantity: target || quantity || 1, purchaseDate: '', expiryDate: ''})) return false;
+    }
+    return true;
+  };
+
+  const handleAuthenticated = (profile) => {
+    epoch.current++;revision.current=-1;setLoading(true);setUser(profile);setGlobalError(null);
+    window.history.replaceState(null,'',window.location.pathname);
+  };
 
   if (!authReady) return <LoadingScreen />;
-  if (!user) return <Login configured={configured} error={globalError} onLogin={() => {epoch.current++;revision.current=-1;setLoading(true);setUser(true);setGlobalError(null);}} />;
+  if (!user) {
+    const inviteToken = new URLSearchParams(window.location.search).get('invite');
+    if (inviteToken) return <AcceptInvite token={inviteToken} onJoined={handleAuthenticated} />;
+    return <Login configured={configured} error={globalError} onLogin={handleAuthenticated} />;
+  }
   if (loading && !inventory.length && !globalError) return <LoadingScreen />;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans select-none">
-      {globalError && <div role="alert" className="bg-red-100 text-red-900 p-4">{globalError}</div>}
-      <Header hubId={hubId} isSyncing={isSyncing} onSyncClick={() => setShowSyncModal(true)} error={globalError} onDownload={downloadBackup} />
+      {globalError && <div role="alert" aria-live="assertive" className="bg-red-100 text-red-900 p-4">{globalError}</div>}
+      <Header hubId={hubId} isSyncing={isSyncing} online={online} pendingSync={pendingSync} lastSyncedAt={lastSyncedAt} onSyncClick={() => setShowSyncModal(true)} error={globalError} onDownload={downloadBackup} />
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
-        {activeTab === 'dashboard' && <Dashboard stats={stats} onGeneratePlan={generateMealPlan} onAnalyzeGaps={analyzeInventory} isAiLoading={isAiLoading} />}
+        {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} onGeneratePlan={generateMealPlan} onAnalyzeGaps={analyzeInventory} isAiLoading={isAiLoading} />}
         {activeTab === 'inventory' && (
           <InventoryManager
             title="Supply Hub"
             items={inventory}
+            shoppingList={shoppingList}
+            consumption={consumption}
             stats={stats}
+            settings={settings}
             onAdd={(i) => handleAdd('inventory', i)}
             onUpdate={(id, i) => handleUpdate('inventory', id, i)}
             onDelete={(id) => handleDelete('inventory', id)}
+            onBulkDelete={(ids) => handleBulkDelete('inventory', ids)}
+            onBulkUpdate={(ids, changes) => handleBulkUpdate('inventory', ids, changes)}
+            onRestock={handleRestockRecurring}
+            onConsume={handleConsume}
+            onDeleteConsumption={handleDeleteConsumption}
             onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)}
             isAiLoading={isAiLoading}
           />
@@ -237,10 +279,13 @@ export default function App() {
             title="Shopping List"
             items={shoppingList}
             stats={stats}
+            settings={settings}
             isShoppingMode={true}
             onAdd={(i) => handleAdd('shopping_list', i)}
             onUpdate={(id, i) => handleUpdate('shopping_list', id, i)}
             onDelete={(id) => handleDelete('shopping_list', id)}
+            onBulkDelete={(ids) => handleBulkDelete('shopping_list', ids)}
+            onBulkUpdate={(ids, changes) => handleBulkUpdate('shopping_list', ids, changes)}
             onBuy={handleBuyItem}
             onSmartSuggest={(txt) => smartSuggestItem(txt, setIsAiLoading)}
             isAiLoading={isAiLoading}
@@ -250,6 +295,7 @@ export default function App() {
           <ApplianceManager
             appliances={appliances}
             stats={stats}
+            settings={settings}
             onAdd={(i) => handleAdd('appliances', i)}
             onUpdate={(id, i) => handleUpdate('appliances', id, i)}
             onDelete={(id) => handleDelete('appliances', id)}
@@ -262,14 +308,14 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => setShowSyncModal(false)} onImport={handleFileUpload} onLogout={logout} />}
+      {showSyncModal && <SyncModal onClose={() => { setPendingImport(null); setShowSyncModal(false); }} onImport={handleFileUpload} pendingImport={pendingImport} onConfirmImport={confirmImport} onCancelImport={() => setPendingImport(null)} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} />}
       {aiContent && <AiModal content={aiContent} onClose={() => setAiContent(null)} />}
     </div>
   );
 }
 
 // --- Dashboard ---
-function Dashboard({ stats, onGeneratePlan, onAnalyzeGaps, isAiLoading }) {
+function Dashboard({ stats, settings, onGeneratePlan, onAnalyzeGaps, isAiLoading }) {
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       <div className="grid grid-cols-2 gap-4">
@@ -284,20 +330,27 @@ function Dashboard({ stats, onGeneratePlan, onAnalyzeGaps, isAiLoading }) {
           <h2 className="text-xl font-black mb-1">Readiness Score</h2>
           <p className="text-slate-400 text-xs font-bold uppercase tracking-widest">Household Readiness</p>
           <div className="mt-6 space-y-4">
-            <ProgressBar label="Food (14 Days)" percent={(stats.foodDays / SURVIVAL_GOAL_DAYS) * 100} color="bg-emerald-500" />
-            <ProgressBar label="Water (14 Days)" percent={(stats.waterDays / SURVIVAL_GOAL_DAYS) * 100} color="bg-blue-500" />
-            <ProgressBar label={`Heat (${HEAT_GOAL_HOURS}h)`} percent={(stats.totalFuelHours / HEAT_GOAL_HOURS) * 100} color="bg-amber-500" />
-            <ProgressBar label={`Power (Duration: ${stats.powerDays.toFixed(1)} Days)`} percent={(stats.powerDays / 2) * 100} color="bg-violet-500" />
+            <ProgressBar label={`Food (${settings.survivalGoalDays} Days)`} percent={progressPercent(stats.foodDays, settings.survivalGoalDays)} color="bg-emerald-500" />
+            <ProgressBar label={`Water (${settings.survivalGoalDays} Days)`} percent={progressPercent(stats.waterDays, settings.survivalGoalDays)} color="bg-blue-500" />
+            <ProgressBar label={`Heat (${settings.heatGoalHours}h)`} percent={progressPercent(stats.totalFuelHours, settings.heatGoalHours)} color="bg-amber-500" />
+            <ProgressBar label={`Power (Goal: ${settings.powerGoalKwh} kWh)`} percent={progressPercent(stats.totalPowerKwh, settings.powerGoalKwh)} color="bg-violet-500" />
           </div>
+          <p className="mt-5 text-[10px] leading-relaxed text-slate-400">
+            Assumes {settings.householdSize} {settings.householdSize === 1 ? 'person' : 'people'} needing {settings.caloriesPerPersonPerDay.toLocaleString()} kcal
+            and {settings.waterGallonsPerPersonPerDay} gal water per person/day ({stats.dailyCalorieNeed.toLocaleString()} kcal
+            and {stats.dailyWaterNeed.toLocaleString()} gal/day for the household). Stored power counts {Math.round(settings.batteryUsableFraction * 100)}%
+            usable capacity after a {Math.round(settings.inverterEfficiency * 100)}% efficient inverter conversion.
+            Edit these in Household settings.
+          </p>
         </div>
       </div>
 
       <div className="grid grid-cols-2 gap-3">
-        <button onClick={onGeneratePlan} disabled={isAiLoading} className="bg-emerald-50 text-emerald-700 py-4 rounded-[2rem] flex flex-col items-center justify-center gap-1 font-black text-[10px] uppercase tracking-widest border border-emerald-100 shadow-sm active:scale-95 transition-all disabled:opacity-50">
+          <button aria-label="Generate meal plan" onClick={onGeneratePlan} disabled={isAiLoading} className="bg-emerald-50 text-emerald-700 py-4 rounded-[2rem] flex flex-col items-center justify-center gap-1 font-black text-[10px] uppercase tracking-widest border border-emerald-100 shadow-sm active:scale-95 transition-all disabled:opacity-50">
           {isAiLoading ? <RefreshCw className="animate-spin" size={20}/> : <Sparkles size={20}/>}
           Meal Plan
         </button>
-        <button onClick={onAnalyzeGaps} disabled={isAiLoading} className="bg-blue-50 text-blue-700 py-4 rounded-[2rem] flex flex-col items-center justify-center gap-1 font-black text-[10px] uppercase tracking-widest border border-blue-100 shadow-sm active:scale-95 transition-all disabled:opacity-50">
+        <button aria-label="Analyze inventory gaps" onClick={onAnalyzeGaps} disabled={isAiLoading} className="bg-blue-50 text-blue-700 py-4 rounded-[2rem] flex flex-col items-center justify-center gap-1 font-black text-[10px] uppercase tracking-widest border border-blue-100 shadow-sm active:scale-95 transition-all disabled:opacity-50">
           {isAiLoading ? <RefreshCw className="animate-spin" size={20}/> : <SearchCheck size={20}/>}
           Analyze Gaps
         </button>
@@ -337,16 +390,16 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
 
       <div className="bg-violet-50 border border-violet-100 rounded-[2.5rem] p-6 shadow-sm flex flex-col items-center text-center">
          <div className="p-3 bg-violet-100 text-violet-600 rounded-full mb-2"><Zap size={24}/></div>
-         <div className="text-3xl font-black text-slate-900">{stats.dailyLoadKwh.toFixed(2)} <span className="text-base font-bold text-slate-400">kWh/day</span></div>
-         <div className="text-xs font-bold text-violet-400 uppercase tracking-widest mb-4">Active Daily Demand</div>
+         <div className="text-3xl font-black text-slate-900">{stats.dailyLoadKwh.toFixed(2)} <span className="text-base font-bold text-slate-600">kWh/day</span></div>
+         <div className="text-xs font-bold text-violet-600 uppercase tracking-widest mb-4">Active Daily Demand</div>
 
          <div className="w-full bg-white p-4 rounded-2xl border border-violet-100 flex justify-between items-center">
             <div className="text-left">
-               <div className="text-[10px] font-black uppercase text-slate-400">Stored Power</div>
+               <div className="text-[10px] font-black uppercase text-slate-600">Stored Power</div>
                <div className="text-lg font-black text-slate-800">{stats.totalPowerKwh.toFixed(1)} kWh</div>
             </div>
             <div className="text-right">
-               <div className="text-[10px] font-black uppercase text-slate-400">Est. Runtime</div>
+               <div className="text-[10px] font-black uppercase text-slate-600">Est. Runtime</div>
                <div className="text-lg font-black text-emerald-600">{stats.powerDays.toFixed(1)} Days</div>
             </div>
          </div>
@@ -365,7 +418,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
           <form onSubmit={submit} className="bg-white border-2 border-violet-100 rounded-[2.5rem] p-7 shadow-2xl space-y-4">
              <div className="flex justify-between items-center mb-2">
                 <h3 className="text-xs font-black uppercase text-violet-600 tracking-widest">{editingId ? 'Edit Device' : 'New Appliance'}</h3>
-                {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-500 flex items-center gap-1 text-[10px] font-black uppercase"><Trash2 size={12}/> Delete</button>}
+                {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 flex items-center gap-1 text-[10px] font-black uppercase"><Trash2 size={12}/> Delete</button>}
              </div>
              <div className="grid grid-cols-2 gap-4">
                 <div className="col-span-2"><Label>Device Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Fridge" /></div>
@@ -380,30 +433,30 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
       )}
 
       <div className="mt-4 space-y-3 px-1">
-        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] px-1">Devices (Tap Power to Toggle)</h3>
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-[0.2em] px-1">Devices (Tap Power to Toggle)</h3>
         {appliances.map(app => (
           <div key={app.id} className={`border p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm transition-all ${app.active !== false ? 'bg-white border-slate-200' : 'bg-slate-50 border-slate-100 opacity-60'}`}>
              <div className="flex items-center gap-4">
-                <button
+                <button aria-label={`Turn ${app.name} ${app.active !== false ? 'off' : 'on'}`} title={`Turn ${app.name} ${app.active !== false ? 'off' : 'on'}`}
                   onClick={(e) => { e.stopPropagation(); onUpdate(app.id, { active: app.active === false ? true : false }); }}
-                  className={`p-3.5 rounded-2xl transition-all active:scale-90 shadow-sm ${app.active !== false ? 'bg-violet-500 text-white shadow-violet-200' : 'bg-slate-200 text-slate-400'}`}
+                  className={`p-3.5 rounded-2xl transition-all active:scale-90 shadow-sm ${app.active !== false ? 'bg-violet-500 text-white shadow-violet-200' : 'bg-slate-200 text-slate-500'}`}
                 >
                   <Power size={20} />
                 </button>
                 <div onClick={() => handleEdit(app)} className="cursor-pointer">
                    <h4 className="font-black text-slate-800 leading-tight">{app.name}</h4>
-                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">
+                   <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
                     {app.watts}W • {app.hours} hrs/day • {((app.watts * app.hours)/1000).toFixed(2)} kWh
                    </p>
                 </div>
              </div>
-             <button onClick={() => handleEdit(app)} className="text-slate-200 hover:text-violet-400 transition-colors p-2">
+             <button aria-label={`Edit ${app.name}`} onClick={() => handleEdit(app)} className="text-slate-500 hover:text-violet-600 transition-colors p-2">
                <ChevronRight size={18} />
              </button>
           </div>
         ))}
         {appliances.length === 0 && !showAdd && (
-           <div className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">No appliances tracked</div>
+           <div className="text-center py-10 text-slate-600 text-xs font-bold uppercase tracking-widest">No appliances tracked</div>
         )}
       </div>
     </div>
@@ -411,25 +464,44 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete, onSmar
 }
 
 // --- Inventory Manager (Reused for Shop) ---
-function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBuy, onSmartSuggest, isAiLoading, isShoppingMode }) {
+function InventoryManager({ title, items, shoppingList = [], consumption = [], stats, settings, onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onConsume, onDeleteConsumption, onBuy, onSmartSuggest, isAiLoading, isShoppingMode }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
   const [smartText, setSmartText] = useState('');
   const [isImgLoading, setIsImgLoading] = useState(false);
   const [sortBy, setSortBy] = useState(''); // 'expiry', 'calories', 'date'
+  const [query, setQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [formError, setFormError] = useState(null);
+  const [bulkCategory, setBulkCategory] = useState('');
+  const [bulkQuantityMode, setBulkQuantityMode] = useState('set');
+  const [bulkQuantityValue, setBulkQuantityValue] = useState('');
 
   const [form, setForm] = useState({
-    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', purchaseDate: '', expiryDate: ''
+    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: ''
   });
 
   const reset = () => {
-    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', purchaseDate: '', expiryDate: '' });
+    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '' });
     setEditingItem(null);
     setShowAdd(false);
+    setFormError(null);
   };
 
   const submit = async (e) => {
     e.preventDefault();
+    setFormError(null);
+    const normalizedName = String(form.name || '').trim().toLowerCase();
+    const normalizedBarcode = String(form.barcode || '').trim();
+    const duplicate = items.some(item => item.id !== editingItem?.id && (
+      (item.category === form.category && String(item.name || '').trim().toLowerCase() === normalizedName) ||
+      (normalizedBarcode && item.barcode === normalizedBarcode)
+    ));
+    if (duplicate) {
+      setFormError('An item with this name and category, or this barcode, already exists. Edit the existing item or choose a different one.');
+      return;
+    }
     const payload = {
       ...form,
       quantity: Number(form.quantity),
@@ -437,11 +509,23 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
       hoursPerUnit: Number(form.hoursPerUnit),
       capacityPerUnit: Number(form.capacityPerUnit),
       gallonsPerUnit: Number(form.gallonsPerUnit || 0),
-      price: Number(form.price)
+      price: Number(form.price),
+      barcode: normalizedBarcode,
+      recurringDays: Number(form.recurringDays || 0),
     };
     if (editingItem) { if (!await onUpdate(editingItem.id, payload)) return; }
     else if (!await onAdd(payload)) return;
     reset();
+  };
+
+  const applyBulkCategory = async () => {
+    if (!bulkCategory) return;
+    if (await onBulkUpdate([...selectedIds], {category: bulkCategory})) setBulkCategory('');
+  };
+  const applyBulkQuantity = async () => {
+    const value = Number(bulkQuantityValue);
+    if (!Number.isFinite(value)) return;
+    if (await onBulkUpdate([...selectedIds], {quantity: {mode: bulkQuantityMode, value}})) setBulkQuantityValue('');
   };
 
   const handleEdit = (item) => { setForm(item); setEditingItem(item); setShowAdd(true); window.scrollTo({ top: 0, behavior: 'smooth' }); };
@@ -460,8 +544,28 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
 
   const totalShopCost = useMemo(() => items.reduce((acc, i) => acc + (Number(i.price||0) * Number(i.quantity||0)), 0), [items]);
 
+  const dueRecurringItems = useMemo(() => {
+    if (isShoppingMode) return [];
+    return items.filter(item => isRecurringDue(item) && !shoppingList.some(row => row.category === item.category && String(row.name || '').trim().toLowerCase() === String(item.name || '').trim().toLowerCase()));
+  }, [items, shoppingList, isShoppingMode]);
+
+  useEffect(() => {
+    setSelectedIds(previous => new Set([...previous].filter(id => items.some(item => item.id === id))));
+  }, [items]);
+
+  const filteredItems = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return items.filter(item => {
+      if (needle && ![item.name, item.category, item.store, item.unit].some(value => String(value || '').toLowerCase().includes(needle))) return false;
+      if (statusFilter === 'expired' && !isExpired(item.expiryDate)) return false;
+      if (statusFilter === 'expiring' && (isExpired(item.expiryDate) || !item.expiryDate || new Date(item.expiryDate) > new Date(Date.now() + 30 * 24 * 60 * 60 * 1000))) return false;
+      if (statusFilter === 'low' && Number(item.quantity || 0) >= Number(item.target || 1) * 0.25) return false;
+      return true;
+    });
+  }, [items, query, statusFilter]);
+
   const sortedItems = useMemo(() => {
-    let sorted = [...items];
+    let sorted = [...filteredItems];
     if (sortBy === 'expiry') {
       sorted.sort((a, b) => new Date(a.expiryDate || '2099-01-01') - new Date(b.expiryDate || '2099-01-01'));
     } else if (sortBy === 'calories') {
@@ -470,7 +574,7 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
       sorted.sort((a, b) => new Date(b.purchaseDate || '1970-01-01') - new Date(a.purchaseDate || '1970-01-01'));
     }
     return sorted;
-  }, [items, sortBy]);
+  }, [filteredItems, sortBy]);
 
   const groupedItems = useMemo(() => {
     const groups = Object.create(null);
@@ -484,22 +588,59 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
     return groups;
   }, [sortedItems, isShoppingMode]);
 
-  const waterPct = Math.min(Math.round((stats.waterDays / SURVIVAL_GOAL_DAYS) * 100), 100);
-  const foodPct = Math.min(Math.round((stats.foodDays / SURVIVAL_GOAL_DAYS) * 100), 100);
+  const waterPct = settings.survivalGoalDays ? Math.min(Math.round((stats.waterDays / settings.survivalGoalDays) * 100), 100) : 0;
+  const foodPct = settings.survivalGoalDays ? Math.min(Math.round((stats.foodDays / settings.survivalGoalDays) * 100), 100) : 0;
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       <div className="flex justify-between items-center px-1">
         <h2 className="text-xl font-black text-slate-800">{title}</h2>
         <div className="flex gap-2">
-          <button onClick={() => setSortBy(prev => prev === 'expiry' ? '' : 'expiry')} className={`p-2 rounded-full ${sortBy === 'expiry' ? 'bg-orange-100 text-orange-600' : 'bg-slate-100 text-slate-400'}`}>
-            <Calendar size={18}/>
+          <button aria-label="Sort by expiry date" title="Sort by expiry date" onClick={() => setSortBy(prev => prev === 'expiry' ? '' : 'expiry')} className={`p-2 rounded-full ${sortBy === 'expiry' ? 'bg-orange-100 text-orange-600' : 'bg-slate-100 text-slate-500'}`}>
+            <Calendar aria-hidden="true" size={18}/>
           </button>
-          <button onClick={() => showAdd ? reset() : setShowAdd(true)} className="bg-slate-900 text-white px-5 py-2.5 rounded-2xl flex items-center gap-2 text-sm font-black active:scale-95 transition-all shadow-lg">
+          <button aria-label={showAdd ? 'Cancel adding item' : 'Add item'} onClick={() => showAdd ? reset() : setShowAdd(true)} className="bg-slate-900 text-white px-5 py-2.5 rounded-2xl flex items-center gap-2 text-sm font-black active:scale-95 transition-all shadow-lg">
             {showAdd ? 'Cancel' : <><Plus size={18}/> Add Item</>}
           </button>
         </div>
       </div>
+
+      <div className="grid grid-cols-[1fr_auto] gap-2">
+        <input aria-label={`Search ${title.toLowerCase()}`} value={query} onChange={event => setQuery(event.target.value)} placeholder="Search name, category or store" className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-3 text-sm outline-none focus:border-blue-400" />
+        <select aria-label="Filter items" value={statusFilter} onChange={event => setStatusFilter(event.target.value)} className="bg-white border border-slate-200 rounded-2xl px-3 text-xs font-bold">
+          <option value="all">All</option><option value="low">Low stock</option><option value="expiring">Expiring</option><option value="expired">Expired</option>
+        </select>
+      </div>
+      {selectedIds.size > 0 && (
+        <div className="bg-blue-50 border border-blue-100 rounded-2xl px-4 py-3 text-sm space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <span className="font-bold text-blue-800">{selectedIds.size} selected</span>
+            <button aria-label="Delete selected items" onClick={async () => { if (await onBulkDelete([...selectedIds])) setSelectedIds(new Set()); }} className="text-red-700 font-black">Delete selected</button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <select aria-label="Set category for selected items" value={bulkCategory} onChange={e => setBulkCategory(e.target.value)} className="bg-white border border-blue-200 rounded-xl px-3 py-2 text-xs font-bold">
+              <option value="">Set category…</option>
+              {categories.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <button aria-label="Apply category to selected items" onClick={applyBulkCategory} disabled={!bulkCategory} className="px-3 py-2 bg-blue-600 text-white rounded-xl text-xs font-black disabled:opacity-40">Apply</button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <select aria-label="Bulk quantity mode" value={bulkQuantityMode} onChange={e => setBulkQuantityMode(e.target.value)} className="bg-white border border-blue-200 rounded-xl px-3 py-2 text-xs font-bold">
+              <option value="set">Set quantity to</option>
+              <option value="delta">Adjust quantity by</option>
+            </select>
+            <input aria-label="Bulk quantity value" type="number" step="any" value={bulkQuantityValue} onChange={e => setBulkQuantityValue(e.target.value)} placeholder="0" className="w-20 bg-white border border-blue-200 rounded-xl px-3 py-2 text-xs font-bold" />
+            <button aria-label="Apply quantity change to selected items" onClick={applyBulkQuantity} disabled={bulkQuantityValue === ''} className="px-3 py-2 bg-blue-600 text-white rounded-xl text-xs font-black disabled:opacity-40">Apply</button>
+          </div>
+        </div>
+      )}
+
+      {dueRecurringItems.length > 0 && (
+        <div className="flex items-center justify-between gap-3 bg-amber-50 border border-amber-100 rounded-2xl px-4 py-3 text-sm">
+          <span className="font-bold text-amber-800">{dueRecurringItems.length} item{dueRecurringItems.length > 1 ? 's' : ''} due for restock</span>
+          <button aria-label="Add due recurring items to shopping list" onClick={async () => { if (await onRestock(dueRecurringItems)) alert('Added due items to your shopping list.'); }} className="text-amber-700 font-black">Add to shopping list</button>
+        </div>
+      )}
 
       {showAdd && (
         <div className="space-y-4 mb-6 animate-in slide-in-from-top-4 duration-300">
@@ -514,7 +655,7 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
           <form onSubmit={submit} className="bg-white border-2 border-blue-100 rounded-[2.5rem] p-6 shadow-2xl space-y-4">
             <div className="flex justify-between mb-2">
               <h3 className="text-xs font-black uppercase text-blue-600">{editingItem ? 'Edit Item' : 'New Supply'}</h3>
-              {editingItem && <button type="button" onClick={async () => { if (await onDelete(editingItem.id)) reset(); }} className="text-red-500 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
+              {editingItem && <button type="button" onClick={async () => { if (await onDelete(editingItem.id)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
             </div>
 
             <div className="flex justify-center mb-4">
@@ -535,9 +676,21 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
               <div><Label>Expiry Date</Label><Input val={form.expiryDate} set={v => setForm({...form, expiryDate: v})} type="date" /></div>
 
               <div><Label>Price ($/Unit)</Label><Input val={form.price} set={v => setForm({...form, price: v})} type="number" placeholder="0.00" /></div>
-              <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={["Food", "Water", "Medical", "Gear", "Fuel", "Power"]} /></div>
+              <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={categories} /></div>
 
               {isShoppingMode && <div className="col-span-2"><Label>Store</Label><Input val={form.store} set={v => setForm({...form, store: v})} placeholder="e.g. Costco" /></div>}
+
+              <div className="col-span-2">
+                <Label>Barcode (optional)</Label>
+                <div className="flex gap-2">
+                  <div className="flex-1"><Input val={form.barcode} set={v => setForm({...form, barcode: v})} placeholder="Scan or type a barcode" /></div>
+                  <BarcodeScanButton onDetected={code => setForm(prev => ({...prev, barcode: code}))} />
+                </div>
+              </div>
+              <div className="col-span-2">
+                <Label>Restock every N days (0 = never)</Label>
+                <Input val={form.recurringDays} set={v => setForm({...form, recurringDays: v})} type="number" placeholder="e.g. 30" />
+              </div>
 
               {form.category === 'Food' && (
                 <>
@@ -546,13 +699,27 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
                 </>
               )}
               {form.category === 'Water' && <div className="col-span-2"><Label>Gallons per unit (for bottles or cases)</Label><Input val={form.gallonsPerUnit} set={v => setForm({...form, gallonsPerUnit:v})} type="number" placeholder="e.g. 0.132 for a 500 mL bottle" /><p className="text-xs text-slate-500 mt-2">Leave zero when your unit is gallons, liters, mL or fl oz. Other units need this value to count toward readiness.</p></div>}
-              {form.category === 'Fuel' && <div className="col-span-2"><Label>Hours/Unit (Heat)</Label><Input val={form.hoursPerUnit} set={v => setForm({...form, hoursPerUnit: v})} type="number" /></div>}
+              {form.category === 'Fuel' && (
+                <>
+                  <div><Label>Fuel Type</Label><Select val={form.fuelType} set={v => setForm({...form, fuelType: v})} opts={fuelTypes} /></div>
+                  <div><Label>Hours/Unit (Heat)</Label><Input val={form.hoursPerUnit} set={v => setForm({...form, hoursPerUnit: v})} type="number" /></div>
+                </>
+              )}
               {form.category === 'Power' && <div className="col-span-2"><Label>Capacity (kWh)</Label><Input val={form.capacityPerUnit} set={v => setForm({...form, capacityPerUnit: v})} type="number" placeholder="e.g. 1.5"/></div>}
             </div>
+            {formError && <p role="alert" className="text-xs font-bold text-red-600">{formError}</p>}
             <button type="submit" className="w-full bg-blue-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl active:bg-blue-700 transition-colors mt-2">
               {editingItem ? 'Save Changes' : 'Add to Hub'}
             </button>
           </form>
+          {editingItem && !isShoppingMode && onConsume && (
+            <ConsumptionPanel
+              item={editingItem}
+              events={consumption.filter(event => event.itemId === editingItem.id)}
+              onConsume={event => onConsume(editingItem.id, event)}
+              onDelete={onDeleteConsumption}
+            />
+          )}
         </div>
       )}
 
@@ -560,8 +727,15 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
         <div className="grid grid-cols-2 gap-4 px-1">
           <SummaryCard icon={<Droplets size={16}/>} color="blue" label="Water" value={stats.waterDays} unit="Days" pct={waterPct} />
           <SummaryCard icon={<Utensils size={16}/>} color="emerald" label="Total Food" value={stats.foodDays} unit="Days" pct={foodPct} />
-          <SummaryCard icon={<Flame size={16}/>} color="amber" label="Total Heat" value={stats.totalFuelHours} unit="Hours" pct={(stats.totalFuelHours / HEAT_GOAL_HOURS) * 100} />
-          <SummaryCard icon={<Zap size={16}/>} color="violet" label="Backup Power" value={stats.totalPowerKwh} unit="kWh" pct={(stats.totalPowerKwh / POWER_GOAL_KWH) * 100} />
+          <SummaryCard icon={<Flame size={16}/>} color="amber" label="Total Heat" value={stats.totalFuelHours} unit="Hours" pct={progressPercent(stats.totalFuelHours, settings.heatGoalHours)} />
+          <SummaryCard icon={<Zap size={16}/>} color="violet" label="Backup Power" value={stats.totalPowerKwh} unit="kWh" pct={progressPercent(stats.totalPowerKwh, settings.powerGoalKwh)} />
+          {Object.keys(stats.fuelByType).length > 0 && (
+            <div className="col-span-2 bg-amber-50 border border-amber-100 rounded-[2rem] p-4 text-[11px] font-bold text-amber-700 flex flex-wrap gap-x-4 gap-y-1">
+              {Object.entries(stats.fuelByType).map(([type, hours]) => (
+                <span key={type}>{type || 'Unspecified'}: {hours.toFixed(0)}h</span>
+              ))}
+            </div>
+          )}
           <div className="col-span-2 bg-slate-900 rounded-[2.5rem] p-5 shadow-lg flex justify-between items-center text-white">
             <div className="flex items-center gap-3">
                <div className="p-2 bg-slate-800 rounded-full"><DollarSign size={20}/></div>
@@ -577,7 +751,7 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
       {isShoppingMode && (
          <div className="bg-emerald-50 border border-emerald-100 rounded-[2.5rem] p-5 shadow-sm flex items-center justify-between mb-6">
            <div>
-              <div className="text-[10px] font-black uppercase text-emerald-600 tracking-widest">Estimated Cost</div>
+              <div className="text-[10px] font-black uppercase text-emerald-700 tracking-widest">Estimated Cost</div>
               <div className="text-2xl font-black text-slate-800">${totalShopCost.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</div>
            </div>
            <div className="p-3 bg-emerald-100 text-emerald-600 rounded-full"><ShoppingCart size={24}/></div>
@@ -589,7 +763,7 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
            Object.entries(groupedItems).map(([groupName, groupItems]) => (
              <div key={groupName} className="mb-6">
                <div className="flex justify-between items-center mb-3 pl-2 pr-2">
-                 <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-2">
+                 <h4 className="text-[10px] font-black text-slate-600 uppercase tracking-widest flex items-center gap-2">
                    {isShoppingMode ? <Store size={12} /> : (getCategoryIcon(groupName)?.icon || <Layers size={12} />)}
                    {groupName}
                  </h4>
@@ -599,17 +773,17 @@ function InventoryManager({ title, items, stats, onAdd, onUpdate, onDelete, onBu
                    </span>
                  )}
                  <div className="flex gap-2">
-                   <button onClick={() => setSortBy('expiry')} className={`text-[8px] font-bold px-2 py-0.5 rounded-md ${sortBy === 'expiry' ? 'bg-orange-100 text-orange-600' : 'text-slate-300'}`}>Exp</button>
-                   <button onClick={() => setSortBy('calories')} className={`text-[8px] font-bold px-2 py-0.5 rounded-md ${sortBy === 'calories' ? 'bg-emerald-100 text-emerald-600' : 'text-slate-300'}`}>Cal</button>
+                   <button onClick={() => setSortBy('expiry')} className={`text-[8px] font-bold px-2 py-0.5 rounded-md ${sortBy === 'expiry' ? 'bg-orange-100 text-orange-800' : 'text-slate-600'}`}>Exp</button>
+                   <button onClick={() => setSortBy('calories')} className={`text-[8px] font-bold px-2 py-0.5 rounded-md ${sortBy === 'calories' ? 'bg-emerald-100 text-emerald-700' : 'text-slate-600'}`}>Cal</button>
                  </div>
                </div>
                <div className="space-y-3">
-                 {groupItems.map(item => <InventoryItem key={item.id} item={item} onClick={() => handleEdit(item)} onBuy={onBuy} />)}
+                 {groupItems.map(item => <InventoryItem key={item.id} item={item} forecast={!isShoppingMode ? consumptionForecast(item, consumption) : null} selected={selectedIds.has(item.id)} onSelect={checked => setSelectedIds(previous => { const next = new Set(previous); if (checked) next.add(item.id); else next.delete(item.id); return next; })} onClick={() => handleEdit(item)} onBuy={onBuy} />)}
                </div>
              </div>
            ))
         ) : (
-           <div className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">List Empty</div>
+           <div className="text-center py-10 text-slate-600 text-xs font-bold uppercase tracking-widest">{items.length ? 'No matching items' : 'List Empty'}</div>
         )}
       </div>
     </div>
@@ -636,13 +810,13 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
       </button>
 
       <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
-        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-6">Household Tracking</h3>
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-6">Household Tracking</h3>
         <div className="space-y-5">
           {plan?.family?.map((m, i) => (
             <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-4 last:border-0 last:pb-0">
                <div className="flex items-center gap-4">
                   <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-3xl flex items-center justify-center font-black text-xl">{m.name[0]}</div>
-                  <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-400 font-bold uppercase">{m.role} • {m.dob}</div></div>
+                  <div><div className="font-black text-slate-800">{m.name}</div><div className="text-[10px] text-slate-600 font-bold uppercase">{m.role} • {m.dob}</div></div>
                </div>
                {m.role === 'Child' && <div className="bg-indigo-50 text-indigo-700 text-[9px] font-black uppercase px-3 py-1 rounded-full">Priority</div>}
             </div>
@@ -650,7 +824,7 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
         </div>
       </section>
       <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
-        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Storm Point</h3>
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Storm Point</h3>
         {isEditing ? (
           <textarea className="w-full bg-slate-50 border-2 rounded-2xl p-5 text-sm font-bold min-h-[100px] outline-none" value={spot} onChange={e => setSpot(e.target.value)} />
         ) : (
@@ -660,7 +834,7 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
 
       {/* Survival Sync Links Moved Here */}
       <div className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm mt-6">
-        <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Survival Sync</h3>
+        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Survival Sync</h3>
         <div className="grid gap-3">
           {[
             { title: "MnDOT 511 Roads", url: "https://511mn.org", icon: <Navigation size={20}/>, color: "bg-blue-50 text-blue-600" },
@@ -671,7 +845,7 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
               <div className={`p-3 rounded-xl ${link.color}`}>{link.icon}</div>
               <div className="flex-1">
                 <div className="font-black text-sm text-slate-800">{link.title}</div>
-                <div className="text-[9px] text-slate-400 font-mono uppercase">{link.url.replace('https://', '')}</div>
+                <div className="text-[9px] text-slate-600 font-mono uppercase">{link.url.replace('https://', '')}</div>
               </div>
               <ChevronRight size={16} className="text-slate-300 group-hover:text-blue-500"/>
             </a>
@@ -683,9 +857,142 @@ function EmergencyPlan({ plan, onUpdate, onRunDrill, isAiLoading }) {
 }
 
 // --- Helper Components ---
-const Label = ({ children }) => <label className="text-[10px] font-black uppercase text-slate-400 mb-1 block">{children}</label>;
+const Label = ({ children }) => <label className="text-[10px] font-black uppercase text-slate-600 mb-1 block">{children}</label>;
 const Input = ({ val, set, type="text", placeholder }) => <input type={type} min={type === "number" ? 0 : undefined} step={type === "number" ? "any" : undefined} className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none focus:bg-white focus:border-blue-400 border border-transparent transition-all" value={val ?? ""} onChange={e => set(e.target.value)} placeholder={placeholder} />;
 const Select = ({ val, set, opts }) => <select className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none border border-transparent" value={val ?? ""} onChange={e => set(e.target.value)}>{opts.map(o => <option key={o} value={o}>{o}</option>)}</select>;
+
+// Barcode scanning is progressive enhancement: browsers without BarcodeDetector (e.g. Safari)
+// just get the manual text input above, which is the required fallback.
+function BarcodeScanButton({ onDetected }) {
+  const [scanning, setScanning] = useState(false);
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const frameRef = useRef(null);
+  const supported = typeof window !== 'undefined' && 'BarcodeDetector' in window;
+
+  const stop = () => {
+    if (frameRef.current) cancelAnimationFrame(frameRef.current);
+    frameRef.current = null;
+    if (streamRef.current) { streamRef.current.getTracks().forEach(track => track.stop()); streamRef.current = null; }
+    setScanning(false);
+  };
+
+  useEffect(() => () => stop(), []);
+
+  const start = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      streamRef.current = stream;
+      setScanning(true);
+      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
+      const detector = new window.BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'qr_code'] });
+      const tick = async () => {
+        if (!videoRef.current) return;
+        try {
+          const results = await detector.detect(videoRef.current);
+          if (results.length) { onDetected(results[0].rawValue); stop(); return; }
+        } catch { /* keep trying past transient decode errors */ }
+        frameRef.current = requestAnimationFrame(tick);
+      };
+      frameRef.current = requestAnimationFrame(tick);
+    } catch {
+      alert('Could not access the camera. Enter the barcode manually.');
+      stop();
+    }
+  };
+
+  if (!supported) return null;
+
+  return (
+    <>
+      <button type="button" aria-label="Scan barcode" onClick={start} className="px-4 bg-slate-50 text-slate-600 rounded-2xl text-[10px] font-black uppercase flex items-center gap-1 shrink-0">
+        <Tag size={14}/> Scan
+      </button>
+      {scanning && (
+        <div role="dialog" aria-modal="true" aria-label="Scan barcode" className="fixed inset-0 bg-black/80 z-50 flex flex-col items-center justify-center p-6">
+          <video ref={videoRef} className="w-full max-w-sm rounded-2xl" muted playsInline />
+          <button type="button" onClick={stop} className="mt-4 px-6 py-3 bg-white text-slate-900 rounded-2xl font-black text-sm">Cancel</button>
+        </div>
+      )}
+    </>
+  );
+}
+
+function calendarDateToday() {
+  const date = new Date();
+  return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
+}
+function formatCalendarDate(value) {
+  const date = new Date(value + 'T00:00:00');
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString(undefined, {month: 'short', day: 'numeric', year: 'numeric'});
+}
+
+function ConsumptionPanel({ item, events, onConsume, onDelete }) {
+  const [date, setDate] = useState(calendarDateToday);
+  const [quantity, setQuantity] = useState('');
+  const [note, setNote] = useState('');
+  const [error, setError] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  const forecast = consumptionForecast(item, events);
+  const orderedEvents = [...events].sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
+
+  const submit = async event => {
+    event.preventDefault();
+    setError(null);
+    const amount = Number(quantity);
+    if (!date || !Number.isFinite(amount) || amount <= 0) {
+      setError('Enter a usage date and a quantity greater than zero.');
+      return;
+    }
+    if (await onConsume({date, quantity: amount, note: note.trim()})) {
+      setQuantity('');
+      setNote('');
+    }
+  };
+
+  const remove = async id => {
+    setBusyId(id);
+    try { await onDelete(id); } finally { setBusyId(null); }
+  };
+
+  return (
+    <section className="bg-slate-50 border border-slate-200 rounded-[2rem] p-5 space-y-4">
+      <div>
+        <h3 className="text-xs font-black uppercase text-slate-700 tracking-widest">Consumption history</h3>
+        <p className="text-xs text-slate-600 mt-1">Log usage separately from the current stock quantity. Two dates are needed for a depletion forecast.</p>
+      </div>
+      {forecast.projectedDepletionDate && (
+        <div className="rounded-2xl bg-violet-50 border border-violet-100 p-3 text-xs text-violet-900">
+          <strong>Estimated burn:</strong> {forecast.ratePerDay.toFixed(2)} {item.unit}/day · depleted around {formatCalendarDate(forecast.projectedDepletionDate)}
+        </div>
+      )}
+      <form onSubmit={submit} className="space-y-3">
+        <div className="grid grid-cols-2 gap-3">
+          <div><Label>Usage date</Label><Input val={date} set={setDate} type="date" /></div>
+          <div><Label>Quantity used</Label><Input val={quantity} set={setQuantity} type="number" placeholder="e.g. 1" /></div>
+        </div>
+        <div><Label>Note (optional)</Label><Input val={note} set={setNote} placeholder="What was used?" /></div>
+        {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}
+        <button type="submit" className="w-full rounded-xl bg-violet-600 text-white p-3 text-sm font-black">Log consumption</button>
+      </form>
+      {orderedEvents.length === 0 ? (
+        <p className="text-xs text-slate-600">No usage logged yet.</p>
+      ) : (
+        <div className="space-y-2">
+          {orderedEvents.length === 1 && <p className="text-xs font-bold text-amber-700">Add a usage entry on a different date to calculate burn rate.</p>}
+          <ul className="space-y-2 max-h-48 overflow-y-auto">
+            {orderedEvents.map(event => (
+              <li key={event.id} className="flex items-center justify-between gap-2 rounded-xl bg-white border border-slate-200 px-3 py-2 text-xs">
+                <span><strong>{formatCalendarDate(event.date)}</strong> · {event.quantity} {item.unit}{event.note ? ' · ' + event.note : ''}</span>
+                <button type="button" aria-label={'Delete consumption from ' + formatCalendarDate(event.date)} onClick={() => remove(event.id)} disabled={busyId === event.id} className="text-red-600 font-black shrink-0 disabled:opacity-50"><Trash2 size={14}/></button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
 
 function SummaryCard({ icon, color, label, value, unit, pct }) {
   const colors = { blue: 'bg-blue-50 text-blue-600 bg-blue-500', emerald: 'bg-emerald-50 text-emerald-600 bg-emerald-500', amber: 'bg-amber-50 text-amber-600 bg-amber-500', violet: 'bg-violet-50 text-violet-600 bg-violet-500' };
@@ -696,7 +1003,7 @@ function SummaryCard({ icon, color, label, value, unit, pct }) {
          <div className={`p-1.5 rounded-lg ${bg} ${text}`}>{icon}</div>
          <span className="text-[10px] font-black uppercase tracking-widest text-slate-800">{label}</span>
       </div>
-      <div className="text-xl font-black text-slate-800 leading-none">{value.toFixed(1)} <span className="text-[9px] font-bold text-slate-300 ml-0.5 uppercase tracking-tighter">{unit}</span></div>
+      <div className="text-xl font-black text-slate-800 leading-none">{value.toFixed(1)} <span className="text-[9px] font-bold text-slate-600 ml-0.5 uppercase tracking-tighter">{unit}</span></div>
       <div className="mt-3 h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
          <div className={`h-full transition-all duration-700 ${bar}`} style={{ width: `${Math.min(pct, 100)}%` }} />
       </div>
@@ -704,17 +1011,17 @@ function SummaryCard({ icon, color, label, value, unit, pct }) {
   );
 }
 
-function InventoryItem({ item, onClick, onBuy }) {
+function InventoryItem({ item, forecast, onClick, onBuy, selected, onSelect }) {
   const { icon, style } = getCategoryIcon(item.category);
   const price = item.price ? Number(item.price) : 0;
   const totalVal = price * (Number(item.quantity) || 0);
 
   const getTagColor = (tag) => {
     switch(tag) {
-      case 'Carbs': return 'bg-orange-100 text-orange-600';
-      case 'Protein': return 'bg-rose-100 text-rose-600';
-      case 'Fat': return 'bg-yellow-100 text-yellow-600';
-      case 'Balanced': return 'bg-emerald-100 text-emerald-600';
+      case 'Carbs': return 'bg-orange-100 text-orange-800';
+      case 'Protein': return 'bg-rose-100 text-rose-700';
+      case 'Fat': return 'bg-yellow-100 text-yellow-800';
+      case 'Balanced': return 'bg-emerald-100 text-emerald-700';
       default: return 'bg-slate-100 text-slate-600';
     }
   };
@@ -723,11 +1030,12 @@ function InventoryItem({ item, onClick, onBuy }) {
   const expired = isExpired(item.expiryDate);
 
   return (
-    <div onClick={onClick} className={`bg-white border border-slate-200 p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm active:scale-95 transition-all cursor-pointer ${expired ? 'border-red-300 bg-red-50' : ''}`}>
-       <div className="flex items-center gap-4">
+    <div role="button" tabIndex="0" aria-label={`Edit ${item.name}`} onClick={onClick} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onClick(); } }} className={`bg-white border border-slate-200 p-5 rounded-[2.25rem] flex justify-between items-center group shadow-sm active:scale-95 transition-all cursor-pointer ${expired ? 'border-red-300 bg-red-50' : ''}`}>
+       <div className="flex items-center gap-3 min-w-0">
+          {onSelect && <input aria-label={`Select ${item.name}`} type="checkbox" checked={selected} onChange={event => { event.stopPropagation(); onSelect(event.target.checked); }} onClick={event => event.stopPropagation()} className="h-4 w-4 accent-blue-600" />}
           <div className={`w-12 h-12 rounded-2xl flex items-center justify-center overflow-hidden ${style}`}>
             {item.image ? (
-               <img src={item.image} alt="icon" className="w-full h-full object-cover"/>
+               <img src={item.image} alt="" className="w-full h-full object-cover"/>
             ) : (
                item.emoji ? <span className="text-2xl">{item.emoji}</span> : icon
             )}
@@ -742,8 +1050,8 @@ function InventoryItem({ item, onClick, onBuy }) {
                )}
              </div>
              <div className="flex gap-2 mt-1">
-               {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-600 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
-               <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">
+               {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
+               <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
                 {item.quantity} {item.unit}
                </p>
              </div>
@@ -752,13 +1060,18 @@ function InventoryItem({ item, onClick, onBuy }) {
                  ${price.toFixed(2)}/ea • Total: ${totalVal.toFixed(2)}
                </p>
              )}
+             {forecast?.projectedDepletionDate && (
+               <p className="text-[9px] font-black text-violet-700 mt-1">
+                 Burns ~${forecast.ratePerDay.toFixed(2)} {item.unit}/day · depleted {formatCalendarDate(forecast.projectedDepletionDate)}
+               </p>
+             )}
           </div>
        </div>
        <div className="flex items-center gap-2">
          {onBuy && (
-           <button
+           <button aria-label={`Move ${item.name} to inventory`}
              onClick={(e) => { e.stopPropagation(); onBuy(item); }}
-             className="p-2 bg-slate-100 text-slate-400 hover:bg-emerald-100 hover:text-emerald-600 rounded-full transition-colors"
+             className="p-2 bg-slate-100 text-slate-500 hover:bg-emerald-100 hover:text-emerald-600 rounded-full transition-colors"
              title="Buy & Move to Inventory"
            >
              <CheckCircle size={20} />
@@ -776,7 +1089,7 @@ function StatusCard({ icon, color, value, label }) {
     <div className="bg-white border border-slate-200 p-6 rounded-[2.5rem] shadow-sm text-center flex flex-col items-center">
       <div className={`p-3 rounded-full mb-3 ${colors[color]}`}>{icon}</div>
       <div className="text-3xl font-black text-slate-900">{value}</div>
-      <div className="text-[10px] font-black uppercase text-slate-400 tracking-widest">{label}</div>
+      <div className="text-[10px] font-black uppercase text-slate-600 tracking-widest">{label}</div>
     </div>
   );
 }
@@ -787,7 +1100,7 @@ const ProgressBar = ({ label, percent, color }) => (
       <span>{label}</span>
       <span>{Math.round(percent)}%</span>
     </div>
-    <div className="h-3 w-full bg-white/10 rounded-full overflow-hidden border border-white/5">
+    <div role="progressbar" aria-label={label} aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(Math.min(percent, 100))} className="h-3 w-full bg-white/10 rounded-full overflow-hidden border border-white/5">
       <div className={`h-full transition-all duration-1000 ${color}`} style={{ width: `${Math.min(percent, 100)}%` }} />
     </div>
   </div>
@@ -802,7 +1115,16 @@ function LoadingScreen() {
   );
 }
 
-function Header({ hubId, isSyncing, onSyncClick, error, onDownload }) {
+function formatRelativeTime(timestamp) {
+  if (!timestamp) return 'Not synced yet';
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 10) return 'Saved just now';
+  if (seconds < 60) return `Saved ${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  return `Saved ${minutes}m ago`;
+}
+
+function Header({ hubId, isSyncing, online, pendingSync, lastSyncedAt, onSyncClick, error, onDownload }) {
   return (
     <header className="bg-slate-900 text-white p-4 sticky top-0 z-50 shadow-xl border-b border-white/5">
       <div className="max-w-xl mx-auto flex justify-between items-center text-white">
@@ -811,11 +1133,11 @@ function Header({ hubId, isSyncing, onSyncClick, error, onDownload }) {
           <h1 className="text-lg font-black tracking-tight text-white">NorthStar Prep</h1>
         </div>
         <div className="flex items-center gap-2">
-          <button onClick={onDownload} className="p-2 bg-slate-800 rounded-full text-slate-400 hover:text-white"><Download size={16}/></button>
-          <button onClick={onSyncClick} className="flex flex-col items-end">
-            <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[9px] font-black uppercase transition-all ${error ? 'bg-red-500/20 text-red-300' : isSyncing ? 'bg-blue-500/20 text-blue-300' : 'bg-green-500/20 text-green-300'}`}>
+          <button aria-label="Download household backup" title="Download household backup" onClick={onDownload} className="p-2 bg-slate-800 rounded-full text-slate-400 hover:text-white"><Download aria-hidden="true" size={16}/></button>
+          <button aria-label="Open household settings" onClick={onSyncClick} className="flex flex-col items-end">
+            <div aria-live="polite" className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[9px] font-black uppercase transition-all ${error ? 'bg-red-500/20 text-red-300' : isSyncing ? 'bg-blue-500/20 text-blue-300' : 'bg-green-500/20 text-green-300'}`}>
               {error ? <AlertOctagon size={10}/> : isSyncing ? <RefreshCw size={10} className="animate-spin" /> : <CheckCircle size={10} />}
-              ID: {hubId.slice(-6).toUpperCase()}
+              {online ? (pendingSync ? `${pendingSync} queued` : formatRelativeTime(lastSyncedAt)) : 'Offline'}
             </div>
           </button>
         </div>
@@ -826,8 +1148,8 @@ function Header({ hubId, isSyncing, onSyncClick, error, onDownload }) {
 
 function NavButton({ active, onClick, icon, label }) {
   return (
-    <button onClick={onClick} className={`flex flex-col items-center gap-1.5 p-3 min-w-0 flex-1 transition-all rounded-3xl ${active ? 'text-blue-600 bg-blue-50' : 'text-slate-400 hover:bg-slate-50'}`}>
-      <div className={`${active ? 'scale-110' : 'scale-100'} transition-transform text-slate-400 ${active ? 'text-blue-600' : ''}`}>{icon}</div>
+    <button aria-current={active ? 'page' : undefined} aria-label={label} onClick={onClick} className={`flex flex-col items-center gap-1.5 p-3 min-w-0 flex-1 transition-all rounded-3xl ${active ? 'text-blue-600 bg-blue-50' : 'text-slate-600 hover:bg-slate-50'}`}>
+      <div className={`${active ? 'scale-110' : 'scale-100'} transition-transform text-slate-600 ${active ? 'text-blue-600' : ''}`}>{icon}</div>
       <span className="text-[9px] font-black uppercase tracking-widest">{label}</span>
     </button>
   );
@@ -857,41 +1179,312 @@ function getCategoryIcon(cat) {
 }
 
 // --- Modals ---
-function SyncModal({onClose,onImport,onLogout}) {
+function useDialogFocus(dialogRef, onClose) {
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return undefined;
+    const previous = document.activeElement;
+    const focusableSelector = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const focusable = () => [...dialog.querySelectorAll(focusableSelector)];
+    (focusable()[0] || dialog).focus();
+    const handleKeyDown = event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const elements = focusable();
+      if (!elements.length) return;
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    dialog.addEventListener('keydown', handleKeyDown);
+    return () => {
+      dialog.removeEventListener('keydown', handleKeyDown);
+      if (previous && typeof previous.focus === 'function') previous.focus();
+    };
+  }, [dialogRef]);
+}
+
+function SettingsForm({ settings, onSave }) {
+  const [form, setForm] = useState({
+    householdSize: settings.householdSize,
+    caloriesPerPersonPerDay: settings.caloriesPerPersonPerDay,
+    waterGallonsPerPersonPerDay: settings.waterGallonsPerPersonPerDay,
+    survivalGoalDays: settings.survivalGoalDays,
+    heatGoalHours: settings.heatGoalHours,
+    powerGoalKwh: settings.powerGoalKwh,
+    batteryUsableFraction: Math.round(settings.batteryUsableFraction * 100),
+    inverterEfficiency: Math.round(settings.inverterEfficiency * 100),
+  });
+  const [error, setError] = useState(null);
+  const [saved, setSaved] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(null); setSaved(false);
+    try {
+      const parsed = settingsSchema.parse({
+        ...form,
+        batteryUsableFraction: Number(form.batteryUsableFraction) / 100,
+        inverterEfficiency: Number(form.inverterEfficiency) / 100,
+      });
+      if (await onSave(parsed)) setSaved(true); else setError('Save failed. Please retry.');
+    } catch { setError('Please check the values above.'); }
+  };
+
+  return (
+    <form onSubmit={submit} className="space-y-3 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Readiness assumptions</h3>
+      <div className="grid grid-cols-2 gap-3">
+        <div><Label>Household size</Label><Input val={form.householdSize} set={v => setForm({...form, householdSize: v})} type="number" /></div>
+        <div><Label>Goal (days)</Label><Input val={form.survivalGoalDays} set={v => setForm({...form, survivalGoalDays: v})} type="number" /></div>
+        <div><Label>Calories/person/day</Label><Input val={form.caloriesPerPersonPerDay} set={v => setForm({...form, caloriesPerPersonPerDay: v})} type="number" /></div>
+        <div><Label>Water gal/person/day</Label><Input val={form.waterGallonsPerPersonPerDay} set={v => setForm({...form, waterGallonsPerPersonPerDay: v})} type="number" /></div>
+        <div><Label>Heat goal (hours)</Label><Input val={form.heatGoalHours} set={v => setForm({...form, heatGoalHours: v})} type="number" /></div>
+        <div><Label>Power goal (kWh)</Label><Input val={form.powerGoalKwh} set={v => setForm({...form, powerGoalKwh: v})} type="number" /></div>
+        <div><Label>Battery usable %</Label><Input val={form.batteryUsableFraction} set={v => setForm({...form, batteryUsableFraction: v})} type="number" /></div>
+        <div><Label>Inverter efficiency %</Label><Input val={form.inverterEfficiency} set={v => setForm({...form, inverterEfficiency: v})} type="number" /></div>
+      </div>
+      <p className="text-xs text-slate-500">Battery usable % and inverter efficiency % account for depth-of-discharge limits and DC-to-AC conversion loss when estimating runtime from stored power.</p>
+      {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}
+      {saved && <p className="text-xs font-bold text-emerald-600">Saved.</p>}
+      <button type="submit" className="w-full rounded-xl p-3 bg-blue-600 text-white font-bold text-sm">Save assumptions</button>
+    </form>
+  );
+}
+function MembersPanel({ currentUserId }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [inviteForm, setInviteForm] = useState({ email: '', role: 'member' });
+  const [inviteLink, setInviteLink] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = () => request('members').then(setData).catch(err => setError(err.message));
+  useEffect(() => { load(); }, []);
+
+  const invite = async e => {
+    e.preventDefault(); setError(null); setBusy(true);
+    try {
+      const result = await request('members', { type: 'invite', email: inviteForm.email, role: inviteForm.role });
+      setInviteLink(`${window.location.origin}${window.location.pathname}?invite=${result.token}`);
+      setInviteForm({ email: '', role: 'member' });
+      await load();
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  };
+  const remove = async userId => {
+    if (!confirm('Remove this member? They will lose access immediately.')) return;
+    setError(null);
+    try { await request('members', { type: 'remove', userId }); await load(); } catch (err) { setError(err.message); }
+  };
+  const revoke = async invitationId => {
+    setError(null);
+    try { await request('members', { type: 'revoke', invitationId }); await load(); } catch (err) { setError(err.message); }
+  };
+  const copyLink = () => { if (inviteLink) navigator.clipboard?.writeText(inviteLink).catch(() => {}); };
+
+  if (!data) return <p className="text-xs text-slate-500">Loading household members…</p>;
+  return (
+    <div className="space-y-3 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Household members</h3>
+      {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}
+      <ul className="space-y-2">
+        {data.members.map(m => (
+          <li key={m.user_id} className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2 text-sm">
+            <span className="truncate">{m.email} <span className="text-[10px] font-black uppercase text-slate-500">{m.role}</span></span>
+            {data.role === 'owner' && m.user_id !== currentUserId && (
+              <button onClick={() => remove(m.user_id)} className="text-red-600 text-[10px] font-black uppercase ml-2 shrink-0">Remove</button>
+            )}
+          </li>
+        ))}
+      </ul>
+      {data.role === 'owner' && (
+        <>
+          <form onSubmit={invite} className="space-y-2">
+            <div className="grid grid-cols-[1fr_auto] gap-2">
+              <Input val={inviteForm.email} set={v => setInviteForm({...inviteForm, email: v})} type="email" placeholder="Invite by email" />
+              <Select val={inviteForm.role} set={v => setInviteForm({...inviteForm, role: v})} opts={['member', 'owner']} />
+            </div>
+            <button type="submit" disabled={busy || !inviteForm.email} className="w-full rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">Create invite link</button>
+          </form>
+          {inviteLink && (
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 space-y-2 text-xs">
+              <p className="font-black text-emerald-900">Send this link to the person you invited:</p>
+              <input readOnly value={inviteLink} onFocus={e => e.target.select()} className="w-full bg-white rounded-lg p-2 text-[10px] font-mono border border-emerald-200" />
+              <button type="button" onClick={copyLink} className="rounded-lg bg-emerald-600 text-white px-3 py-1.5 font-black">Copy link</button>
+            </div>
+          )}
+          {data.invitations.length > 0 && (
+            <div className="space-y-1">
+              <p className="text-[10px] font-black uppercase text-slate-500">Pending invitations</p>
+              {data.invitations.map(inv => (
+                <div key={inv.id} className="flex items-center justify-between bg-amber-50 rounded-xl px-3 py-2 text-xs">
+                  <span>{inv.email} · {inv.role}</span>
+                  <button onClick={() => revoke(inv.id)} className="text-red-600 font-black uppercase text-[10px]">Revoke</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ActivityPanel() {
+  const [entries, setEntries] = useState(null);
+  useEffect(() => { request('audit').then(r => setEntries(r.entries)).catch(() => setEntries([])); }, []);
+  if (!entries) return null;
+  return (
+    <div className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Recent activity</h3>
+      {entries.length === 0 ? <p className="text-xs text-slate-500">No activity recorded yet.</p> : (
+        <ul className="space-y-1 max-h-40 overflow-y-auto text-xs text-slate-600">
+          {entries.map((e, i) => (
+            <li key={i}>
+              <span className="font-bold text-slate-800">{e.actor_email || 'Someone'}</span> {e.action}
+              {e.item_name ? ` "${e.item_name}"` : ''} · <span className="text-slate-400">{new Date(e.created_at).toLocaleString()}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function SyncModal({onClose,onImport,pendingImport,onConfirmImport,onCancelImport,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId}) {
+  const dialogRef = useRef(null);
+  useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
-    <section role="dialog" aria-modal="true" aria-labelledby="settings-title" className="bg-white w-full max-w-sm rounded-3xl p-8 space-y-5">
+    <section ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="settings-title" className="bg-white w-full max-w-sm rounded-3xl p-8 space-y-5 max-h-[85vh] overflow-y-auto">
       <h2 id="settings-title" className="text-xl font-black">Household settings</h2>
-      <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances and your family plan.</p>
+      <p className="text-sm text-slate-600">Your household syncs across signed-in devices. Import a backup to merge supplies, shopping, appliances, consumption history and your family plan.</p>
       <label className="block text-sm font-bold">Import JSON backup<input type="file" accept=".json,application/json" onChange={onImport} className="block mt-2 w-full text-xs" /></label>
+      {pendingImport && <div role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-2 text-sm">
+        <p className="font-black text-amber-900">Backup ready to review</p>
+        <p className="text-amber-800">{pendingImport.inventory.length} inventory items, {pendingImport.shoppingList.length} shopping items, {pendingImport.appliances.length} appliances, {pendingImport.consumption.length} consumption events and {pendingImport.plan ? 'a family plan' : 'no family plan'} will be merged by ID.</p>
+        {pendingImport.settings && <p className="text-amber-800">Readiness assumptions are included.</p>}
+        <div className="flex gap-2 pt-1"><button type="button" onClick={onConfirmImport} className="rounded-xl bg-amber-600 px-3 py-2 text-xs font-black text-white">Merge backup</button><button type="button" onClick={onCancelImport} className="rounded-xl bg-white px-3 py-2 text-xs font-black text-amber-800">Cancel</button></div>
+      </div>}
+      <SettingsForm settings={settings} onSave={onUpdateSettings} />
+      <BackupsPanel onRestore={onRestoreBackup} />
+      <MembersPanel currentUserId={currentUserId} />
+      <ActivityPanel />
       <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>
       <button onClick={onClose} className="w-full rounded-xl p-3 bg-slate-900 text-white">Close</button>
     </section>
   </div>;
 }
+
+function BackupsPanel({ onRestore }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  useEffect(() => { request('backup').then(setData).catch(err => setError(err.message)); }, []);
+
+  return (
+    <div className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Automatic backups</h3>
+      {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}
+      {!data && !error && <p className="text-xs text-slate-500">Loading backup history…</p>}
+      {data && !data.configured && <p className="text-xs text-amber-700">Scheduled encrypted backups are not configured for this deployment yet.</p>}
+      {data && data.configured && (
+        data.backups.some(b => b.status === 'success')
+          ? (() => { const latest = data.backups.find(b => b.status === 'success'); return (
+              <p className="text-xs text-slate-600">Last successful backup: {new Date(latest.created_at).toLocaleString()} ({latest.inventory_count} supplies, {latest.shopping_count} shopping, {latest.appliance_count} appliances).</p>
+            ); })()
+          : <p className="text-xs text-slate-600">No successful automatic backup yet.</p>
+      )}
+      {data && data.backups.length > 0 && (
+        <ul className="space-y-1 max-h-40 overflow-y-auto text-xs">
+          {data.backups.map(b => (
+            <li key={b.id} className="flex items-center justify-between gap-2 bg-slate-50 rounded-xl px-3 py-2">
+              <span className={b.status === 'failed' ? 'text-red-700' : 'text-slate-700'}>
+                {new Date(b.created_at).toLocaleString()} · {b.status}{b.status === 'failed' && b.error ? `: ${b.error}` : ''}
+              </span>
+              {b.status === 'success' && (
+                <button type="button" disabled={busyId === b.id} onClick={async () => { setBusyId(b.id); try { await onRestore(b.id); } finally { setBusyId(null); } }} className="text-blue-700 font-black uppercase text-[10px] shrink-0 disabled:opacity-50">
+                  {busyId === b.id ? 'Loading…' : 'Preview restore'}
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 function Login({configured,error,onLogin}) {
+  const [email,setEmail]=useState('');
   const [password,setPassword]=useState('');
   const [message,setMessage]=useState(null);
   const [pending,setPending]=useState(false);
-  const submit=async event=>{event.preventDefault();setPending(true);setMessage(null);try{await request('session',{password});setPassword('');onLogin();}catch(error){setMessage(error.message);}finally{setPending(false);}};
+  const submit=async event=>{event.preventDefault();setPending(true);setMessage(null);try{const result=await request('session',{email,password});setPassword('');onLogin(result.user);}catch(error){setMessage(error.message);}finally{setPending(false);}};
   return <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
     <form onSubmit={submit} className="w-full max-w-sm space-y-6">
       <Shield className="text-blue-400" size={40}/><h1 className="text-3xl font-black">NorthStar Prep</h1>
       <p className="text-slate-300">Sign in to your household supplies and emergency plan.</p>
       {!configured && <p role="alert" className="text-amber-200">Setup required: connect the database and configure household login in Vercel.</p>}
       {(message||error) && <p role="alert" className="text-red-300">{message||error}</p>}
-      <label className="block">Household password<input autoComplete="current-password" type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+      <label className="block">Email<input autoComplete="username" type="email" required value={email} onChange={e=>setEmail(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+      <label className="block">Password<input autoComplete="current-password" type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
       <button disabled={pending||!configured} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{pending?'Signing in…':'Sign in'}</button>
+      <p className="text-xs text-slate-400">Household members join by invitation from an existing owner. Ask them for an invite link if you don't have an account yet.</p>
     </form>
   </main>;
 }
 
+function AcceptInvite({token,onJoined}) {
+  const [status,setStatus]=useState('checking');
+  const [invitation,setInvitation]=useState(null);
+  const [email,setEmail]=useState('');
+  const [password,setPassword]=useState('');
+  const [message,setMessage]=useState(null);
+  const [pending,setPending]=useState(false);
+  useEffect(() => {
+    request(`invite?token=${encodeURIComponent(token)}`).then(result => {
+      if (!result.valid) { setStatus('invalid'); return; }
+      setInvitation(result); setEmail(result.email); setStatus('ready');
+    }).catch(() => setStatus('invalid'));
+  }, [token]);
+  const submit = async event => {
+    event.preventDefault(); setPending(true); setMessage(null);
+    try { const result = await request('invite', {token, email, password}); onJoined(result.user); }
+    catch (error) { setMessage(error.message); }
+    finally { setPending(false); }
+  };
+  return <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
+    <div className="w-full max-w-sm space-y-6">
+      <Shield className="text-blue-400" size={40}/><h1 className="text-3xl font-black">NorthStar Prep</h1>
+      {status === 'checking' && <p className="text-slate-300">Checking your invitation…</p>}
+      {status === 'invalid' && <p role="alert" className="text-red-300">This invitation link is invalid, expired or already used. Ask the household owner for a new one.</p>}
+      {status === 'ready' && (
+        <form onSubmit={submit} className="space-y-6">
+          <p className="text-slate-300">You've been invited to join as a household {invitation.role}. Set a password to create your account.</p>
+          {message && <p role="alert" className="text-red-300">{message}</p>}
+          <label className="block">Email<input autoComplete="username" type="email" required value={email} onChange={e=>setEmail(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+          <label className="block">Choose a password<input autoComplete="new-password" type="password" required minLength={8} value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
+          <button disabled={pending} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{pending?'Joining…':'Join household'}</button>
+        </form>
+      )}
+    </div>
+  </main>;
+}
+
 function AiModal({ content, onClose }) {
+  const dialogRef = useRef(null);
+  useDialogFocus(dialogRef, onClose);
   return (
     <div className="fixed inset-0 z-[110] bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-6 text-slate-900">
-      <div className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[80vh]">
+      <div ref={dialogRef} tabIndex="-1" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title" className="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[80vh]">
         <div className="flex justify-between items-center mb-6">
-          <h3 className="text-xl font-black text-slate-900">{content.title}</h3>
-          <button onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-400"><X size={16}/></button>
+          <h3 id="ai-modal-title" className="text-xl font-black text-slate-900">{content.title}</h3>
+          <button aria-label="Close AI result" onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-500"><X aria-hidden="true" size={16}/></button>
         </div>
         <div className="overflow-y-auto text-sm text-slate-600 leading-relaxed whitespace-pre-wrap flex-1">{content.text}</div>
         <button onClick={onClose} className="mt-6 w-full bg-slate-900 text-white py-4 rounded-2xl font-black">Close</button>

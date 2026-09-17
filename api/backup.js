@@ -1,11 +1,14 @@
 import { validSession, sameOrigin } from '../server/auth.js';
-import { readState, getMembership, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory } from '../server/db.js';
+import { readState, getMembership, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory, listOwnerEmails, listDigestOptedInEmails, listPushSubscriptions, deletePushSubscription } from '../server/db.js';
 import { backupsConfigured, encryptBackup, decryptBackup } from '../server/backupCrypto.js';
 import { configured as offSiteConfigured, uploadBackupCopy, downloadBackupCopy, deleteBackupCopy } from '../server/backupBlobStore.js';
 import { stateSchema, backupSchema } from '../shared/schema.js';
 import { beginRequest, logFailure, logIssue, metricsRetentionDays, readinessRetentionDays, observe } from '../server/observability.js';
 import { computeReadiness } from '../shared/readiness.js';
 import { todayLocal } from '../shared/reminders.js';
+import { emailConfigured, sendEmail, isDigestDay } from '../server/email.js';
+import { pushConfigured, sendPush } from '../server/push.js';
+import { buildDailyDigest, digestSummaryText, weeklyDigestText } from '../shared/digest.js';
 
 const retainCount = 30;
 
@@ -17,7 +20,7 @@ function isCronRequest(req) {
 }
 
 export function createHandler(
-  repository = {readState, getMembership, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory},
+  repository = {readState, getMembership, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory, listOwnerEmails, listDigestOptedInEmails, listPushSubscriptions, deletePushSubscription},
   authenticate = validSession,
   offSite = {configured: offSiteConfigured, upload: uploadBackupCopy, download: downloadBackupCopy, remove: deleteBackupCopy},
 ) {
@@ -29,7 +32,21 @@ export function createHandler(
       try {
         let state;
         try { ({data: state} = await repository.readState()); }
-        catch (error) { await repository.insertBackupRecord({status: 'failed', error: error.message}).catch(() => {}); throw error; }
+        catch (error) {
+          await repository.insertBackupRecord({status: 'failed', error: error.message}).catch(() => {});
+          if (emailConfigured()) {
+            try {
+              const owners = await repository.listOwnerEmails();
+              await Promise.allSettled(owners.map(to => sendEmail({
+                to, subject: 'NorthStar Prep backup failed',
+                text: `Today's automatic household backup failed: ${error.message}\n\nCheck Household settings for backup history once the app is reachable again.`,
+              }))).then(results => {
+                for (const result of results) if (result.status === 'rejected') logIssue(request, '/api/backup', 'failure_email_failure', result.reason);
+              });
+            } catch (emailError) { logIssue(request, '/api/backup', 'failure_email_failure', emailError); }
+          }
+          throw error;
+        }
         const plaintext = JSON.stringify(state);
         const {iv, ciphertext, authTag, checksum} = encryptBackup(plaintext);
         const backupId = await repository.insertBackupRecord({
@@ -62,9 +79,9 @@ export function createHandler(
         // The same run records the day's readiness snapshot, for the same reason: the Hobby plan
         // allows one scheduled run a day, so this is the only cron there is. A snapshot failure
         // must never fail the backup the cron exists for, so it is logged and reported instead.
+        const stats = computeReadiness(state, state.settings);
         let readinessRecorded = true;
         try {
-          const stats = computeReadiness(state, state.settings);
           await repository.recordReadinessSnapshot({
             day: todayLocal(),
             waterDays: stats.waterDays, foodDays: stats.foodDays, powerDays: stats.powerDays,
@@ -73,6 +90,43 @@ export function createHandler(
           });
           await repository.pruneReadinessHistory(readinessRetentionDays());
         } catch (error) { readinessRecorded = false; logIssue(request, '/api/backup', 'readiness_snapshot_failure', error); }
+
+        // Push and (weekly) email digests ride the same daily cron for the same reason request
+        // metrics and the readiness snapshot do: Vercel's Hobby plan allows one scheduled run a
+        // day, so this is the only cron there is. Neither can fail the backup the cron exists for.
+        if (pushConfigured()) {
+          try {
+            const digest = buildDailyDigest(state);
+            if (digest) {
+              const subscriptions = await repository.listPushSubscriptions();
+              const payload = {title: 'NorthStar Prep', body: digestSummaryText(digest), url: '/'};
+              const stale = [];
+              await Promise.allSettled(subscriptions.map(async subscription => {
+                const result = await sendPush(subscription, payload);
+                if (result === 'gone') stale.push(subscription.endpoint);
+              })).then(results => {
+                for (const result of results) if (result.status === 'rejected') logIssue(request, '/api/backup', 'push_send_failure', result.reason);
+              });
+              if (stale.length) {
+                await Promise.allSettled(stale.map(endpoint => repository.deletePushSubscription(endpoint))).then(results => {
+                  for (const result of results) if (result.status === 'rejected') logIssue(request, '/api/backup', 'push_subscription_prune_failure', result.reason);
+                });
+              }
+            }
+          } catch (error) { logIssue(request, '/api/backup', 'push_digest_failure', error); }
+        }
+        if (emailConfigured() && isDigestDay()) {
+          try {
+            const recipients = await repository.listDigestOptedInEmails();
+            if (recipients.length) {
+              const text = weeklyDigestText(stats);
+              await Promise.allSettled(recipients.map(to => sendEmail({to, subject: 'Your weekly NorthStar Prep readiness digest', text}))).then(results => {
+                for (const result of results) if (result.status === 'rejected') logIssue(request, '/api/backup', 'digest_email_failure', result.reason);
+              });
+            }
+          } catch (error) { logIssue(request, '/api/backup', 'digest_email_failure', error); }
+        }
+
         return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length, metricsPruned, readinessRecorded, offSiteStatus});
       } catch (error) {
         logFailure(request, '/api/backup', 500, error);

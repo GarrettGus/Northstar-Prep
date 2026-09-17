@@ -315,6 +315,7 @@ test('members API: owners can invite, list and revoke; members cannot manage mem
     async listPendingInvitations(){return invitations;},
     async createInvitation(entry){invitations.push({id:'inv-1',email:entry.email,role:entry.role,created_at:'now',expires_at:entry.expiresAt});},
     async revokeInvitation(id){const before=invitations.length;const kept=invitations.filter(i=>i.id!==id);invitations.length=0;invitations.push(...kept);return kept.length<before;},
+    async getEmailDigestOptIn(){return false;},
   };
   const asOwner=createMembersHandler(repository,()=>({userId:'owner-1'}));
   const asMember=createMembersHandler(repository,()=>({userId:'member-1'}));

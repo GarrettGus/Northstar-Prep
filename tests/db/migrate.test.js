@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import pg from 'pg';
 import { createDisposableDatabase, dropDatabase, migrate, postgresAvailable } from '../support/postgres.js';
 import { installNeonOverPostgres, closeNeonPools } from '../support/neonOverPostgres.js';
-import { verifyPassword } from '../../server/auth.js';
+import { hashPassword, verifyPassword } from '../../server/auth.js';
 import { encryptBackup, decryptBackup } from '../../server/backupCrypto.js';
 
 const ownerEnv = {HOUSEHOLD_OWNER_EMAIL: 'owner@example.test', HOUSEHOLD_PASSWORD: 'correct-horse-battery-staple'};
@@ -50,9 +50,9 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       const tables = rows.map(row => row.tablename).sort();
       assert.deepEqual(tables, [
         'northstar_alert_state', 'northstar_appliances', 'northstar_audit_log', 'northstar_backups',
-        'northstar_checklist_checks', 'northstar_contacts', 'northstar_family_members', 'northstar_household',
+        'northstar_checklist_checks', 'northstar_consumption_events', 'northstar_contacts', 'northstar_family_members', 'northstar_household',
         'northstar_household_members', 'northstar_inventory', 'northstar_invitations', 'northstar_kits', 'northstar_login_limits',
-        'northstar_medications', 'northstar_password_resets', 'northstar_plan', 'northstar_readiness_history', 'northstar_reminder_history', 'northstar_reminders',
+        'northstar_medications', 'northstar_password_resets', 'northstar_plan', 'northstar_push_subscriptions', 'northstar_readiness_history', 'northstar_reminder_history', 'northstar_reminders',
         'northstar_request_metrics', 'northstar_settings', 'northstar_shopping_items', 'northstar_users',
       ]);
     });
@@ -199,6 +199,34 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       // zero-tolerance window would be ambiguous: prune everything older than one day.
       await db.pruneReadinessHistory(1);
       assert.deepEqual(await db.listReadinessHistory(), []);
+    });
+
+    it('lists owner emails, tracks email-digest opt-in, and stores/removes push subscriptions', async () => {
+      const db = await loadDb(database.url);
+      const ownerId = await db.createUserWithMembership({email: 'notify-owner@example.test', passwordHash: hashPassword('owner-password-1'), role: 'owner'});
+      const memberId = await db.createUserWithMembership({email: 'notify-member@example.test', passwordHash: hashPassword('member-password-1'), role: 'member'});
+
+      const owners = await db.listOwnerEmails();
+      assert.ok(owners.includes('notify-owner@example.test'));
+      assert.ok(!owners.includes('notify-member@example.test'));
+
+      assert.equal(await db.getEmailDigestOptIn(memberId), false);
+      await db.setEmailDigestOptIn(memberId, true);
+      assert.equal(await db.getEmailDigestOptIn(memberId), true);
+      assert.deepEqual(await db.listDigestOptedInEmails(), ['notify-member@example.test']);
+      assert.equal(await db.getEmailDigestOptIn(ownerId), false);
+
+      await db.savePushSubscription({userId: memberId, endpoint: 'https://push.example/1', p256dh: 'p', auth: 'a'});
+      // Re-subscribing the same endpoint (e.g. the browser refreshed its keys) updates in place.
+      await db.savePushSubscription({userId: memberId, endpoint: 'https://push.example/1', p256dh: 'p2', auth: 'a2'});
+      const subscriptions = await db.listPushSubscriptions();
+      assert.equal(subscriptions.length, 1);
+      assert.equal(subscriptions[0].p256dh, 'p2');
+
+      await db.deletePushSubscriptionForUser(memberId, 'https://push.example/does-not-exist');
+      assert.equal((await db.listPushSubscriptions()).length, 1, 'deleting the wrong endpoint must not remove anything');
+      await db.deletePushSubscriptionForUser(memberId, 'https://push.example/1');
+      assert.deepEqual(await db.listPushSubscriptions(), []);
     });
   });
 

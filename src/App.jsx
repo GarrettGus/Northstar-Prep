@@ -2397,6 +2397,8 @@ function BackupsPanel({ onRestore }) {
             <li key={b.id} className="flex items-center justify-between gap-2 bg-slate-50 rounded-xl px-3 py-2">
               <span className={b.status === 'failed' ? 'text-red-700' : 'text-slate-700'}>
                 {new Date(b.created_at).toLocaleString()} · {b.status}{b.status === 'failed' && b.error ? `: ${b.error}` : ''}
+                {b.status === 'success' && b.offSiteStatus === 'success' && <span className="text-emerald-700"> · off-site copy ok</span>}
+                {b.status === 'success' && b.offSiteStatus === 'failed' && <span className="text-red-700"> · off-site copy failed</span>}
               </span>
               {b.status === 'success' && (
                 <button type="button" disabled={busyId === b.id} onClick={async () => { setBusyId(b.id); try { await onRestore(b.id); } finally { setBusyId(null); } }} className="text-blue-700 font-black uppercase text-[10px] shrink-0 disabled:opacity-50">

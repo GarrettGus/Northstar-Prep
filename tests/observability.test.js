@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { beginRequest, classifyOutcome, isFailure, observe } from '../server/observability.js';
+import { beginRequest, classifyOutcome, isFailure, logFailure, observe } from '../server/observability.js';
 import { createHandler as createHealthHandler } from '../api/health.js';
 
 process.env.SESSION_SECRET = 'test-only-secret-with-more-than-32-characters';
@@ -75,6 +75,23 @@ test('a handler that throws is still logged, counted as a failed write and rethr
     await assert.rejects(() => handler({method: 'POST', headers: {}}, response()), /Database unavailable/);
   });
   assert.deepEqual(telemetry.recorded.map(m => [m.outcome, m.status]), [['write_failure', 500]]);
+});
+
+test('failure logs carry the SQLSTATE, and the message only for schema errors', async () => {
+  const dbError = (code, message) => Object.assign(new Error(message), {name: 'NeonDbError', code});
+  const request = {id: 'req-1', started: Date.now()};
+  const lines = await quietly(async () => {
+    logFailure(request, '/api/hub', 503, dbError('42P01', 'relation "northstar_consumption_events" does not exist'));
+    logFailure(request, '/api/hub', 503, dbError('23505', 'duplicate key value violates unique constraint: Key (id)=(Rice)'));
+    logFailure(request, '/api/hub', 503, new Error('fetch failed'));
+  });
+  const [schema, constraint, network] = lines.map(line => JSON.parse(line));
+  assert.equal(schema.code, '42P01');
+  assert.match(schema.message, /northstar_consumption_events/);
+  assert.equal(constraint.code, '23505');
+  assert.equal(constraint.message, undefined, 'non-schema messages can quote row values');
+  assert.equal(network.code, undefined);
+  assert.ok(!lines.join(' ').includes('Rice'));
 });
 
 test('metrics or alerting failures never turn a served request into a failed one', async () => {

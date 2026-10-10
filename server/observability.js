@@ -30,7 +30,17 @@ export function logFailure({ id, started }, route, status, error) {
     event: 'request_failure', requestId: id, route, status,
     latencyMs: Date.now() - started, environment: environment(),
     error: error instanceof Error ? error.name : 'UnknownError',
+    ...databaseErrorDetail(error),
   }));
+}
+
+// Postgres SQLSTATE codes carry no household content, so they are always safe to log. Class 42
+// messages (undefined table/column, syntax) name schema objects rather than row values, and
+// are what distinguishes "the production migration hasn't run" from a genuine outage.
+function databaseErrorDetail(error) {
+  const code = typeof error?.code === 'string' && /^[0-9A-Z]{5}$/.test(error.code) ? error.code : null;
+  if (!code) return {};
+  return code.startsWith('42') ? {code, message: String(error.message).slice(0, 200)} : {code};
 }
 
 // A side effect that failed without failing the request it belongs to (an audit row, an

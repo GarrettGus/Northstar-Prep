@@ -1,12 +1,13 @@
-import { hashToken, randomToken, sameOrigin, validSession } from '../server/auth.js';
-import { createInvitation, createPasswordReset, getMembership, listMembers, listPendingInvitations, removeMember, revokeInvitation } from '../server/db.js';
+import { appOrigin, hashToken, randomToken, sameOrigin, validSession } from '../server/auth.js';
+import { createInvitation, createPasswordReset, findUserById, getEmailDigestOptIn, getMembership, listMembers, listPendingInvitations, removeMember, revokeInvitation, setEmailDigestOptIn } from '../server/db.js';
+import { emailConfigured, sendEmail } from '../server/email.js';
 import { emailSchema, idSchema, roleSchema } from '../shared/schema.js';
-import { beginRequest, logFailure, observe } from '../server/observability.js';
+import { beginRequest, logFailure, logIssue, observe } from '../server/observability.js';
 
 const inviteLifetimeMs = 7 * 24 * 3600 * 1000;
 const resetLifetimeMs = 3600 * 1000;
 
-export function createHandler(repository = {getMembership, listMembers, listPendingInvitations, createInvitation, removeMember, revokeInvitation, createPasswordReset}, authenticate = validSession) {
+export function createHandler(repository = {getMembership, listMembers, listPendingInvitations, createInvitation, removeMember, revokeInvitation, createPasswordReset, findUserById, getEmailDigestOptIn, setEmailDigestOptIn}, authenticate = validSession) {
   return async function handler(req, res) {
     const request = beginRequest(req, res);
     res.setHeader('Cache-Control', 'no-store');
@@ -20,16 +21,31 @@ export function createHandler(repository = {getMembership, listMembers, listPend
       if (req.method === 'GET') {
         const members = await repository.listMembers();
         const invitations = membership.role === 'owner' ? await repository.listPendingInvitations() : [];
-        return res.status(200).json({members, invitations, role: membership.role});
+        const emailDigestOptIn = await repository.getEmailDigestOptIn(session.userId);
+        return res.status(200).json({members, invitations, role: membership.role, emailConfigured: emailConfigured(), emailDigestOptIn});
+      }
+      const body = req.body || {};
+      // Any member can set their own weekly-digest preference; everything else here is owner-only.
+      if (body.type === 'set-email-digest') {
+        const optIn = Boolean(body.optIn);
+        await repository.setEmailDigestOptIn(session.userId, optIn);
+        return res.status(200).json({ok: true, emailDigestOptIn: optIn});
       }
       if (membership.role !== 'owner') return res.status(403).json({error: 'Only owners can manage household members.'});
-      const body = req.body || {};
       if (body.type === 'invite') {
         const email = emailSchema.parse(body.email);
         const role = roleSchema.parse(body.role);
         const rawToken = randomToken();
         const expiresAt = new Date(Date.now() + inviteLifetimeMs).toISOString();
         await repository.createInvitation({email, role, invitedBy: session.userId, tokenHash: hashToken(rawToken), expiresAt});
+        // The link is still returned below either way — email is a convenience on top of the
+        // existing copy-the-link flow, never a replacement for it (see README's Architecture note).
+        if (emailConfigured()) {
+          try {
+            await sendEmail({to: email, subject: 'You are invited to NorthStar Prep', text:
+              `You've been invited to join a household on NorthStar Prep. Accept your invitation: ${appOrigin(req)}/?invite=${rawToken}\n\nThis link expires in 7 days.`});
+          } catch (error) { logIssue(request, '/api/members', 'invite_email_failure', error); }
+        }
         return res.status(200).json({token: rawToken, expiresAt});
       }
       if (body.type === 'remove') {
@@ -46,6 +62,15 @@ export function createHandler(repository = {getMembership, listMembers, listPend
         const rawToken = randomToken();
         const expiresAt = new Date(Date.now() + resetLifetimeMs).toISOString();
         await repository.createPasswordReset({userId, tokenHash: hashToken(rawToken), expiresAt});
+        if (emailConfigured()) {
+          try {
+            const user = await repository.findUserById(userId);
+            if (user?.email) {
+              await sendEmail({to: user.email, subject: 'Your NorthStar Prep password reset link', text:
+                `Reset your password: ${appOrigin(req)}/?reset=${rawToken}\n\nThis link expires in 1 hour and can only be used once.`});
+            }
+          } catch (error) { logIssue(request, '/api/members', 'reset_email_failure', error); }
+        }
         return res.status(200).json({token: rawToken, expiresAt});
       }
       if (body.type === 'revoke') {

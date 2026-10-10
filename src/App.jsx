@@ -2143,12 +2143,23 @@ function MembersPanel({ currentUserId }) {
   };
   const copyLink = () => { if (inviteLink) navigator.clipboard?.writeText(inviteLink).catch(() => {}); };
   const copyResetLink = () => { if (resetLink) navigator.clipboard?.writeText(resetLink.url).catch(() => {}); };
+  const toggleDigest = async () => {
+    setError(null);
+    try { await request('members', { type: 'set-email-digest', optIn: !data.emailDigestOptIn }); await load(); }
+    catch (err) { setError(err.message); }
+  };
 
   if (!data) return <p className="text-xs text-slate-500">Loading household members…</p>;
   return (
     <div className="space-y-3 border-t border-slate-100 pt-5">
       <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Household members</h3>
       {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}
+      {data.emailConfigured && (
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={data.emailDigestOptIn} onChange={toggleDigest} />
+          Weekly readiness email
+        </label>
+      )}
       <ul className="space-y-2">
         {data.members.map(m => (
           <li key={m.user_id} className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2 text-sm">
@@ -2199,6 +2210,69 @@ function MembersPanel({ currentUserId }) {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// VAPID public keys arrive base64url-encoded; pushManager.subscribe wants raw bytes.
+function urlBase64ToUint8Array(base64) {
+  const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+  const base64Safe = (base64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64Safe);
+  return Uint8Array.from([...raw].map(char => char.charCodeAt(0)));
+}
+
+// Push notifications for overdue reminders, expiring supplies and due restocks (the daily
+// digest — see shared/digest.js and the cron in api/backup.js). No-ops with a plain message
+// when VAPID keys are not configured for this deployment, or when the browser has no push
+// support at all.
+function PushNotificationsPanel() {
+  const [state, setState] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const supported = 'serviceWorker' in navigator && 'PushManager' in window;
+
+  useEffect(() => {
+    if (!supported) { setState({ configured: false }); return; }
+    request('push').then(async result => {
+      let subscribed = false;
+      try { subscribed = Boolean(await (await navigator.serviceWorker.ready).pushManager.getSubscription()); } catch { /* ignore */ }
+      setState({ ...result, subscribed });
+    }).catch(() => setState({ configured: false }));
+  }, []);
+
+  const enable = async () => {
+    setError(null); setBusy(true);
+    try {
+      if (Notification.permission === 'denied') throw new Error('Notifications are blocked for this site in your browser settings.');
+      if (await Notification.requestPermission() !== 'granted') throw new Error('Notification permission was not granted.');
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(state.publicKey) });
+      await request('push', { subscription: subscription.toJSON() });
+      setState(previous => ({ ...previous, subscribed: true }));
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  };
+  const disable = async () => {
+    setError(null); setBusy(true);
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      if (subscription) { await request('push', { endpoint: subscription.endpoint }, 'DELETE'); await subscription.unsubscribe(); }
+      setState(previous => ({ ...previous, subscribed: false }));
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  };
+
+  if (!state || !state.configured) return null;
+  return (
+    <div className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Notifications</h3>
+      {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}
+      <div className="flex items-center justify-between text-sm gap-2">
+        <span>Push notifications for overdue reminders and expiring supplies</span>
+        {state.subscribed
+          ? <button type="button" disabled={busy} onClick={disable} className="text-red-600 text-[10px] font-black uppercase shrink-0">Turn off</button>
+          : <button type="button" disabled={busy} onClick={enable} className="text-blue-700 text-[10px] font-black uppercase shrink-0">Turn on</button>}
+      </div>
     </div>
   );
 }
@@ -2293,6 +2367,7 @@ function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pen
       <ServiceHealthPanel />
       <BackupsPanel onRestore={onRestoreBackup} />
       <MembersPanel currentUserId={currentUserId} />
+      <PushNotificationsPanel />
       <ChangePasswordPanel />
       <ActivityPanel />
       <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>

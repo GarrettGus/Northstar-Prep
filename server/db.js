@@ -266,6 +266,29 @@ export async function listMembers(householdId = 1) {
     FROM northstar_household_members m JOIN northstar_users u ON u.id = m.user_id
     WHERE m.household_id = ${householdId} ORDER BY m.added_at ASC`;
 }
+export async function listOwnerEmails(householdId = 1) {
+  const sql = database();
+  const rows = await sql`SELECT u.email FROM northstar_household_members m JOIN northstar_users u ON u.id = m.user_id
+    WHERE m.household_id = ${householdId} AND m.role = 'owner'`;
+  return rows.map(row => row.email);
+}
+// Self-service opt-in to the optional weekly readiness email (see api/members.js's
+// 'set-email-digest' action and shared/digest.js's weeklyDigestText).
+export async function setEmailDigestOptIn(userId, optIn) {
+  const sql = database();
+  await sql`UPDATE northstar_users SET email_digest_opt_in = ${optIn} WHERE id = ${userId}`;
+}
+export async function getEmailDigestOptIn(userId) {
+  const sql = database();
+  const rows = await sql`SELECT email_digest_opt_in AS "emailDigestOptIn" FROM northstar_users WHERE id = ${userId}`;
+  return rows[0]?.emailDigestOptIn ?? false;
+}
+export async function listDigestOptedInEmails(householdId = 1) {
+  const sql = database();
+  const rows = await sql`SELECT u.email FROM northstar_household_members m JOIN northstar_users u ON u.id = m.user_id
+    WHERE m.household_id = ${householdId} AND u.email_digest_opt_in = true`;
+  return rows.map(row => row.email);
+}
 export async function createUserWithMembership({email, passwordHash, householdId = 1, role}) {
   const sql = database();
   const userId = randomUUID();
@@ -400,6 +423,29 @@ export async function pruneBackups(householdId = 1, keep = 30) {
     SELECT id FROM northstar_backups WHERE household_id = ${householdId} ORDER BY created_at DESC LIMIT ${keep}
   ) RETURNING id`;
   return rows.map(row => row.id);
+}
+
+// --- Web push subscriptions (see api/push.js and server/push.js). One row per browser
+// installation; endpoint is unique across the whole table, not just per household, since it is
+// itself an opaque per-installation URL the push service assigns. ---
+export async function savePushSubscription({userId, householdId = 1, endpoint, p256dh, auth}) {
+  const sql = database();
+  await sql`INSERT INTO northstar_push_subscriptions (household_id, user_id, endpoint, p256dh, auth)
+    VALUES (${householdId}, ${userId}, ${endpoint}, ${p256dh}, ${auth})
+    ON CONFLICT (endpoint) DO UPDATE SET
+      user_id = EXCLUDED.user_id, household_id = EXCLUDED.household_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth`;
+}
+export async function deletePushSubscriptionForUser(userId, endpoint) {
+  const sql = database();
+  await sql`DELETE FROM northstar_push_subscriptions WHERE user_id = ${userId} AND endpoint = ${endpoint}`;
+}
+export async function deletePushSubscription(endpoint) {
+  const sql = database();
+  await sql`DELETE FROM northstar_push_subscriptions WHERE endpoint = ${endpoint}`;
+}
+export async function listPushSubscriptions(householdId = 1) {
+  const sql = database();
+  return sql`SELECT endpoint, p256dh, auth FROM northstar_push_subscriptions WHERE household_id = ${householdId}`;
 }
 
 // --- Request metrics and alert state. ---

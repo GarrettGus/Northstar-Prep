@@ -65,4 +65,11 @@ export function sameOrigin(req) {
   if (!req.headers.origin) return !process.env.VERCEL;
   try { return new URL(req.headers.origin).host === req.headers.host; } catch { return false; }
 }
+// Best-effort app origin for building links in emails: the browser's Origin header on a
+// same-origin POST (already required for these requests, see sameOrigin above), or the
+// request's own Host as a fallback.
+export function appOrigin(req) {
+  if (req.headers.origin) { try { return new URL(req.headers.origin).origin; } catch { /* fall through */ } }
+  return `https://${req.headers.host}`;
+}
 export function configured() { try { sessionSecret(); } catch { return false; } return Boolean(process.env.DATABASE_URL); }

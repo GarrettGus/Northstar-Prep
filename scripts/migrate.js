@@ -16,6 +16,9 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_users (
   password_hash text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 )`;
+// Self-service opt-in to the optional weekly readiness email (see api/members.js and
+// server/email.js). Additive: existing accounts default to opted out.
+await sql`ALTER TABLE northstar_users ADD COLUMN IF NOT EXISTS email_digest_opt_in boolean NOT NULL DEFAULT false`;
 await sql`CREATE TABLE IF NOT EXISTS northstar_household_members (
   household_id integer NOT NULL REFERENCES northstar_household(id),
   user_id uuid NOT NULL REFERENCES northstar_users(id),
@@ -311,6 +314,19 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_alert_state (
   key text PRIMARY KEY,
   last_sent_at timestamptz NOT NULL DEFAULT now()
 )`;
+
+// --- Web push subscriptions (see api/push.js and server/push.js). endpoint is unique across
+// the whole table: it is itself an opaque per-browser-installation URL the push service assigns. ---
+await sql`CREATE TABLE IF NOT EXISTS northstar_push_subscriptions (
+  id bigserial PRIMARY KEY,
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  user_id uuid NOT NULL REFERENCES northstar_users(id),
+  endpoint text NOT NULL UNIQUE,
+  p256dh text NOT NULL,
+  auth text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+)`;
+await sql`CREATE INDEX IF NOT EXISTS northstar_push_subscriptions_household_idx ON northstar_push_subscriptions (household_id)`;
 
 // One-time backfill: copy the existing JSONB row into the new relational tables. Only runs while
 // the relational tables are still empty, so it's safe to leave in place and re-run this script.

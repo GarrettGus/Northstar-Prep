@@ -49,7 +49,7 @@
 
 - Added outbound email via Resend (`server/email.js`) for invitations, owner-made reset links, self-service reset requests (no account enumeration, rate-limited per IP and per address) and backup-failure notices to owners, all falling back to the existing manual links. Closes the sole-owner lockout gap when email is configured.
 
-- Added Web Push (`server/push.js`, `api/push.js`, `shared/digest.js`): per-device opt-in, a counts-only daily digest from the existing cron, and alerts for plan activation, stand-down and help requests; dead subscriptions are pruned, removed members stop receiving pushes, and sign-out unsubscribes the device.
+- Added Web Push (`server/push.js`, `api/_push.js`, `shared/digest.js`): per-device opt-in, a counts-only daily digest from the existing cron, and alerts for plan activation, stand-down and help requests; dead subscriptions are pruned, removed members stop receiving pushes, and sign-out unsubscribes the device.
 
 ## Verification
 

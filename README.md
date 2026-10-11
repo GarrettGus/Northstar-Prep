@@ -42,7 +42,7 @@ Earlier versions of this app used one `HOUSEHOLD_PASSWORD` shared by everyone. T
 Target repository: [GarrettGus/Northstar-Prep](https://github.com/GarrettGus/Northstar-Prep).
 Target Vercel project: `garrettgus-projects/northstar-prep`.
 
-Use the Vite preset, `npm run build`, output directory `dist`, and Node 22 or newer. Vercel discovers the `/api` functions automatically. Run the database migration before the first login, and re-run `npm run db:migrate` before deploying an upgrade — this release adds a `writer_token` column that `/api/hub` writes on every save, so saves fail with a 503 until the migration has run.
+Use the Vite preset, `npm run build`, output directory `dist`, and Node 22 or newer. Vercel discovers the `/api` functions automatically. Each non-underscore file in `api/` is one Vercel Function, and the Hobby plan refuses a deployment with more than 12: `/api/go`, `/api/alerts` and `/api/push` are therefore served by one function (`api/live.js`, via the rewrites in `vercel.json`) whose handlers live in `_`-prefixed files, and `tests/function-count.test.js` fails if the count goes over. Run the database migration before the first login, and re-run `npm run db:migrate` before deploying an upgrade — this release adds a `writer_token` column that `/api/hub` writes on every save, so saves fail with a 503 until the migration has run.
 
 `npm run preview` previews the compiled frontend only; use `npm run dev` or a Vercel deployment to exercise API functionality.
 

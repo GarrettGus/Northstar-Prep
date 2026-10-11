@@ -11,9 +11,9 @@ import reminderHistory from '../api/reminder-history.js';
 import readinessHistory from '../api/readiness-history.js';
 import passwordReset from '../api/password-reset.js';
 import password from '../api/password.js';
-import go from '../api/go.js';
-import alerts from '../api/alerts.js';
-import push from '../api/push.js';
+import go from '../api/_go.js';
+import alerts from '../api/_alerts.js';
+import push from '../api/_push.js';
 const port = Number(process.env.PORT) || 5173;
 const vite = await createViteServer({server:{middlewareMode:true},appType:'spa'});
 createServer(async(req,res)=>{

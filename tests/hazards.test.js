@@ -4,7 +4,7 @@ import { hazardCatalog, hazardChecklists, hazardSupplyTemplates, roundCoordinate
 import { checklistsFor, checklistCatalog } from '../shared/checklists.js';
 import { supplyTemplatesFor, findSupplyTemplate, templateToBackup } from '../shared/supplyTemplates.js';
 import { planSchema, normalizeBackup, settingsSchema, idSchema } from '../shared/schema.js';
-import { createHandler, simplifyAlerts, clearAlertCache } from '../api/alerts.js';
+import { createHandler, simplifyAlerts, clearAlertCache } from '../api/_alerts.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
 process.env.DATABASE_URL='postgres://test-only/db';
 function response(){return {code:200,headers:{},setHeader(name,value){this.headers[name]=value;},status(code){this.code=code;return this;},json(data){this.data=data;return this;}};}

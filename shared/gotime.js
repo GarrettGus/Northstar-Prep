@@ -1,6 +1,6 @@
 // "Go time": turning the plan into an action list at the moment something happens. Everything
 // here is derived from household state already on the device, so it works offline; the only
-// server-side part is the shared activation and check-ins (api/go.js).
+// server-side part is the shared activation and check-ins (api/_go.js).
 import { itemsInKit, kitCompleteness } from './kits.js';
 
 export const activationModes = ['evacuate', 'shelter'];

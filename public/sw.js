@@ -25,7 +25,7 @@ self.addEventListener('fetch', event => {
 });
 
 // Push notifications (daily digest, plan activation, a member needing help). Payloads carry
-// counts and generic text only; see shared/digest.js and api/go.js.
+// counts and generic text only; see shared/digest.js and api/_go.js.
 self.addEventListener('push', event => {
   let data = {};
   try { data = event.data ? event.data.json() : {}; } catch { data = {}; }

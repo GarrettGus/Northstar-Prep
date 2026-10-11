@@ -4,7 +4,7 @@ import { grabList, goBagCoverage, shelterGuidance, checkinStatuses, lastOutSteps
 import { simulateOutage } from '../shared/outage.js';
 import { computeReadiness } from '../shared/readiness.js';
 import { settingsSchema, kitSchema } from '../shared/schema.js';
-import { createHandler } from '../api/go.js';
+import { createHandler } from '../api/_go.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
 process.env.DATABASE_URL='postgres://test-only/db';
 function response(){return {code:200,headers:{},setHeader(name,value){this.headers[name]=value;},status(code){this.code=code;return this;},json(data){this.data=data;return this;}};}

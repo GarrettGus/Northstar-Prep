@@ -45,7 +45,8 @@ export async function readState() {
     sql`SELECT id, name, purpose, target_contents AS "targetContents", assigned_to AS "assignedTo" FROM northstar_kits WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, person, name, dose, quantity_on_hand AS "quantityOnHand", refill_date AS "refillDate", prescriber, notes
         FROM northstar_medications WHERE household_id = ${householdId} ORDER BY seq`,
-    sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary"
+    sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary",
+          location_label AS "locationLabel", latitude, longitude, hazards, links
         FROM northstar_plan WHERE household_id = ${householdId}`,
     sql`SELECT name, role, dob, kind, calories_per_day AS "caloriesPerDay", water_gallons_per_day AS "waterGallonsPerDay"
         FROM northstar_family_members WHERE household_id = ${householdId} ORDER BY position`,
@@ -66,6 +67,9 @@ export async function readState() {
     family: familyRows,
     contacts: contactRows,
     meetingPoints: {primary: planRow.meetingPrimary, secondary: planRow.meetingSecondary},
+    location: {label: planRow.locationLabel, latitude: planRow.latitude, longitude: planRow.longitude},
+    hazards: planRow.hazards ?? [],
+    links: planRow.links ?? [],
   } : null;
   const kits = kitRows.map(row => ({...row, targetContents: row.targetContents ?? []}));
   const data = stateSchema.parse({inventory, shoppingList, appliances, reminders, checklistChecks, kits, medications, plan, consumption, settings: settingsRows[0]});
@@ -193,10 +197,14 @@ export async function compareAndSave(version, next, current = emptyState()) {
         statements.push(tx`DELETE FROM northstar_family_members WHERE household_id = ${householdId} AND ${guard}`);
         statements.push(tx`DELETE FROM northstar_contacts WHERE household_id = ${householdId} AND ${guard}`);
       } else {
-        statements.push(tx`INSERT INTO northstar_plan (household_id, shelter_spot, meeting_primary, meeting_secondary)
-          SELECT ${householdId}, ${next.plan.shelterSpot}, ${next.plan.meetingPoints.primary}, ${next.plan.meetingPoints.secondary}
+        const location = next.plan.location ?? {label: '', latitude: '', longitude: ''};
+        const coordinate = value => value === '' || value === undefined ? null : value;
+        statements.push(tx`INSERT INTO northstar_plan (household_id, shelter_spot, meeting_primary, meeting_secondary, location_label, latitude, longitude, hazards, links)
+          SELECT ${householdId}, ${next.plan.shelterSpot}, ${next.plan.meetingPoints.primary}, ${next.plan.meetingPoints.secondary},
+            ${location.label}, ${coordinate(location.latitude)}, ${coordinate(location.longitude)}, ${JSON.stringify(next.plan.hazards ?? [])}::jsonb, ${JSON.stringify(next.plan.links ?? [])}::jsonb
           WHERE ${guard}
-          ON CONFLICT (household_id) DO UPDATE SET shelter_spot = EXCLUDED.shelter_spot, meeting_primary = EXCLUDED.meeting_primary, meeting_secondary = EXCLUDED.meeting_secondary`);
+          ON CONFLICT (household_id) DO UPDATE SET shelter_spot = EXCLUDED.shelter_spot, meeting_primary = EXCLUDED.meeting_primary, meeting_secondary = EXCLUDED.meeting_secondary,
+            location_label = EXCLUDED.location_label, latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude, hazards = EXCLUDED.hazards, links = EXCLUDED.links`);
         statements.push(tx`DELETE FROM northstar_family_members WHERE household_id = ${householdId} AND ${guard}`);
         for (let position = 0; position < next.plan.family.length; position++) {
           const member = next.plan.family[position];
@@ -519,4 +527,11 @@ export async function listCheckins(householdId = 1) {
   return sql`SELECT c.user_id AS "userId", u.email, c.status, c.note, c.updated_at AS "updatedAt"
     FROM northstar_checkins c JOIN northstar_users u ON u.id = c.user_id
     WHERE c.household_id = ${householdId} ORDER BY c.updated_at DESC`;
+}
+
+// Just the plan's coordinates, for the weather alert lookup; null until a location is set.
+export async function readPlanLocation(householdId = 1) {
+  const sql = database();
+  const rows = await sql`SELECT latitude, longitude FROM northstar_plan WHERE household_id = ${householdId} AND latitude IS NOT NULL AND longitude IS NOT NULL`;
+  return rows[0] ? {latitude: Number(rows[0].latitude), longitude: Number(rows[0].longitude)} : null;
 }

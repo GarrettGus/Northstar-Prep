@@ -12,11 +12,13 @@ import { computeReadiness, computeReadinessGaps, consumptionForecast, isExpired,
 import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
 import { backupToCsv, csvToBackupPreview } from '../shared/csv.js';
 import { simulateOutage, appliancePriorities, appliancePriorityLabels } from '../shared/outage.js';
-import { supplyTemplateCatalog, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
+import { supplyTemplatesFor, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
 import { effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, todayLocal, addDaysISO } from '../shared/reminders.js';
-import { checklistCatalog } from '../shared/checklists.js';
+import { checklistsFor } from '../shared/checklists.js';
+import { roundCoordinate } from '../shared/hazards.js';
 import { kitCompleteness } from '../shared/kits.js';
 import { GoTime, GoTimeBanner } from './GoTime.jsx';
+import { HazardProfileSection, WeatherAlerts } from './Hazards.jsx';
 import { clearDeviceData, loadPendingCheckin, savePendingCheckin, enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
 
 // --- Constants ---
@@ -45,6 +47,7 @@ export default function App() {
   const [showGo, setShowGo] = useState(false);
   const [go, setGo] = useState(null);
   const [pendingCheckin, setPendingCheckin] = useState(() => loadPendingCheckin());
+  const [weather, setWeather] = useState(null);
   const [outage, setOutage] = useState(null);
   const [globalError, setGlobalError] = useState(null);
   const [settings, setSettings] = useState(() => settingsSchema.parse({}));
@@ -144,6 +147,17 @@ export default function App() {
     const timer = setInterval(refreshGo, goActive || showGo ? 15000 : 60000);
     return () => { cancelled = true; clearInterval(timer); };
   }, [user, online, goActive, showGo]);
+  // NWS alerts for the plan's saved location, refreshed every ten minutes (the server caches them).
+  const locationKey = plan?.location?.latitude !== '' && plan?.location?.latitude !== undefined ? `${plan.location.latitude},${plan.location.longitude}` : '';
+  useEffect(() => {
+    if (!user || !online) return;
+    if (!locationKey) { setWeather(null); return; }
+    let cancelled = false;
+    const load = () => request('alerts').then(result => { if (!cancelled) setWeather(result); }).catch(() => {});
+    load();
+    const timer = setInterval(load, 600000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [user, online, locationKey]);
   const goAction = async body => {
     try { setGo(await request('go', body)); setGlobalError(null); return true; }
     catch (error) { setGlobalError(error.message); if (error.status === 401) setUser(null); return false; }
@@ -177,7 +191,7 @@ export default function App() {
   const logout = async () => {
     const queued = loadQueuedActions().length;
     if (queued && !window.confirm(`${queued} change${queued === 1 ? ' has' : 's have'} not synced yet and will be discarded from this device if you sign out. Sign out anyway?`)) return;
-    try {await request('session',{},'DELETE');await clearDeviceData();setPendingSync(0);setLastSyncedAt(null);epoch.current++;setUser(null);setGo(null);setShowGo(false);setPendingCheckin(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    try {await request('session',{},'DELETE');await clearDeviceData();setPendingSync(0);setLastSyncedAt(null);epoch.current++;setUser(null);setGo(null);setWeather(null);setShowGo(false);setPendingCheckin(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
@@ -215,7 +229,7 @@ export default function App() {
   // Starter templates go through the same non-destructive preview as a JSON backup, so nothing
   // is written until it is confirmed and existing rows merge by ID rather than being replaced.
   const previewTemplate = (templateId) => {
-    const template = findSupplyTemplate(templateId);
+    const template = findSupplyTemplate(templateId, plan);
     if (!template) return;
     try {
       setPendingImport(normalizeBackup(templateToBackup(template, settings), () => crypto.randomUUID()));
@@ -315,6 +329,7 @@ export default function App() {
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
         {(activeTab === 'dashboard' || goActive) && <div className="mb-6"><GoTimeBanner activation={go?.activation} checkins={go?.checkins} members={go?.members} onOpen={() => setShowGo(true)} /></div>}
+        {activeTab === 'dashboard' && weather?.alerts?.length > 0 && <WeatherAlerts alerts={weather.alerts} area={weather.area} />}
         {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} refillDueMedications={refillDueMedications} onViewReminders={() => setActiveTab('plan')} onViewRotation={() => setActiveTab('inventory')} />}
         {activeTab === 'inventory' && (
           <InventoryManager
@@ -366,7 +381,7 @@ export default function App() {
         )}
         {activeTab === 'plan' && (
           <EmergencyPlan
-            plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunSimulation={runOutageSimulation} settings={settings}
+            plan={plan} weather={weather} onUpdate={(plan) => mutate({type:'plan',plan})} onRunSimulation={runOutageSimulation} settings={settings}
             onOpenBinder={() => setShowBinder(true)}
             reminders={reminders} checklistChecks={checklistChecks} medications={medications}
             onAddReminder={(i) => handleAdd('reminders', i)}
@@ -384,7 +399,7 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => { cancelImport(); setShowSyncModal(false); }} onImport={handleFileUpload} onImportCsv={handleCsvUpload} onDownloadCsv={downloadCsv} pendingImport={pendingImport} pendingImportSource={pendingImportSource} onConfirmImport={confirmImport} onCancelImport={cancelImport} onApplyTemplate={previewTemplate} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
+      {showSyncModal && <SyncModal onClose={() => { cancelImport(); setShowSyncModal(false); }} onImport={handleFileUpload} onImportCsv={handleCsvUpload} onDownloadCsv={downloadCsv} pendingImport={pendingImport} pendingImportSource={pendingImportSource} onConfirmImport={confirmImport} onCancelImport={cancelImport} onApplyTemplate={previewTemplate} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} plan={plan} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
       {outage && <OutageSimulationModal result={outage} settings={settings} onClose={() => setOutage(null)} />}
     </div>
   );
@@ -1277,15 +1292,21 @@ function ContactsSection({ contacts, isEditing, onChange }) {
   );
 }
 
-function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder, reminders = [], checklistChecks = [], medications = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem, onAddMedication, onUpdateMedication, onDeleteMedication }) {
+function EmergencyPlan({ plan, weather = null, onUpdate, onRunSimulation, settings, onOpenBinder, reminders = [], checklistChecks = [], medications = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem, onAddMedication, onUpdateMedication, onDeleteMedication }) {
   const [isEditing, setIsEditing] = useState(false);
   const [spot, setSpot] = useState(plan?.shelterSpot || '');
   const [family, setFamily] = useState(plan?.family || []);
   const [contacts, setContacts] = useState(plan?.contacts || []);
   const [meetingPrimary, setMeetingPrimary] = useState(plan?.meetingPoints?.primary || '');
   const [meetingSecondary, setMeetingSecondary] = useState(plan?.meetingPoints?.secondary || '');
+  const [location, setLocation] = useState(plan?.location || {label: '', latitude: '', longitude: ''});
+  const [hazards, setHazards] = useState(plan?.hazards || []);
+  const [links, setLinks] = useState(plan?.links || []);
   const [saveError, setSaveError] = useState(null);
   const resetFromPlan = () => {
+    setLocation(plan?.location || {label: '', latitude: '', longitude: ''});
+    setHazards(plan?.hazards || []);
+    setLinks(plan?.links || []);
     setSpot(plan?.shelterSpot || '');
     setFamily(plan?.family || []);
     setContacts(plan?.contacts || []);
@@ -1312,6 +1333,10 @@ function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder
     // (e.g. "Add member" clicked but never filled in) is safe to discard without telling anyone.
     if (cleanedFamily.some(m => !m.name && (m.role || m.dob))) { setSaveError('Give each household member a name, or remove the empty row, before saving.'); return; }
     if (cleanedContacts.some(c => !c.name && !c.phone && c.type)) { setSaveError('Give each contact a name or phone number, or remove the empty row, before saving.'); return; }
+    const cleanedLinks = links.map(l => ({title: (l.title || '').trim(), url: (l.url || '').trim()})).filter(l => l.title || l.url);
+    if (cleanedLinks.some(l => !l.title || !/^https?:\/\/\S+$/i.test(l.url))) { setSaveError('Give each link a title and a web address starting with https://, or remove it, before saving.'); return; }
+    const lat = String(location.latitude ?? '').trim(), lon = String(location.longitude ?? '').trim();
+    if ((lat === '') !== (lon === '') || (lat !== '' && (!(Math.abs(Number(lat)) <= 90) || !(Math.abs(Number(lon)) <= 180)))) { setSaveError('Enter both latitude and longitude (or neither), e.g. 44.98 and -93.27.'); return; }
     try {
       const ok = await onUpdate({
         ...plan,
@@ -1319,6 +1344,9 @@ function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder
         family: cleanedFamily.filter(m => m.name || m.role || m.dob || m.caloriesPerDay !== '' || m.waterGallonsPerDay !== ''),
         contacts: cleanedContacts.filter(c => c.name || c.phone || c.type),
         meetingPoints: { primary: meetingPrimary.trim(), secondary: meetingSecondary.trim() },
+        location: { label: (location.label || '').trim(), latitude: lat === '' ? '' : roundCoordinate(lat), longitude: lon === '' ? '' : roundCoordinate(lon) },
+        hazards,
+        links: cleanedLinks,
       });
       if (!ok) { setSaveError('Could not save plan. Please retry.'); return; }
       setIsEditing(false);
@@ -1385,28 +1413,13 @@ function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder
 
       <RemindersSection reminders={reminders} onAdd={onAddReminder} onUpdate={onUpdateReminder} onDelete={onDeleteReminder} onComplete={onCompleteReminder} onSnooze={onSnoozeReminder} />
       <MedicationsSection medications={medications} onAdd={onAddMedication} onUpdate={onUpdateMedication} onDelete={onDeleteMedication} />
-      <ChecklistsSection checklistChecks={checklistChecks} onToggle={onToggleChecklistItem} />
+      <ChecklistsSection checklists={checklistsFor(plan)} checklistChecks={checklistChecks} onToggle={onToggleChecklistItem} />
 
-      {/* Survival Sync Links Moved Here */}
-      <div className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm mt-6">
-        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Survival Sync</h3>
-        <div className="grid gap-3">
-          {[
-            { title: "MnDOT 511 Roads", url: "https://511mn.org", icon: <Navigation size={20}/>, color: "bg-blue-50 text-blue-600" },
-            { title: "NWS Twin Cities", url: "https://www.weather.gov/mpx/", icon: <Wind size={20}/>, color: "bg-orange-50 text-orange-600" },
-            { title: "Xcel Outage Map", url: "https://www.outagemap-xcelenergy.com", icon: <AlertTriangle size={20}/>, color: "bg-red-50 text-red-600" }
-          ].map((link, i) => (
-            <a key={i} href={link.url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-5 p-4 rounded-2xl hover:bg-slate-50 transition-colors group">
-              <div className={`p-3 rounded-xl ${link.color}`}>{link.icon}</div>
-              <div className="flex-1">
-                <div className="font-black text-sm text-slate-800">{link.title}</div>
-                <div className="text-[9px] text-slate-600 font-mono uppercase">{link.url.replace('https://', '')}</div>
-              </div>
-              <ChevronRight size={16} className="text-slate-300 group-hover:text-blue-500"/>
-            </a>
-          ))}
-        </div>
-      </div>
+      <HazardProfileSection
+        plan={plan} weather={weather} isEditing={isEditing}
+        location={location} hazards={hazards} links={links}
+        onLocationChange={setLocation} onHazardsChange={setHazards} onLinksChange={setLinks}
+      />
     </div>
   );
 }
@@ -1601,14 +1614,14 @@ function MedicationsSection({ medications, onAdd, onUpdate, onDelete }) {
 }
 
 // --- Seasonal Checklists ---
-function ChecklistsSection({ checklistChecks, onToggle }) {
+function ChecklistsSection({ checklists, checklistChecks, onToggle }) {
   const checkedIds = useMemo(() => new Set(checklistChecks.map(c => c.id)), [checklistChecks]);
   const [openSeason, setOpenSeason] = useState(null);
   return (
     <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
       <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4 flex items-center gap-2"><Layers size={14}/> Seasonal Checklists</h3>
       <div className="space-y-3">
-        {checklistCatalog.map(({season, label, items}) => {
+        {checklists.map(({season, label, items}) => {
           const doneCount = items.filter(item => checkedIds.has(`${season}__${item.id}`)).length;
           const open = openSeason === season;
           return (
@@ -2007,7 +2020,7 @@ export function EmergencyBinder({ plan, inventory = [], stats, settings, checkli
       <section className="break-inside-avoid">
         <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Seasonal checklists</h2>
         <div className="space-y-4">
-          {checklistCatalog.map(season => (
+          {checklistsFor(plan).map(season => (
             <div key={season.season}>
               <h3 className="text-xs font-black uppercase text-slate-600 mb-1">{season.label}</h3>
               <ul className="text-sm space-y-0.5">
@@ -2304,7 +2317,7 @@ function ActivityPanel() {
   );
 }
 
-function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pendingImportSource,onConfirmImport,onCancelImport,onApplyTemplate,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,onOpenBinder}) {
+function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pendingImportSource,onConfirmImport,onCancelImport,onApplyTemplate,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,plan,onOpenBinder}) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
@@ -2317,7 +2330,7 @@ function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pen
         <label className="block text-sm font-bold">Import inventory/shopping CSV<input type="file" accept=".csv,text/csv" onChange={onImportCsv} className="block mt-2 w-full text-xs" /></label>
         <button type="button" onClick={onDownloadCsv} className="w-full rounded-xl p-3 bg-slate-50 border border-slate-200 text-sm font-bold flex items-center justify-center gap-2"><Download size={16}/> Export inventory/shopping CSV</button>
       </div>
-      <StarterTemplatesPanel settings={settings} onApply={onApplyTemplate} disabled={Boolean(pendingImport)} />
+      <StarterTemplatesPanel templates={supplyTemplatesFor(plan)} settings={settings} onApply={onApplyTemplate} disabled={Boolean(pendingImport)} />
       {pendingImport && <div role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-2 text-sm">
         <p className="font-black text-amber-900">{pendingImportSource?.kind === 'template' ? `${pendingImportSource.label} ready to review` : pendingImportSource?.kind === 'csv' ? 'CSV ready to review' : 'Backup ready to review'}</p>
         <p className="text-amber-800">{pendingImport.inventory.length} inventory items, {pendingImport.shoppingList.length} shopping items, {pendingImport.appliances.length} appliances, {pendingImport.consumption?.length ?? 0} consumption events and {pendingImport.plan ? 'a family plan' : 'no family plan'} will be merged by ID.</p>
@@ -2355,7 +2368,7 @@ function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pen
 
 // Starter supply templates for a household staring at an empty screen. Applying one runs through
 // the same preview-and-merge path as a JSON backup, so nothing is overwritten without confirmation.
-function StarterTemplatesPanel({ settings, onApply, disabled }) {
+function StarterTemplatesPanel({ templates, settings, onApply, disabled }) {
   const [open, setOpen] = useState(false);
   return (
     <section className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
@@ -2371,7 +2384,7 @@ function StarterTemplatesPanel({ settings, onApply, disabled }) {
             You will see exactly what gets added before anything is saved.
           </p>
           <ul className="space-y-2">
-            {supplyTemplateCatalog.map(template => (
+            {templates.map(template => (
               <li key={template.id} className="bg-white border border-slate-200 rounded-xl p-3 flex items-start justify-between gap-3">
                 <div>
                   <div className="text-xs font-black text-slate-800">{template.label}</div>

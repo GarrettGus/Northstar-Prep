@@ -201,6 +201,23 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_plan (
   meeting_primary text NOT NULL DEFAULT '',
   meeting_secondary text NOT NULL DEFAULT ''
 )`;
+// Location (rounded to ~1 km), chosen hazards and the household's own quick links.
+const [{exists: hadPlanLinks}] = await sql`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'northstar_plan' AND column_name = 'links') AS exists`;
+await sql`ALTER TABLE northstar_plan ADD COLUMN IF NOT EXISTS location_label text NOT NULL DEFAULT ''`;
+await sql`ALTER TABLE northstar_plan ADD COLUMN IF NOT EXISTS latitude numeric`;
+await sql`ALTER TABLE northstar_plan ADD COLUMN IF NOT EXISTS longitude numeric`;
+await sql`ALTER TABLE northstar_plan ADD COLUMN IF NOT EXISTS hazards jsonb NOT NULL DEFAULT '[]'`;
+await sql`ALTER TABLE northstar_plan ADD COLUMN IF NOT EXISTS links jsonb NOT NULL DEFAULT '[]'`;
+// The Family Hub's quick links used to be hardcoded to one region. The first time this runs on an
+// existing plan, carry those links over as the household's own (editable) links so nothing it
+// relied on disappears; a new household starts with none and adds its own.
+if (!hadPlanLinks) {
+  await sql`UPDATE northstar_plan SET links = ${JSON.stringify([
+    {title: 'MnDOT 511 Roads', url: 'https://511mn.org'},
+    {title: 'NWS Twin Cities', url: 'https://www.weather.gov/mpx/'},
+    {title: 'Xcel Outage Map', url: 'https://www.outagemap-xcelenergy.com'},
+  ])}::jsonb WHERE links = '[]'::jsonb`;
+}
 await sql`CREATE TABLE IF NOT EXISTS northstar_family_members (
   household_id integer NOT NULL REFERENCES northstar_household(id),
   position integer NOT NULL,

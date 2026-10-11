@@ -7,7 +7,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createDisposableDatabase, dropDatabase, migrate, postgresAvailable, repoRoot } from '../../support/postgres.js';
-import { baseURL, port, stateDir, statePath, storageStatePath } from './support/environment.js';
+import { baseURL, port, stubPort, stateDir, statePath, storageStatePath } from './support/environment.js';
 
 const registerPath = fileURLToPath(new URL('../../support/register.js', import.meta.url));
 
@@ -39,9 +39,14 @@ export default async function globalSetup() {
   const database = await createDisposableDatabase('northstar_e2e');
   await migrate(database.url, {...secrets, HOUSEHOLD_OWNER_EMAIL: owner.email, HOUSEHOLD_PASSWORD: owner.password});
 
+  const stubs = spawn(process.execPath, [fileURLToPath(new URL('./support/stubServices.js', import.meta.url)), String(stubPort)], {stdio: ['ignore', 'pipe', 'inherit']});
+  await new Promise((resolve, reject) => { stubs.stdout.once('data', resolve); stubs.once('exit', () => reject(new Error('The stub services exited before they were ready.'))); });
+  stubs.unref();
+  const stubBase = `http://127.0.0.1:${stubPort}`;
+
   const server = spawn(process.execPath, ['--import', pathToFileURL(registerPath).href, 'scripts/dev.js'], {
     cwd: repoRoot,
-    env: {...process.env, ...secrets, DATABASE_URL: database.url, PORT: String(port), NODE_ENV: 'development'},
+    env: {...process.env, ...secrets, DATABASE_URL: database.url, PORT: String(port), NODE_ENV: 'development', NWS_API_BASE: stubBase},
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const signal = {exited: false, output: ''};
@@ -54,6 +59,7 @@ export default async function globalSetup() {
     await waitForServer(signal);
   } catch (error) {
     server.kill('SIGKILL');
+    stubs.kill('SIGKILL');
     await dropDatabase(database.name);
     throw error;
   }
@@ -73,7 +79,7 @@ export default async function globalSetup() {
   await rm(stateDir, {recursive: true, force: true});
   await mkdir(stateDir, {recursive: true});
   await writeFile(statePath, JSON.stringify({
-    databaseName: database.name, databaseUrl: database.url, serverPid: server.pid,
+    databaseName: database.name, databaseUrl: database.url, serverPid: server.pid, stubPid: stubs.pid, stubBase,
     owner, cronSecret: secrets.CRON_SECRET, userId,
   }, null, 2));
   await writeFile(storageStatePath, JSON.stringify({

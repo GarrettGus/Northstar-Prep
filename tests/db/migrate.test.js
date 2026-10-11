@@ -200,6 +200,30 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       await db.pruneReadinessHistory(1);
       assert.deepEqual(await db.listReadinessHistory(), []);
     });
+
+    it('round-trips a plan\'s location, hazards and links', async () => {
+      const db = await loadDb(database.url);
+      const {data, version} = await db.readState();
+      const plan = {shelterSpot: 'Basement', family: [], contacts: [], meetingPoints: {primary: '', secondary: ''},
+        location: {label: 'Home', latitude: 44.98, longitude: -93.27}, hazards: ['flood', 'winter-storm'], links: [{title: 'Roads', url: 'https://511mn.org'}]};
+      await db.compareAndSave(version, {...data, plan}, data);
+      const after = await db.readState();
+      assert.deepEqual(after.data.plan, plan);
+      assert.deepEqual(await db.readPlanLocation(), {latitude: 44.98, longitude: -93.27});
+      await db.compareAndSave(after.version, {...after.data, plan: {...plan, location: {label: '', latitude: '', longitude: ''}}}, after.data);
+      assert.equal(await db.readPlanLocation(), null);
+    });
+
+    it('carries the old hardcoded quick links over to an existing plan the first time links are added', async () => {
+      await query(database.url, 'ALTER TABLE northstar_plan DROP COLUMN links');
+      await migrate(database.url);
+      const [{links}] = await query(database.url, 'SELECT links FROM northstar_plan WHERE household_id = 1');
+      assert.deepEqual(links.map(link => link.title), ['MnDOT 511 Roads', 'NWS Twin Cities', 'Xcel Outage Map']);
+      // Re-running never re-seeds over the household's own edits.
+      await query(database.url, `UPDATE northstar_plan SET links = '[]'::jsonb`);
+      await migrate(database.url);
+      assert.deepEqual((await query(database.url, 'SELECT links FROM northstar_plan'))[0].links, []);
+    });
   });
 
   describe('re-running the migration', () => {
@@ -271,6 +295,8 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       assert.deepEqual(data.plan, {
         ...legacyState.plan,
         family: legacyState.plan.family.map(member => ({...member, kind: 'person', caloriesPerDay: '', waterGallonsPerDay: ''})),
+        // A blob predating hazard profiles has no location, hazards or links.
+        location: {label: '', latitude: '', longitude: ''}, hazards: [], links: [],
       });
       assert.deepEqual(data.settings, legacyState.settings);
       assert.deepEqual(data.reminders, [], 'a blob predating reminders must migrate to an empty collection');

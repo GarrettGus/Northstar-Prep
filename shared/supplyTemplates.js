@@ -1,3 +1,4 @@
+import { hazardSupplyTemplates } from './hazards.js';
 // Fixed catalog of starter supply templates, in the same shape as the seasonal checklist catalog
 // in shared/checklists.js: not user-editable, and applied by generating ordinary inventory rows
 // rather than by storing a reference to the template.
@@ -79,8 +80,8 @@ export function scaleTemplateQuantity(item, settings) {
   return Math.max(1, Math.ceil(base));
 }
 
-export function findSupplyTemplate(id) {
-  return supplyTemplateCatalog.find(template => template.id === id) ?? null;
+export function findSupplyTemplate(id, plan = null) {
+  return supplyTemplatesFor(plan).find(template => template.id === id) ?? null;
 }
 
 // Builds the inventory rows a template would add, as a backup-shaped object so it can go through
@@ -110,4 +111,9 @@ export function templateToBackup(template, settings) {
     checklistChecks: [],
     plan: null,
   };
+}
+
+// The starter templates plus one per hazard the household has chosen (see shared/hazards.js).
+export function supplyTemplatesFor(plan) {
+  return [...supplyTemplateCatalog, ...hazardSupplyTemplates(plan)];
 }

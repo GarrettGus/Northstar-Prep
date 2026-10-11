@@ -5,6 +5,7 @@ import { environment, stateDir } from './support/environment.js';
 export default async function globalTeardown() {
   let state;
   try { state = environment(); } catch { return; }
+  if (state.stubPid) { try { process.kill(state.stubPid, 'SIGKILL'); } catch { /* already gone */ } }
   if (state.serverPid) { try { process.kill(state.serverPid, 'SIGKILL'); } catch { /* already gone */ } }
   await dropDatabase(state.databaseName);
   await rm(stateDir, {recursive: true, force: true});

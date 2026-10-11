@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { hazardIds, roundCoordinate } from './hazards.js';
 
 const text = z.string().max(500);
 const number = z.coerce.number().finite().nonnegative().max(1e9).default(0);
@@ -128,11 +129,28 @@ export const medicationSchema = z.object({
   dose: z.string().trim().max(200).default(''), quantityOnHand: number, refillDate: date,
   prescriber: z.string().trim().max(200).default(''), notes: text.default(''),
 });
+// Blank means "not set"; null round-trips a nullable database column back to blank.
+const coordinate = limit => z.preprocess(
+  value => value === null || value === undefined || value === '' ? '' : value,
+  z.union([z.literal(''), z.coerce.number().finite().min(-limit).max(limit).transform(roundCoordinate)]),
+);
+const linkSchema = z.object({
+  title: z.string().trim().min(1).max(100),
+  url: z.string().trim().max(500).regex(/^https?:\/\/[^\s<>"']+$/i, 'Links must start with http:// or https://'),
+});
 export const planSchema = z.object({
   shelterSpot: z.string().max(3000).default(''),
   family: z.array(familyMemberSchema).max(30).default([]),
   contacts: z.array(z.object({name: text, phone: z.string().max(80), type: text.default('')})).max(50).default([]),
   meetingPoints: z.object({primary: text.default(''), secondary: text.default('')}).default({primary:'',secondary:''}),
+  // Where the household is (rounded to ~1 km, see shared/hazards.js) and what it faces there.
+  location: z.object({
+    label: z.string().trim().max(200).default(''),
+    latitude: coordinate(90), longitude: coordinate(180),
+  }).default({label: '', latitude: '', longitude: ''}),
+  hazards: z.array(z.enum(hazardIds)).max(hazardIds.length).default([]).transform(list => [...new Set(list)]),
+  // The household's own quick links (utility outage map, road conditions, school closures...).
+  links: z.array(linkSchema).max(20).default([]),
 });
 export const consumptionSchema = z.array(consumptionEventSchema).max(10000).default([]);
 export const stateSchema = z.object({ inventory: z.array(itemSchema).max(2000), shoppingList: z.array(itemSchema).max(2000), appliances: z.array(applianceSchema).max(200), reminders: z.array(reminderSchema).max(300), checklistChecks: z.array(checklistCheckSchema).max(500), kits: z.array(kitSchema).max(200).default([]), medications: z.array(medicationSchema).max(300).default([]), plan: planSchema.nullable(), consumption: consumptionSchema, settings: settingsSchema.default(() => settingsSchema.parse({})) });

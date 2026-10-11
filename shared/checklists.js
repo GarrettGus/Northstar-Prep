@@ -1,3 +1,4 @@
+import { hazardChecklists } from './hazards.js';
 // Fixed catalog of seasonal preparedness checklists. Items are not user-editable; a household's
 // progress against them is tracked separately as checked rows keyed by `${season}__${item.id}`.
 export const checklistCatalog = [
@@ -42,3 +43,8 @@ export const checklistCatalog = [
     ],
   },
 ];
+
+// The seasonal checklists plus one per hazard the household has chosen (see shared/hazards.js).
+export function checklistsFor(plan) {
+  return [...checklistCatalog, ...hazardChecklists(plan)];
+}

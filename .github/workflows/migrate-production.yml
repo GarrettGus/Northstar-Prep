@@ -1,0 +1,80 @@
+name: Migrate production database
+
+# Runs scripts/migrate.js against the production database, on demand only. The connection string
+# lives in the `production` GitHub Environment as the DATABASE_URL_UNPOOLED secret, so it never
+# passes through a laptop or a chat session. Add required reviewers to that environment
+# (Settings → Environments → production) if every run should need a second approval.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "migrate production" to run the migration against the production database'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migrate-production
+  cancel-in-progress: false
+
+jobs:
+  # The same migration suite CI runs on every PR, against a disposable Postgres, on the exact
+  # commit about to be applied, so a migration that does not apply or is not re-runnable never
+  # reaches production.
+  prove:
+    if: inputs.confirm == 'migrate production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Migration tests against a disposable database
+        run: node --test tests/db/migrate.test.js
+
+  migrate:
+    needs: prove
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Check the secret is configured
+        env:
+          DATABASE_URL_UNPOOLED: ${{ secrets.DATABASE_URL_UNPOOLED }}
+        run: |
+          if [ -z "$DATABASE_URL_UNPOOLED" ]; then
+            echo "::error::Add DATABASE_URL_UNPOOLED as a secret of the 'production' environment (Settings → Environments → production)."
+            exit 1
+          fi
+      - name: Apply the migration
+        # Only the unpooled connection string is passed: no owner email/password, so this run can
+        # never create an account, only add the tables and columns the deployed code expects.
+        env:
+          DATABASE_URL_UNPOOLED: ${{ secrets.DATABASE_URL_UNPOOLED }}
+        run: node scripts/migrate.js
+      - name: Confirm the schema the deployed code needs
+        env:
+          DATABASE_URL_UNPOOLED: ${{ secrets.DATABASE_URL_UNPOOLED }}
+        run: node scripts/check-schema.js

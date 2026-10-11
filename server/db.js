@@ -12,6 +12,15 @@ export const householdId = 1;
 // readState() joins the tables back into the shape the rest of the app already expects;
 // compareAndSave() diffs the incoming state against what was last read and only writes the
 // rows that actually changed, inside one transaction guarded by the household's version.
+// One indexed lookup, so a polling client whose copy is already current can skip readState()'s
+// full fan-out of per-collection queries.
+export async function readVersion() {
+  const sql = database();
+  const rows = await sql`SELECT version FROM northstar_household WHERE id = ${householdId}`;
+  if (!rows.length) throw new Error('Run the database migration before using the app.');
+  return Number(rows[0].version);
+}
+
 export async function readState() {
   const sql = database();
   const [households, inventory, shoppingList, appliances, reminders, checklistChecks, kitRows, medications, planRows, familyRows, contactRows, settingsRows, consumption] = await Promise.all([

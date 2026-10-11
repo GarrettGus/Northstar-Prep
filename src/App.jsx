@@ -16,7 +16,7 @@ import { supplyTemplateCatalog, templateToBackup, findSupplyTemplate } from '../
 import { effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, todayLocal, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
 import { kitCompleteness } from '../shared/kits.js';
-import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
+import { clearDeviceData, enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
 
 // --- Constants ---
 const SYSTEM_ID = 'Household';
@@ -81,7 +81,13 @@ export default function App() {
     const refresh = async () => {
       if (running || busy.current) return;
       running = true;
-      try { const state = await request('hub'); if (!cancelled) {accept(state); setPendingSync(loadQueuedActions().length); setGlobalError(null);} }
+      try {
+        const state = await request(revision.current >= 0 ? `hub?since=${revision.current}` : 'hub');
+        if (!cancelled) {
+          if (state.unchanged) setLastSyncedAt(Date.now()); else accept(state);
+          setPendingSync(loadQueuedActions().length); setGlobalError(null);
+        }
+      }
       catch(error) {
         if (!cancelled && !error.status) {
           const cached = loadCachedState();
@@ -137,7 +143,9 @@ export default function App() {
     finally {busy.current=false;setIsSyncing(false);}
   };
   const logout = async () => {
-    try {await request('session',{},'DELETE');epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    const queued = loadQueuedActions().length;
+    if (queued && !window.confirm(`${queued} change${queued === 1 ? ' has' : 's have'} not synced yet and will be discarded from this device if you sign out. Sign out anyway?`)) return;
+    try {await request('session',{},'DELETE');await clearDeviceData();setPendingSync(0);setLastSyncedAt(null);epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {

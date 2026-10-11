@@ -1,5 +1,5 @@
 import { validSession, sameOrigin } from '../server/auth.js';
-import { readState, compareAndSave, insertAuditLog, insertReminderHistory, householdId } from '../server/db.js';
+import { readState, readVersion, compareAndSave, insertAuditLog, insertReminderHistory, householdId } from '../server/db.js';
 import { applyAction, collectionKey, idSchema } from '../shared/schema.js';
 import { beginRequest, logFailure, logIssue, observe } from '../server/observability.js';
 import { storeImage, deleteImage, isDataUrlImage, isManagedImageUrl } from '../server/imageStore.js';
@@ -87,7 +87,13 @@ function reminderHistoryEvents(previousState, nextState) {
   return events;
 }
 
-export function createHandler(repository = {readState, compareAndSave, logAudit: insertAuditLog, logReminderHistory: insertReminderHistory}, authenticate = validSession, imageStore = {store: storeImage, remove: deleteImage}) {
+function sinceVersion(req) {
+  const raw = req.query?.since ?? new URL(req.url || '/', 'http://localhost').searchParams.get('since');
+  if (typeof raw !== 'string' || !/^\d{1,15}$/.test(raw)) return null;
+  return Number(raw);
+}
+
+export function createHandler(repository = {readState, readVersion, compareAndSave, logAudit: insertAuditLog, logReminderHistory: insertReminderHistory}, authenticate = validSession, imageStore = {store: storeImage, remove: deleteImage}) {
   return async (req,res) => {
     const request = beginRequest(req, res);
     res.setHeader('Cache-Control','no-store');
@@ -96,7 +102,13 @@ export function createHandler(repository = {readState, compareAndSave, logAudit:
     if (!['GET','POST'].includes(req.method)) return res.status(405).json({error:'Method not allowed.'});
     if (req.method === 'POST' && !sameOrigin(req)) return res.status(403).json({error:'Request origin rejected.'});
     try {
-      if (req.method === 'GET') return res.status(200).json(await repository.readState());
+      if (req.method === 'GET') {
+        // A poll that sends the version it already holds gets a tiny "unchanged" reply instead of
+        // the whole household whenever nothing has been saved since.
+        const since = sinceVersion(req);
+        if (since !== null && repository.readVersion && await repository.readVersion() === since) return res.status(200).json({unchanged:true, version:since});
+        return res.status(200).json(await repository.readState());
+      }
       if (!req.body || typeof req.body !== 'object' || JSON.stringify(req.body).length > 3_000_000) return res.status(400).json({error:'Invalid or oversized request.'});
       let action;
       try { action = await materializeActionImages(req.body, imageStore.store); }

@@ -23,6 +23,14 @@ export function saveCachedState(state) {
   }
 }
 
+// Signing out must not leave the household (including medications) readable on this device.
+// Clears the cached state, any queued edits, and every Cache Storage entry the service worker
+// holds, including API responses that versions before the shell-only worker cached.
+export async function clearDeviceData() {
+  try { localStorage.removeItem(STATE_KEY); localStorage.removeItem(QUEUE_KEY); } catch { /* storage unavailable: nothing to clear */ }
+  try { if (typeof caches !== 'undefined') await Promise.all((await caches.keys()).map(key => caches.delete(key))); } catch { /* best effort */ }
+}
+
 export function loadQueuedActions() {
   const queue = read(QUEUE_KEY, []);
   return Array.isArray(queue) ? queue : [];

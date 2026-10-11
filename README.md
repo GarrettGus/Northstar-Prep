@@ -64,6 +64,15 @@ For a persistent staging environment (a fixed URL to demo against before promoti
 
 `scripts/migrate.js` connects with `DATABASE_URL_UNPOOLED` (falling back to `DATABASE_URL`) because Neon's pooled connection does not support the session state some migration statements need. Run it from CI against each target's own database using that target's own connection string as a workflow secret — never share one migration run across environments. `.github/workflows/ci.yml`'s `verify` job proves `scripts/migrate.js` applies cleanly and is re-runnable (against a disposable database, never a deployed one) before you run it for real; see [Before a production migration](#before-a-production-migration).
 
+### Running the production migration from CI
+
+`.github/workflows/migrate-production.yml` runs `scripts/migrate.js` against production on demand, so the connection string never has to leave GitHub:
+
+1. Create a `production` environment under **Settings → Environments** (optionally with required reviewers) and add the production `DATABASE_URL_UNPOOLED` from Vercel as a secret of that environment.
+2. **Actions → Migrate production database → Run workflow** on `main`, typing `migrate production` to confirm.
+
+It first re-runs the migration suite against a disposable database on the same commit, then applies the migration with only the unpooled connection string (it can add tables and columns but never create an account), and finally runs `scripts/check-schema.js`, a read-only check that the expected tables and columns exist, printing row counts but no contents.
+
 ### Staging smoke test
 
 `npm run smoke-test -- <url>` (`scripts/smoketest.js`) polls `<url>/api/health` until it reports `{"status":"ok","database":"ok"}`, retrying with backoff (`SMOKE_TEST_ATTEMPTS`, `SMOKE_TEST_DELAY_MS`) since a fresh deployment can take a moment to become reachable. The `staging-smoke-test` job in `.github/workflows/ci.yml` runs it automatically against every non-Production deployment Vercel reports (via the `deployment_status` event), so a preview or staging deployment that cannot reach its own database is caught before anyone promotes it to production. Run it manually against the staging URL as a final check before promoting.

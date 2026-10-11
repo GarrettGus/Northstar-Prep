@@ -1,12 +1,21 @@
 import { hashToken, randomToken, sameOrigin, validSession } from '../server/auth.js';
-import { createInvitation, createPasswordReset, getMembership, listMembers, listPendingInvitations, removeMember, revokeInvitation } from '../server/db.js';
+import { createInvitation, createPasswordReset, findUserById, getMembership, listMembers, listPendingInvitations, removeMember, revokeInvitation } from '../server/db.js';
+import { appUrl, emailConfigured, inviteEmail, resetEmail, sendEmail } from '../server/email.js';
 import { emailSchema, idSchema, roleSchema } from '../shared/schema.js';
-import { beginRequest, logFailure, observe } from '../server/observability.js';
+import { beginRequest, logFailure, logIssue, observe } from '../server/observability.js';
 
 const inviteLifetimeMs = 7 * 24 * 3600 * 1000;
 const resetLifetimeMs = 3600 * 1000;
 
-export function createHandler(repository = {getMembership, listMembers, listPendingInvitations, createInvitation, removeMember, revokeInvitation, createPasswordReset}, authenticate = validSession) {
+// Sends the link by email when a provider is configured. Never throws: the token is already
+// stored and returned to the owner, so a failed send only means they share the link by hand.
+async function deliver(request, to, message, mailer) {
+  if (!to || !mailer.configured()) return false;
+  try { return (await mailer.send({to, ...message})).sent === true; }
+  catch (error) { logIssue(request, '/api/members', 'email_send_failure', error); return false; }
+}
+
+export function createHandler(repository = {getMembership, listMembers, listPendingInvitations, createInvitation, removeMember, revokeInvitation, createPasswordReset, findUserById}, authenticate = validSession, mailer = {configured: emailConfigured, send: sendEmail}) {
   return async function handler(req, res) {
     const request = beginRequest(req, res);
     res.setHeader('Cache-Control', 'no-store');
@@ -20,7 +29,7 @@ export function createHandler(repository = {getMembership, listMembers, listPend
       if (req.method === 'GET') {
         const members = await repository.listMembers();
         const invitations = membership.role === 'owner' ? await repository.listPendingInvitations() : [];
-        return res.status(200).json({members, invitations, role: membership.role});
+        return res.status(200).json({members, invitations, role: membership.role, emailEnabled: mailer.configured()});
       }
       if (membership.role !== 'owner') return res.status(403).json({error: 'Only owners can manage household members.'});
       const body = req.body || {};
@@ -30,7 +39,9 @@ export function createHandler(repository = {getMembership, listMembers, listPend
         const rawToken = randomToken();
         const expiresAt = new Date(Date.now() + inviteLifetimeMs).toISOString();
         await repository.createInvitation({email, role, invitedBy: session.userId, tokenHash: hashToken(rawToken), expiresAt});
-        return res.status(200).json({token: rawToken, expiresAt});
+        const base = appUrl(req);
+        const emailed = base && body.sendEmail !== false ? await deliver(request, email, inviteEmail({link: `${base}/?invite=${rawToken}`, role, expiresAt}), mailer) : false;
+        return res.status(200).json({token: rawToken, expiresAt, emailed});
       }
       if (body.type === 'remove') {
         const userId = idSchema.parse(body.userId);
@@ -46,7 +57,10 @@ export function createHandler(repository = {getMembership, listMembers, listPend
         const rawToken = randomToken();
         const expiresAt = new Date(Date.now() + resetLifetimeMs).toISOString();
         await repository.createPasswordReset({userId, tokenHash: hashToken(rawToken), expiresAt});
-        return res.status(200).json({token: rawToken, expiresAt});
+        const base = appUrl(req);
+        const user = base && body.sendEmail !== false && repository.findUserById ? await repository.findUserById(userId) : null;
+        const emailed = user ? await deliver(request, user.email, resetEmail({link: `${base}/?reset=${rawToken}`}), mailer) : false;
+        return res.status(200).json({token: rawToken, expiresAt, emailed});
       }
       if (body.type === 'revoke') {
         const invitationId = idSchema.parse(body.invitationId);

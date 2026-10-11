@@ -1,1 +1,1 @@
-{"framework":"vite","buildCommand":"npm run build","outputDirectory":"dist","crons":[{"path":"/api/backup","schedule":"0 8 * * *"}]}
+{"framework": "vite", "buildCommand": "npm run build", "outputDirectory": "dist", "crons": [{"path": "/api/backup", "schedule": "0 8 * * *"}], "rewrites": [{"source": "/api/go", "destination": "/api/live?route=go"}, {"source": "/api/alerts", "destination": "/api/live?route=alerts"}, {"source": "/api/push", "destination": "/api/live?route=push"}]}

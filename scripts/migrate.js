@@ -166,6 +166,9 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_kits (
   target_contents jsonb NOT NULL DEFAULT '[]',
   PRIMARY KEY (household_id, id)
 )`;
+// Which household member a kit belongs to (blank for a shared kit), so "everyone has a packed
+// go-bag" can be checked rather than only listed on the evacuation checklist.
+await sql`ALTER TABLE northstar_kits ADD COLUMN IF NOT EXISTS assigned_to text NOT NULL DEFAULT ''`;
 // --- Medications and prescriptions: sensitive household health data (see README privacy notes). ---
 await sql`CREATE TABLE IF NOT EXISTS northstar_medications (
   household_id integer NOT NULL REFERENCES northstar_household(id),
@@ -198,6 +201,23 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_plan (
   meeting_primary text NOT NULL DEFAULT '',
   meeting_secondary text NOT NULL DEFAULT ''
 )`;
+// Location (rounded to ~1 km), chosen hazards and the household's own quick links.
+const [{exists: hadPlanLinks}] = await sql`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'northstar_plan' AND column_name = 'links') AS exists`;
+await sql`ALTER TABLE northstar_plan ADD COLUMN IF NOT EXISTS location_label text NOT NULL DEFAULT ''`;
+await sql`ALTER TABLE northstar_plan ADD COLUMN IF NOT EXISTS latitude numeric`;
+await sql`ALTER TABLE northstar_plan ADD COLUMN IF NOT EXISTS longitude numeric`;
+await sql`ALTER TABLE northstar_plan ADD COLUMN IF NOT EXISTS hazards jsonb NOT NULL DEFAULT '[]'`;
+await sql`ALTER TABLE northstar_plan ADD COLUMN IF NOT EXISTS links jsonb NOT NULL DEFAULT '[]'`;
+// The Family Hub's quick links used to be hardcoded to one region. The first time this runs on an
+// existing plan, carry those links over as the household's own (editable) links so nothing it
+// relied on disappears; a new household starts with none and adds its own.
+if (!hadPlanLinks) {
+  await sql`UPDATE northstar_plan SET links = ${JSON.stringify([
+    {title: 'MnDOT 511 Roads', url: 'https://511mn.org'},
+    {title: 'NWS Twin Cities', url: 'https://www.weather.gov/mpx/'},
+    {title: 'Xcel Outage Map', url: 'https://www.outagemap-xcelenergy.com'},
+  ])}::jsonb WHERE links = '[]'::jsonb`;
+}
 await sql`CREATE TABLE IF NOT EXISTS northstar_family_members (
   household_id integer NOT NULL REFERENCES northstar_household(id),
   position integer NOT NULL,
@@ -306,6 +326,38 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_readiness_history (
   PRIMARY KEY (household_id, day)
 )`;
 await sql`CREATE INDEX IF NOT EXISTS northstar_readiness_history_day_idx ON northstar_readiness_history (household_id, day DESC)`;
+
+// --- Plan activation ("Go time"): at most one active event per household, plus each member's
+// latest check-in. Deliberately outside household state: it is live coordination, not something a
+// backup should restore, and a check-in must be attributable to the member who sent it.
+await sql`CREATE TABLE IF NOT EXISTS northstar_activation (
+  household_id integer PRIMARY KEY REFERENCES northstar_household(id),
+  mode text NOT NULL CHECK (mode IN ('evacuate','shelter')),
+  note text NOT NULL DEFAULT '',
+  started_by uuid REFERENCES northstar_users(id) ON DELETE SET NULL,
+  started_at timestamptz NOT NULL DEFAULT now()
+)`;
+await sql`CREATE TABLE IF NOT EXISTS northstar_checkins (
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  user_id uuid NOT NULL REFERENCES northstar_users(id) ON DELETE CASCADE,
+  status text NOT NULL,
+  note text NOT NULL DEFAULT '',
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (household_id, user_id)
+)`;
+
+// --- Web Push subscriptions: one row per browser a member turned notifications on in. The id is a
+// hash of the endpoint so re-subscribing the same browser updates its row instead of adding one.
+await sql`CREATE TABLE IF NOT EXISTS northstar_push_subscriptions (
+  id text PRIMARY KEY,
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  user_id uuid NOT NULL REFERENCES northstar_users(id) ON DELETE CASCADE,
+  endpoint text NOT NULL,
+  p256dh text NOT NULL,
+  auth text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+)`;
+await sql`CREATE INDEX IF NOT EXISTS northstar_push_subscriptions_household_idx ON northstar_push_subscriptions (household_id, user_id)`;
 
 await sql`CREATE TABLE IF NOT EXISTS northstar_alert_state (
   key text PRIMARY KEY,

@@ -1,11 +1,14 @@
 import { validSession, sameOrigin } from '../server/auth.js';
-import { readState, getMembership, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory } from '../server/db.js';
+import { readState, getMembership, listMembers, listPushSubscriptions, deletePushSubscription, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory } from '../server/db.js';
 import { backupsConfigured, encryptBackup, decryptBackup } from '../server/backupCrypto.js';
 import { configured as offSiteConfigured, uploadBackupCopy, downloadBackupCopy, deleteBackupCopy } from '../server/backupBlobStore.js';
 import { stateSchema, backupSchema } from '../shared/schema.js';
 import { beginRequest, logFailure, logIssue, metricsRetentionDays, readinessRetentionDays, observe } from '../server/observability.js';
 import { computeReadiness } from '../shared/readiness.js';
 import { todayLocal } from '../shared/reminders.js';
+import { appUrl, backupFailureEmail, emailConfigured, sendEmail } from '../server/email.js';
+import { broadcast, pushConfigured } from '../server/push.js';
+import { dailyDigest } from '../shared/digest.js';
 
 const retainCount = 30;
 
@@ -16,10 +19,23 @@ function isCronRequest(req) {
   return Boolean(secret) && req.headers.authorization === `Bearer ${secret}`;
 }
 
+// Tells every owner that the daily backup failed, so a silent failure doesn't wait for someone to
+// open Household settings. Best effort: a failed notice never changes the cron's own result.
+async function notifyOwnersOfFailure(request, req, repository, mailer) {
+  if (!mailer.configured() || !repository.listMembers) return;
+  try {
+    const owners = (await repository.listMembers()).filter(member => member.role === 'owner');
+    const message = backupFailureEmail({url: appUrl(req)});
+    await Promise.all(owners.map(owner => mailer.send({to: owner.email, ...message})));
+  } catch (error) { logIssue(request, '/api/backup', 'backup_failure_email_failure', error); }
+}
+
 export function createHandler(
-  repository = {readState, getMembership, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory},
+  repository = {readState, getMembership, listMembers, listPushSubscriptions, deletePushSubscription, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory},
   authenticate = validSession,
   offSite = {configured: offSiteConfigured, upload: uploadBackupCopy, download: downloadBackupCopy, remove: deleteBackupCopy},
+  mailer = {configured: emailConfigured, send: sendEmail},
+  push = {configured: pushConfigured, broadcast},
 ) {
   return async function handler(req, res) {
     const request = beginRequest(req, res);
@@ -73,9 +89,25 @@ export function createHandler(
           });
           await repository.pruneReadinessHistory(readinessRetentionDays());
         } catch (error) { readinessRecorded = false; logIssue(request, '/api/backup', 'readiness_snapshot_failure', error); }
-        return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length, metricsPruned, readinessRecorded, offSiteStatus});
+        // And it sends the daily push digest (counts only, see shared/digest.js), for the same
+        // one-cron reason. Like the snapshot, it can never fail the backup.
+        let pushDigest = 'skipped';
+        if (push.configured()) {
+          try {
+            const {notification} = dailyDigest(state);
+            if (!notification) pushDigest = 'nothing_due';
+            else {
+              const subscriptions = await repository.listPushSubscriptions();
+              pushDigest = await push.broadcast(subscriptions, notification, {
+                remove: id => repository.deletePushSubscription(id), onError: error => logIssue(request, '/api/backup', 'push_send_failure', error),
+              });
+            }
+          } catch (error) { pushDigest = 'failed'; logIssue(request, '/api/backup', 'push_digest_failure', error); }
+        }
+        return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length, metricsPruned, readinessRecorded, offSiteStatus, pushDigest});
       } catch (error) {
         logFailure(request, '/api/backup', 500, error);
+        await notifyOwnersOfFailure(request, req, repository, mailer);
         return res.status(500).json({status: 'failed', error: error.message});
       }
     }

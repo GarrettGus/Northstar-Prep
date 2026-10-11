@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { readFileSync } from 'node:fs';
 
 export const port = Number(process.env.NORTHSTAR_E2E_PORT) || 5183;
+export const stubPort = port + 1;
 export const baseURL = `http://127.0.0.1:${port}`;
 export const stateDir = join(tmpdir(), 'northstar-e2e');
 export const statePath = join(stateDir, 'environment.json');

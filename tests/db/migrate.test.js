@@ -49,10 +49,10 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       const rows = await query(database.url, `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`);
       const tables = rows.map(row => row.tablename).sort();
       assert.deepEqual(tables, [
-        'northstar_alert_state', 'northstar_appliances', 'northstar_audit_log', 'northstar_backups',
-        'northstar_checklist_checks', 'northstar_consumption_events', 'northstar_contacts', 'northstar_family_members', 'northstar_household',
+        'northstar_activation', 'northstar_alert_state', 'northstar_appliances', 'northstar_audit_log', 'northstar_backups',
+        'northstar_checkins', 'northstar_checklist_checks', 'northstar_consumption_events', 'northstar_contacts', 'northstar_family_members', 'northstar_household',
         'northstar_household_members', 'northstar_inventory', 'northstar_invitations', 'northstar_kits', 'northstar_login_limits',
-        'northstar_medications', 'northstar_password_resets', 'northstar_plan', 'northstar_readiness_history', 'northstar_reminder_history', 'northstar_reminders',
+        'northstar_medications', 'northstar_password_resets', 'northstar_plan', 'northstar_push_subscriptions', 'northstar_readiness_history', 'northstar_reminder_history', 'northstar_reminders',
         'northstar_request_metrics', 'northstar_settings', 'northstar_shopping_items', 'northstar_users',
       ]);
     });
@@ -115,7 +115,7 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
     it('saves and reads back kits, medications, and an item with a storage location and kit assignment', async () => {
       const db = await loadDb(database.url);
       const {data, version} = await db.readState();
-      const kit = {id: 'kit-1', name: 'Go-bag', purpose: 'Evacuation', targetContents: [{name: 'Flashlight', quantity: 1, unit: 'units'}]};
+      const kit = {id: 'kit-1', name: 'Go-bag', purpose: 'Evacuation', targetContents: [{name: 'Flashlight', quantity: 1, unit: 'units'}], assignedTo: 'Alex'};
       const medication = {id: 'med-1', person: 'Alex', name: 'Lisinopril', dose: '10mg', quantityOnHand: 30, refillDate: '2026-10-01', prescriber: 'Dr. Lee', notes: ''};
       const item = {id: 'flashlight-1', name: 'Flashlight', quantity: 1, unit: 'units', category: 'Gear',
         caloriesPerUnit: 0, hoursPerUnit: 0, capacityPerUnit: 0, price: 0, gallonsPerUnit: 0, target: 0, store: '', emoji: '', image: '',
@@ -200,6 +200,51 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       await db.pruneReadinessHistory(1);
       assert.deepEqual(await db.listReadinessHistory(), []);
     });
+
+    it('round-trips a plan\'s location, hazards and links', async () => {
+      const db = await loadDb(database.url);
+      const {data, version} = await db.readState();
+      const plan = {shelterSpot: 'Basement', family: [], contacts: [], meetingPoints: {primary: '', secondary: ''},
+        location: {label: 'Home', latitude: 44.98, longitude: -93.27}, hazards: ['flood', 'winter-storm'], links: [{title: 'Roads', url: 'https://511mn.org'}]};
+      await db.compareAndSave(version, {...data, plan}, data);
+      const after = await db.readState();
+      assert.deepEqual(after.data.plan, plan);
+      assert.deepEqual(await db.readPlanLocation(), {latitude: 44.98, longitude: -93.27});
+      await db.compareAndSave(after.version, {...after.data, plan: {...plan, location: {label: '', latitude: '', longitude: ''}}}, after.data);
+      assert.equal(await db.readPlanLocation(), null);
+    });
+
+    it('stores push subscriptions per member, filters by member, and stops listing a removed member', async () => {
+      const db = await loadDb(database.url);
+      const owner = await db.createUserWithMembership({email: 'push-owner@example.com', passwordHash: 'x', role: 'owner'});
+      const member = await db.createUserWithMembership({email: 'push-member@example.com', passwordHash: 'x', role: 'member'});
+      await db.savePushSubscription({id: 'sub-owner', userId: owner, endpoint: 'https://push.example/o', p256dh: 'k', auth: 'a'});
+      await db.savePushSubscription({id: 'sub-member', userId: member, endpoint: 'https://push.example/m', p256dh: 'k', auth: 'a'});
+      // Re-subscribing the same browser updates its row.
+      await db.savePushSubscription({id: 'sub-member', userId: member, endpoint: 'https://push.example/m', p256dh: 'k2', auth: 'a2'});
+      const ids = rows => rows.map(row => row.id).sort();
+      assert.deepEqual(ids(await db.listPushSubscriptions()), ['sub-member', 'sub-owner']);
+      assert.deepEqual(ids(await db.listPushSubscriptions(1, {userId: owner})), ['sub-owner']);
+      assert.deepEqual(ids(await db.listPushSubscriptions(1, {excludeUserId: owner})), ['sub-member']);
+      assert.equal((await db.listPushSubscriptions(1, {userId: member}))[0].p256dh, 'k2');
+      await db.deletePushSubscription('sub-owner', member);
+      assert.equal((await db.listPushSubscriptions()).length, 2, 'another user cannot delete it');
+      await db.removeMember(member);
+      assert.deepEqual(ids(await db.listPushSubscriptions()), ['sub-owner']);
+      await db.deletePushSubscription('sub-owner', owner);
+      assert.deepEqual(await db.listPushSubscriptions(), []);
+    });
+
+    it('carries the old hardcoded quick links over to an existing plan the first time links are added', async () => {
+      await query(database.url, 'ALTER TABLE northstar_plan DROP COLUMN links');
+      await migrate(database.url);
+      const [{links}] = await query(database.url, 'SELECT links FROM northstar_plan WHERE household_id = 1');
+      assert.deepEqual(links.map(link => link.title), ['MnDOT 511 Roads', 'NWS Twin Cities', 'Xcel Outage Map']);
+      // Re-running never re-seeds over the household's own edits.
+      await query(database.url, `UPDATE northstar_plan SET links = '[]'::jsonb`);
+      await migrate(database.url);
+      assert.deepEqual((await query(database.url, 'SELECT links FROM northstar_plan'))[0].links, []);
+    });
   });
 
   describe('re-running the migration', () => {
@@ -271,6 +316,8 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       assert.deepEqual(data.plan, {
         ...legacyState.plan,
         family: legacyState.plan.family.map(member => ({...member, kind: 'person', caloriesPerDay: '', waterGallonsPerDay: ''})),
+        // A blob predating hazard profiles has no location, hazards or links.
+        location: {label: '', latitude: '', longitude: ''}, hazards: [], links: [],
       });
       assert.deepEqual(data.settings, legacyState.settings);
       assert.deepEqual(data.reminders, [], 'a blob predating reminders must migrate to an empty collection');

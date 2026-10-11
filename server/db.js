@@ -12,6 +12,15 @@ export const householdId = 1;
 // readState() joins the tables back into the shape the rest of the app already expects;
 // compareAndSave() diffs the incoming state against what was last read and only writes the
 // rows that actually changed, inside one transaction guarded by the household's version.
+// One indexed lookup, so a polling client whose copy is already current can skip readState()'s
+// full fan-out of per-collection queries.
+export async function readVersion() {
+  const sql = database();
+  const rows = await sql`SELECT version FROM northstar_household WHERE id = ${householdId}`;
+  if (!rows.length) throw new Error('Run the database migration before using the app.');
+  return Number(rows[0].version);
+}
+
 export async function readState() {
   const sql = database();
   const [households, inventory, shoppingList, appliances, reminders, checklistChecks, kitRows, medications, planRows, familyRows, contactRows, settingsRows, consumption] = await Promise.all([
@@ -33,10 +42,11 @@ export async function readState() {
           last_completed_date AS "lastCompletedDate", snoozed_until AS "snoozedUntil"
         FROM northstar_reminders WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, completed_at AS "completedAt" FROM northstar_checklist_checks WHERE household_id = ${householdId}`,
-    sql`SELECT id, name, purpose, target_contents AS "targetContents" FROM northstar_kits WHERE household_id = ${householdId} ORDER BY seq`,
+    sql`SELECT id, name, purpose, target_contents AS "targetContents", assigned_to AS "assignedTo" FROM northstar_kits WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, person, name, dose, quantity_on_hand AS "quantityOnHand", refill_date AS "refillDate", prescriber, notes
         FROM northstar_medications WHERE household_id = ${householdId} ORDER BY seq`,
-    sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary"
+    sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary",
+          location_label AS "locationLabel", latitude, longitude, hazards, links
         FROM northstar_plan WHERE household_id = ${householdId}`,
     sql`SELECT name, role, dob, kind, calories_per_day AS "caloriesPerDay", water_gallons_per_day AS "waterGallonsPerDay"
         FROM northstar_family_members WHERE household_id = ${householdId} ORDER BY position`,
@@ -57,6 +67,9 @@ export async function readState() {
     family: familyRows,
     contacts: contactRows,
     meetingPoints: {primary: planRow.meetingPrimary, secondary: planRow.meetingSecondary},
+    location: {label: planRow.locationLabel, latitude: planRow.latitude, longitude: planRow.longitude},
+    hazards: planRow.hazards ?? [],
+    links: planRow.links ?? [],
   } : null;
   const kits = kitRows.map(row => ({...row, targetContents: row.targetContents ?? []}));
   const data = stateSchema.parse({inventory, shoppingList, appliances, reminders, checklistChecks, kits, medications, plan, consumption, settings: settingsRows[0]});
@@ -110,11 +123,11 @@ function upsertChecklistCheck(tx, check, guard) {
     ON CONFLICT (household_id, id) DO UPDATE SET completed_at = EXCLUDED.completed_at`;
 }
 function upsertKit(tx, kit, guard) {
-  return tx`INSERT INTO northstar_kits (household_id, id, name, purpose, target_contents)
-    SELECT ${householdId}, ${kit.id}, ${kit.name}, ${kit.purpose}, ${JSON.stringify(kit.targetContents)}::jsonb
+  return tx`INSERT INTO northstar_kits (household_id, id, name, purpose, target_contents, assigned_to)
+    SELECT ${householdId}, ${kit.id}, ${kit.name}, ${kit.purpose}, ${JSON.stringify(kit.targetContents)}::jsonb, ${kit.assignedTo ?? ''}
     WHERE ${guard}
     ON CONFLICT (household_id, id) DO UPDATE SET
-      name = EXCLUDED.name, purpose = EXCLUDED.purpose, target_contents = EXCLUDED.target_contents`;
+      name = EXCLUDED.name, purpose = EXCLUDED.purpose, target_contents = EXCLUDED.target_contents, assigned_to = EXCLUDED.assigned_to`;
 }
 function upsertMedication(tx, medication, guard) {
   return tx`INSERT INTO northstar_medications (household_id, id, person, name, dose, quantity_on_hand, refill_date, prescriber, notes)
@@ -184,10 +197,14 @@ export async function compareAndSave(version, next, current = emptyState()) {
         statements.push(tx`DELETE FROM northstar_family_members WHERE household_id = ${householdId} AND ${guard}`);
         statements.push(tx`DELETE FROM northstar_contacts WHERE household_id = ${householdId} AND ${guard}`);
       } else {
-        statements.push(tx`INSERT INTO northstar_plan (household_id, shelter_spot, meeting_primary, meeting_secondary)
-          SELECT ${householdId}, ${next.plan.shelterSpot}, ${next.plan.meetingPoints.primary}, ${next.plan.meetingPoints.secondary}
+        const location = next.plan.location ?? {label: '', latitude: '', longitude: ''};
+        const coordinate = value => value === '' || value === undefined ? null : value;
+        statements.push(tx`INSERT INTO northstar_plan (household_id, shelter_spot, meeting_primary, meeting_secondary, location_label, latitude, longitude, hazards, links)
+          SELECT ${householdId}, ${next.plan.shelterSpot}, ${next.plan.meetingPoints.primary}, ${next.plan.meetingPoints.secondary},
+            ${location.label}, ${coordinate(location.latitude)}, ${coordinate(location.longitude)}, ${JSON.stringify(next.plan.hazards ?? [])}::jsonb, ${JSON.stringify(next.plan.links ?? [])}::jsonb
           WHERE ${guard}
-          ON CONFLICT (household_id) DO UPDATE SET shelter_spot = EXCLUDED.shelter_spot, meeting_primary = EXCLUDED.meeting_primary, meeting_secondary = EXCLUDED.meeting_secondary`);
+          ON CONFLICT (household_id) DO UPDATE SET shelter_spot = EXCLUDED.shelter_spot, meeting_primary = EXCLUDED.meeting_primary, meeting_secondary = EXCLUDED.meeting_secondary,
+            location_label = EXCLUDED.location_label, latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude, hazards = EXCLUDED.hazards, links = EXCLUDED.links`);
         statements.push(tx`DELETE FROM northstar_family_members WHERE household_id = ${householdId} AND ${guard}`);
         for (let position = 0; position < next.plan.family.length; position++) {
           const member = next.plan.family[position];
@@ -473,4 +490,72 @@ export async function claimAlert(key, cooldownMinutes = 60) {
     WHERE northstar_alert_state.last_sent_at < now() - make_interval(mins => ${Math.round(cooldownMinutes)})
     RETURNING key`;
   return Boolean(rows[0]);
+}
+
+// --- Plan activation ("Go time") and member check-ins. ---
+export async function getActivation(householdId = 1) {
+  const sql = database();
+  const rows = await sql`SELECT a.mode, a.note, a.started_at AS "startedAt", u.email AS "startedBy"
+    FROM northstar_activation a LEFT JOIN northstar_users u ON u.id = a.started_by
+    WHERE a.household_id = ${householdId}`;
+  return rows[0] ?? null;
+}
+// Starting (or switching) an activation clears earlier check-ins so a "safe" from last month's
+// event is never read as a status for this one.
+export async function startActivation({householdId = 1, mode, note, userId}) {
+  const sql = database();
+  await sql.transaction(tx => [
+    tx`DELETE FROM northstar_checkins WHERE household_id = ${householdId}`,
+    tx`INSERT INTO northstar_activation (household_id, mode, note, started_by, started_at)
+      VALUES (${householdId}, ${mode}, ${note}, ${userId}, now())
+      ON CONFLICT (household_id) DO UPDATE SET mode = EXCLUDED.mode, note = EXCLUDED.note, started_by = EXCLUDED.started_by, started_at = now()`,
+  ]);
+}
+export async function endActivation(householdId = 1) {
+  const sql = database();
+  const rows = await sql`DELETE FROM northstar_activation WHERE household_id = ${householdId} RETURNING mode`;
+  return Boolean(rows[0]);
+}
+export async function upsertCheckin({householdId = 1, userId, status, note}) {
+  const sql = database();
+  await sql`INSERT INTO northstar_checkins (household_id, user_id, status, note, updated_at)
+    VALUES (${householdId}, ${userId}, ${status}, ${note}, now())
+    ON CONFLICT (household_id, user_id) DO UPDATE SET status = EXCLUDED.status, note = EXCLUDED.note, updated_at = now()`;
+}
+export async function listCheckins(householdId = 1) {
+  const sql = database();
+  return sql`SELECT c.user_id AS "userId", u.email, c.status, c.note, c.updated_at AS "updatedAt"
+    FROM northstar_checkins c JOIN northstar_users u ON u.id = c.user_id
+    WHERE c.household_id = ${householdId} ORDER BY c.updated_at DESC`;
+}
+
+// Just the plan's coordinates, for the weather alert lookup; null until a location is set.
+export async function readPlanLocation(householdId = 1) {
+  const sql = database();
+  const rows = await sql`SELECT latitude, longitude FROM northstar_plan WHERE household_id = ${householdId} AND latitude IS NOT NULL AND longitude IS NOT NULL`;
+  return rows[0] ? {latitude: Number(rows[0].latitude), longitude: Number(rows[0].longitude)} : null;
+}
+
+// --- Web Push subscriptions. ---
+export async function savePushSubscription({householdId = 1, id, userId, endpoint, p256dh, auth}) {
+  const sql = database();
+  // Re-subscribing a browser (or the same browser after another member signs in) takes the row over.
+  await sql`INSERT INTO northstar_push_subscriptions (id, household_id, user_id, endpoint, p256dh, auth)
+    VALUES (${id}, ${householdId}, ${userId}, ${endpoint}, ${p256dh}, ${auth})
+    ON CONFLICT (id) DO UPDATE SET household_id = EXCLUDED.household_id, user_id = EXCLUDED.user_id, endpoint = EXCLUDED.endpoint, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth`;
+}
+export async function deletePushSubscription(id, userId = null) {
+  const sql = database();
+  if (userId) await sql`DELETE FROM northstar_push_subscriptions WHERE id = ${id} AND user_id = ${userId}`;
+  else await sql`DELETE FROM northstar_push_subscriptions WHERE id = ${id}`;
+}
+// Only subscriptions whose user is still a household member: removing someone stops their pushes.
+export async function listPushSubscriptions(householdId = 1, {userId = null, excludeUserId = null} = {}) {
+  const sql = database();
+  return sql`SELECT s.id, s.user_id AS "userId", s.endpoint, s.p256dh, s.auth
+    FROM northstar_push_subscriptions s
+    JOIN northstar_household_members m ON m.user_id = s.user_id AND m.household_id = s.household_id
+    WHERE s.household_id = ${householdId}
+      AND (${userId}::uuid IS NULL OR s.user_id = ${userId}::uuid)
+      AND (${excludeUserId}::uuid IS NULL OR s.user_id <> ${excludeUserId}::uuid)`;
 }

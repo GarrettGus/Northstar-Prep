@@ -41,8 +41,11 @@ test('signing in opens the household, survives a reload, and can be signed out a
   await expect(page.getByRole('button', {name: 'Open household settings'})).toBeVisible();
 
   await page.getByRole('button', {name: 'Open household settings'}).click();
+  // The household was cached on this device while signed in; signing out must remove it.
+  expect(await page.evaluate(() => localStorage.getItem('northstar-state-cache-v1'))).not.toBeNull();
   await page.getByRole('button', {name: 'Sign out'}).click();
   await expect(page.getByRole('button', {name: 'Sign in'})).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem('northstar-state-cache-v1'))).toBeNull();
 
   await page.reload();
   await expect(page.getByRole('button', {name: 'Sign in'})).toBeVisible();

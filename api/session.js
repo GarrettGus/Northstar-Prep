@@ -1,5 +1,6 @@
 import { configured, cookie, hashPassword, loginKey, randomToken, sameOrigin, token, validSession, verifyPassword } from '../server/auth.js';
 import { findUserByEmail, getMembership, rateLimit } from '../server/db.js';
+import { emailConfigured } from '../server/email.js';
 import { emailSchema } from '../shared/schema.js';
 import { beginRequest, logFailure, observe } from '../server/observability.js';
 
@@ -13,10 +14,10 @@ export function createHandler(repository = {rateLimit, findUserByEmail, getMembe
     res.setHeader('Cache-Control', 'no-store');
     if (req.method === 'GET') {
       const session = validSession(req);
-      if (!session) return res.status(200).json({authenticated: false, configured: configured()});
+      if (!session) return res.status(200).json({authenticated: false, configured: configured(), emailEnabled: emailConfigured()});
       try {
         const membership = await repository.getMembership(session.userId);
-        if (!membership) return res.status(200).json({authenticated: false, configured: configured()});
+        if (!membership) return res.status(200).json({authenticated: false, configured: configured(), emailEnabled: emailConfigured()});
         return res.status(200).json({authenticated: true, configured: configured(), user: {id: session.userId, role: membership.role}});
       } catch (error) { logFailure(request, '/api/session', 503, error); return res.status(503).json({error: 'Account lookup unavailable.'}); }
     }

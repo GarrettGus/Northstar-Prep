@@ -12,11 +12,15 @@ import { computeReadiness, computeReadinessGaps, consumptionForecast, isExpired,
 import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
 import { backupToCsv, csvToBackupPreview } from '../shared/csv.js';
 import { simulateOutage, appliancePriorities, appliancePriorityLabels } from '../shared/outage.js';
-import { supplyTemplateCatalog, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
+import { supplyTemplatesFor, templateToBackup, findSupplyTemplate } from '../shared/supplyTemplates.js';
 import { effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, todayLocal, addDaysISO } from '../shared/reminders.js';
-import { checklistCatalog } from '../shared/checklists.js';
+import { checklistsFor } from '../shared/checklists.js';
+import { roundCoordinate } from '../shared/hazards.js';
 import { kitCompleteness } from '../shared/kits.js';
-import { enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
+import { GoTime, GoTimeBanner } from './GoTime.jsx';
+import { currentSubscription, pushSupported, subscribe as subscribePush, unsubscribe as unsubscribePush } from './push.js';
+import { HazardProfileSection, WeatherAlerts } from './Hazards.jsx';
+import { clearDeviceData, loadPendingCheckin, savePendingCheckin, enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
 
 // --- Constants ---
 const SYSTEM_ID = 'Household';
@@ -27,6 +31,7 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [configured, setConfigured] = useState(true);
+  const [emailEnabled, setEmailEnabled] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [inventory, setInventory] = useState([]);
   const [shoppingList, setShoppingList] = useState([]);
@@ -41,6 +46,10 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [showSyncModal, setShowSyncModal] = useState(false);
   const [showBinder, setShowBinder] = useState(false);
+  const [showGo, setShowGo] = useState(false);
+  const [go, setGo] = useState(null);
+  const [pendingCheckin, setPendingCheckin] = useState(() => loadPendingCheckin());
+  const [weather, setWeather] = useState(null);
   const [outage, setOutage] = useState(null);
   const [globalError, setGlobalError] = useState(null);
   const [settings, setSettings] = useState(() => settingsSchema.parse({}));
@@ -70,8 +79,17 @@ export default function App() {
     window.addEventListener('offline', handleOffline);
     return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
   }, []);
+  // Notifications deep-link with ?tab=<tab> or ?go=1; read once signed in, then tidy the URL.
   useEffect(() => {
-    request('session').then(value => { setUser(value.authenticated ? value.user : null); setConfigured(value.configured); })
+    if (!user) return;
+    const params = new URLSearchParams(window.location.search);
+    const tab = params.get('tab');
+    if (['dashboard','inventory','shopping','power','plan'].includes(tab)) setActiveTab(tab);
+    if (params.get('go') === '1') setShowGo(true);
+    if (tab || params.get('go')) window.history.replaceState(null, '', window.location.pathname);
+  }, [user]);
+  useEffect(() => {
+    request('session').then(value => { setUser(value.authenticated ? value.user : null); setConfigured(value.configured); setEmailEnabled(Boolean(value.emailEnabled)); })
       .catch(error=>setGlobalError(error.message)).finally(()=>setAuthReady(true));
   }, []);
   useEffect(() => {
@@ -81,7 +99,13 @@ export default function App() {
     const refresh = async () => {
       if (running || busy.current) return;
       running = true;
-      try { const state = await request('hub'); if (!cancelled) {accept(state); setPendingSync(loadQueuedActions().length); setGlobalError(null);} }
+      try {
+        const state = await request(revision.current >= 0 ? `hub?since=${revision.current}` : 'hub');
+        if (!cancelled) {
+          if (state.unchanged) setLastSyncedAt(Date.now()); else accept(state);
+          setPendingSync(loadQueuedActions().length); setGlobalError(null);
+        }
+      }
       catch(error) {
         if (!cancelled && !error.status) {
           const cached = loadCachedState();
@@ -115,6 +139,45 @@ export default function App() {
     flush();
     return () => { cancelled = true; };
   }, [user, online]);
+  // Plan activation and check-ins: polled at the household cadence while an event is active or
+  // the Go time screen is open, and every minute otherwise so an activation by another member
+  // still surfaces on the Dashboard. A check-in made offline is sent once the connection returns.
+  const goActive = Boolean(go?.activation);
+  useEffect(() => {
+    if (!user || !online) return;
+    let cancelled = false;
+    const refreshGo = async () => {
+      try {
+        const queued = loadPendingCheckin();
+        const result = queued ? await request('go', {type:'checkin', ...queued}) : await request('go');
+        if (queued) { savePendingCheckin(null); if (!cancelled) setPendingCheckin(null); }
+        if (!cancelled) setGo(result);
+      } catch (error) { if (!cancelled && error.status === 401) setUser(null); }
+    };
+    refreshGo();
+    const timer = setInterval(refreshGo, goActive || showGo ? 15000 : 60000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [user, online, goActive, showGo]);
+  // NWS alerts for the plan's saved location, refreshed every ten minutes (the server caches them).
+  const locationKey = plan?.location?.latitude !== '' && plan?.location?.latitude !== undefined ? `${plan.location.latitude},${plan.location.longitude}` : '';
+  useEffect(() => {
+    if (!user || !online) return;
+    if (!locationKey) { setWeather(null); return; }
+    let cancelled = false;
+    const load = () => request('alerts').then(result => { if (!cancelled) setWeather(result); }).catch(() => {});
+    load();
+    const timer = setInterval(load, 600000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [user, online, locationKey]);
+  const goAction = async body => {
+    try { setGo(await request('go', body)); setGlobalError(null); return true; }
+    catch (error) { setGlobalError(error.message); if (error.status === 401) setUser(null); return false; }
+  };
+  const handleCheckin = async (status, note) => {
+    if (!online) { const checkin = {status, note}; savePendingCheckin(checkin); setPendingCheckin(checkin); return true; }
+    return goAction({type:'checkin', status, note});
+  };
+
   const queueOffline = action => {
     try {
       const next = applyAction({inventory, shoppingList, appliances, reminders, checklistChecks, kits, medications, plan, consumption, settings}, action);
@@ -137,7 +200,10 @@ export default function App() {
     finally {busy.current=false;setIsSyncing(false);}
   };
   const logout = async () => {
-    try {await request('session',{},'DELETE');epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    const queued = loadQueuedActions().length;
+    if (queued && !window.confirm(`${queued} change${queued === 1 ? ' has' : 's have'} not synced yet and will be discarded from this device if you sign out. Sign out anyway?`)) return;
+    await unsubscribePush();
+    try {await request('session',{},'DELETE');await clearDeviceData();setPendingSync(0);setLastSyncedAt(null);epoch.current++;setUser(null);setGo(null);setWeather(null);setShowGo(false);setPendingCheckin(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
@@ -175,7 +241,7 @@ export default function App() {
   // Starter templates go through the same non-destructive preview as a JSON backup, so nothing
   // is written until it is confirmed and existing rows merge by ID rather than being replaced.
   const previewTemplate = (templateId) => {
-    const template = findSupplyTemplate(templateId);
+    const template = findSupplyTemplate(templateId, plan);
     if (!template) return;
     try {
       setPendingImport(normalizeBackup(templateToBackup(template, settings), () => crypto.randomUUID()));
@@ -260,9 +326,11 @@ export default function App() {
     if (inviteToken) return <AcceptInvite token={inviteToken} onJoined={handleAuthenticated} />;
     const resetToken = params.get('reset');
     if (resetToken) return <ResetPassword token={resetToken} onReset={handleAuthenticated} />;
-    return <Login configured={configured} error={globalError} onLogin={handleAuthenticated} />;
+    return <Login configured={configured} emailEnabled={emailEnabled} error={globalError} onLogin={handleAuthenticated} />;
   }
   if (loading && !inventory.length && !globalError) return <LoadingScreen />;
+  if (showGo) return <GoTime go={go} online={online} plan={plan} kits={kits} inventory={inventory} medications={medications} appliances={appliances} stats={stats} settings={settings} pendingCheckin={pendingCheckin}
+    onActivate={(mode, note) => goAction({type:'activate', mode, note})} onStandDown={() => goAction({type:'stand_down'})} onCheckin={handleCheckin} onClose={() => setShowGo(false)} />;
   if (showBinder) return <EmergencyBinder plan={plan} inventory={inventory} stats={stats} settings={settings} checklistChecks={checklistChecks} medications={medications} onClose={() => setShowBinder(false)} />;
 
   return (
@@ -272,6 +340,8 @@ export default function App() {
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
+        {(activeTab === 'dashboard' || goActive) && <div className="mb-6"><GoTimeBanner activation={go?.activation} checkins={go?.checkins} members={go?.members} onOpen={() => setShowGo(true)} /></div>}
+        {activeTab === 'dashboard' && weather?.alerts?.length > 0 && <WeatherAlerts alerts={weather.alerts} area={weather.area} />}
         {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} refillDueMedications={refillDueMedications} onViewReminders={() => setActiveTab('plan')} onViewRotation={() => setActiveTab('inventory')} />}
         {activeTab === 'inventory' && (
           <InventoryManager
@@ -282,6 +352,7 @@ export default function App() {
             stats={stats}
             settings={settings}
             kits={kits}
+            family={plan?.family || []}
             onAdd={(i) => handleAdd('inventory', i)}
             onUpdate={(id, i) => handleUpdate('inventory', id, i)}
             onDelete={(id) => handleDelete('inventory', id)}
@@ -322,7 +393,7 @@ export default function App() {
         )}
         {activeTab === 'plan' && (
           <EmergencyPlan
-            plan={plan} onUpdate={(plan) => mutate({type:'plan',plan})} onRunSimulation={runOutageSimulation} settings={settings}
+            plan={plan} weather={weather} onUpdate={(plan) => mutate({type:'plan',plan})} onRunSimulation={runOutageSimulation} settings={settings}
             onOpenBinder={() => setShowBinder(true)}
             reminders={reminders} checklistChecks={checklistChecks} medications={medications}
             onAddReminder={(i) => handleAdd('reminders', i)}
@@ -340,7 +411,7 @@ export default function App() {
 
       <NavBar activeTab={activeTab} setActiveTab={setActiveTab} />
 
-      {showSyncModal && <SyncModal onClose={() => { cancelImport(); setShowSyncModal(false); }} onImport={handleFileUpload} onImportCsv={handleCsvUpload} onDownloadCsv={downloadCsv} pendingImport={pendingImport} pendingImportSource={pendingImportSource} onConfirmImport={confirmImport} onCancelImport={cancelImport} onApplyTemplate={previewTemplate} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
+      {showSyncModal && <SyncModal onClose={() => { cancelImport(); setShowSyncModal(false); }} onImport={handleFileUpload} onImportCsv={handleCsvUpload} onDownloadCsv={downloadCsv} pendingImport={pendingImport} pendingImportSource={pendingImportSource} onConfirmImport={confirmImport} onCancelImport={cancelImport} onApplyTemplate={previewTemplate} onRestoreBackup={restoreFromBackup} onLogout={logout} settings={settings} onUpdateSettings={handleUpdateSettings} currentUserId={user.id} plan={plan} onOpenBinder={() => { setShowSyncModal(false); setShowBinder(true); }} />}
       {outage && <OutageSimulationModal result={outage} settings={settings} onClose={() => setOutage(null)} />}
     </div>
   );
@@ -645,7 +716,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
 }
 
 // --- Inventory Manager (Reused for Shop) ---
-function InventoryManager({ title, items, shoppingList = [], consumption = [], stats, settings, kits = [], onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onConsume, onDeleteConsumption, onBuy, isShoppingMode, onAddKit, onUpdateKit, onDeleteKit }) {
+function InventoryManager({ title, items, shoppingList = [], consumption = [], stats, settings, kits = [], onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onConsume, onDeleteConsumption, onBuy, isShoppingMode, onAddKit, onUpdateKit, onDeleteKit, family = [] }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
   const [sortBy, setSortBy] = useState(''); // 'expiry', 'calories', 'date'
@@ -975,7 +1046,7 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
         </div>
       )}
 
-      {!isShoppingMode && <KitsSection kits={kits} inventory={items} onAdd={onAddKit} onUpdate={onUpdateKit} onDelete={onDeleteKit} />}
+      {!isShoppingMode && <KitsSection kits={kits} inventory={items} family={family} onAdd={onAddKit} onUpdate={onUpdateKit} onDelete={onDeleteKit} />}
 
       {isShoppingMode && (
          <div className="bg-emerald-50 border border-emerald-100 rounded-[2.5rem] p-5 shadow-sm flex items-center justify-between mb-6">
@@ -1020,9 +1091,10 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
 }
 
 // --- Storage kits (go-bag, basement, vehicle, ...) ---
-const emptyKitForm = () => ({ name: '', purpose: '', targetContents: [] });
+const emptyKitForm = () => ({ name: '', purpose: '', assignedTo: '', targetContents: [] });
 
-function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
+function KitsSection({ kits, inventory, family = [], onAdd, onUpdate, onDelete }) {
+  const memberNames = family.map(member => member.name).filter(name => name && name.trim());
   const [showAdd, setShowAdd] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState(emptyKitForm);
@@ -1035,7 +1107,7 @@ function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
   const submit = async (e) => {
     e.preventDefault();
     const data = {
-      name: form.name, purpose: form.purpose,
+      name: form.name, purpose: form.purpose, assignedTo: form.assignedTo,
       targetContents: form.targetContents.filter(row => String(row.name || '').trim()).map(row => ({ name: row.name.trim(), quantity: Number(row.quantity) || 0, unit: row.unit || 'units' })),
     };
     if (editingId) { if (!await onUpdate(editingId, data)) return; }
@@ -1043,7 +1115,7 @@ function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
     reset();
   };
   const handleEdit = (kit) => {
-    setForm({ name: kit.name, purpose: kit.purpose, targetContents: kit.targetContents.map(row => ({...row})) });
+    setForm({ name: kit.name, purpose: kit.purpose, assignedTo: kit.assignedTo || '', targetContents: kit.targetContents.map(row => ({...row})) });
     setEditingId(kit.id);
     setShowAdd(true);
   };
@@ -1065,6 +1137,13 @@ function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
           </div>
           <div><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Go-bag — Dad" /></div>
           <div><Label>Purpose (optional)</Label><Input val={form.purpose} set={v => setForm({...form, purpose: v})} placeholder="e.g. Grab-and-go bag for evacuation" /></div>
+          <div>
+            <Label>Belongs to</Label>
+            <select aria-label="Kit belongs to" value={form.assignedTo} onChange={e => setForm({...form, assignedTo: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold text-slate-700">
+              <option value="">Shared (whole household)</option>
+              {[...new Set([...memberNames, ...(form.assignedTo && !memberNames.includes(form.assignedTo) ? [form.assignedTo] : [])])].map(name => <option key={name} value={name}>{name}</option>)}
+            </select>
+          </div>
           <div>
             <Label>Target contents</Label>
             <div className="space-y-2">
@@ -1093,7 +1172,7 @@ function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
               <div className="flex justify-between items-center gap-3">
                 <div className="min-w-0">
                   <div className="font-black text-slate-800 text-sm truncate">{kit.name}</div>
-                  {kit.purpose && <div className="text-[10px] text-slate-500 truncate">{kit.purpose}</div>}
+                  {(kit.assignedTo || kit.purpose) && <div className="text-[10px] text-slate-500 truncate">{[kit.assignedTo && `For ${kit.assignedTo}`, kit.purpose].filter(Boolean).join(' · ')}</div>}
                 </div>
                 <div className={`text-[10px] font-black uppercase shrink-0 ${ready ? 'text-emerald-600' : 'text-amber-600'}`}>
                   {completeness.totalCount > 0 ? `${completeness.metCount}/${completeness.totalCount} packed` : `${completeness.assignedCount} item${completeness.assignedCount === 1 ? '' : 's'}`}
@@ -1225,15 +1304,21 @@ function ContactsSection({ contacts, isEditing, onChange }) {
   );
 }
 
-function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder, reminders = [], checklistChecks = [], medications = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem, onAddMedication, onUpdateMedication, onDeleteMedication }) {
+function EmergencyPlan({ plan, weather = null, onUpdate, onRunSimulation, settings, onOpenBinder, reminders = [], checklistChecks = [], medications = [], onAddReminder, onUpdateReminder, onDeleteReminder, onCompleteReminder, onSnoozeReminder, onToggleChecklistItem, onAddMedication, onUpdateMedication, onDeleteMedication }) {
   const [isEditing, setIsEditing] = useState(false);
   const [spot, setSpot] = useState(plan?.shelterSpot || '');
   const [family, setFamily] = useState(plan?.family || []);
   const [contacts, setContacts] = useState(plan?.contacts || []);
   const [meetingPrimary, setMeetingPrimary] = useState(plan?.meetingPoints?.primary || '');
   const [meetingSecondary, setMeetingSecondary] = useState(plan?.meetingPoints?.secondary || '');
+  const [location, setLocation] = useState(plan?.location || {label: '', latitude: '', longitude: ''});
+  const [hazards, setHazards] = useState(plan?.hazards || []);
+  const [links, setLinks] = useState(plan?.links || []);
   const [saveError, setSaveError] = useState(null);
   const resetFromPlan = () => {
+    setLocation(plan?.location || {label: '', latitude: '', longitude: ''});
+    setHazards(plan?.hazards || []);
+    setLinks(plan?.links || []);
     setSpot(plan?.shelterSpot || '');
     setFamily(plan?.family || []);
     setContacts(plan?.contacts || []);
@@ -1260,6 +1345,10 @@ function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder
     // (e.g. "Add member" clicked but never filled in) is safe to discard without telling anyone.
     if (cleanedFamily.some(m => !m.name && (m.role || m.dob))) { setSaveError('Give each household member a name, or remove the empty row, before saving.'); return; }
     if (cleanedContacts.some(c => !c.name && !c.phone && c.type)) { setSaveError('Give each contact a name or phone number, or remove the empty row, before saving.'); return; }
+    const cleanedLinks = links.map(l => ({title: (l.title || '').trim(), url: (l.url || '').trim()})).filter(l => l.title || l.url);
+    if (cleanedLinks.some(l => !l.title || !/^https?:\/\/\S+$/i.test(l.url))) { setSaveError('Give each link a title and a web address starting with https://, or remove it, before saving.'); return; }
+    const lat = String(location.latitude ?? '').trim(), lon = String(location.longitude ?? '').trim();
+    if ((lat === '') !== (lon === '') || (lat !== '' && (!(Math.abs(Number(lat)) <= 90) || !(Math.abs(Number(lon)) <= 180)))) { setSaveError('Enter both latitude and longitude (or neither), e.g. 44.98 and -93.27.'); return; }
     try {
       const ok = await onUpdate({
         ...plan,
@@ -1267,6 +1356,9 @@ function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder
         family: cleanedFamily.filter(m => m.name || m.role || m.dob || m.caloriesPerDay !== '' || m.waterGallonsPerDay !== ''),
         contacts: cleanedContacts.filter(c => c.name || c.phone || c.type),
         meetingPoints: { primary: meetingPrimary.trim(), secondary: meetingSecondary.trim() },
+        location: { label: (location.label || '').trim(), latitude: lat === '' ? '' : roundCoordinate(lat), longitude: lon === '' ? '' : roundCoordinate(lon) },
+        hazards,
+        links: cleanedLinks,
       });
       if (!ok) { setSaveError('Could not save plan. Please retry.'); return; }
       setIsEditing(false);
@@ -1333,28 +1425,13 @@ function EmergencyPlan({ plan, onUpdate, onRunSimulation, settings, onOpenBinder
 
       <RemindersSection reminders={reminders} onAdd={onAddReminder} onUpdate={onUpdateReminder} onDelete={onDeleteReminder} onComplete={onCompleteReminder} onSnooze={onSnoozeReminder} />
       <MedicationsSection medications={medications} onAdd={onAddMedication} onUpdate={onUpdateMedication} onDelete={onDeleteMedication} />
-      <ChecklistsSection checklistChecks={checklistChecks} onToggle={onToggleChecklistItem} />
+      <ChecklistsSection checklists={checklistsFor(plan)} checklistChecks={checklistChecks} onToggle={onToggleChecklistItem} />
 
-      {/* Survival Sync Links Moved Here */}
-      <div className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm mt-6">
-        <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Survival Sync</h3>
-        <div className="grid gap-3">
-          {[
-            { title: "MnDOT 511 Roads", url: "https://511mn.org", icon: <Navigation size={20}/>, color: "bg-blue-50 text-blue-600" },
-            { title: "NWS Twin Cities", url: "https://www.weather.gov/mpx/", icon: <Wind size={20}/>, color: "bg-orange-50 text-orange-600" },
-            { title: "Xcel Outage Map", url: "https://www.outagemap-xcelenergy.com", icon: <AlertTriangle size={20}/>, color: "bg-red-50 text-red-600" }
-          ].map((link, i) => (
-            <a key={i} href={link.url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-5 p-4 rounded-2xl hover:bg-slate-50 transition-colors group">
-              <div className={`p-3 rounded-xl ${link.color}`}>{link.icon}</div>
-              <div className="flex-1">
-                <div className="font-black text-sm text-slate-800">{link.title}</div>
-                <div className="text-[9px] text-slate-600 font-mono uppercase">{link.url.replace('https://', '')}</div>
-              </div>
-              <ChevronRight size={16} className="text-slate-300 group-hover:text-blue-500"/>
-            </a>
-          ))}
-        </div>
-      </div>
+      <HazardProfileSection
+        plan={plan} weather={weather} isEditing={isEditing}
+        location={location} hazards={hazards} links={links}
+        onLocationChange={setLocation} onHazardsChange={setHazards} onLinksChange={setLinks}
+      />
     </div>
   );
 }
@@ -1549,14 +1626,14 @@ function MedicationsSection({ medications, onAdd, onUpdate, onDelete }) {
 }
 
 // --- Seasonal Checklists ---
-function ChecklistsSection({ checklistChecks, onToggle }) {
+function ChecklistsSection({ checklists, checklistChecks, onToggle }) {
   const checkedIds = useMemo(() => new Set(checklistChecks.map(c => c.id)), [checklistChecks]);
   const [openSeason, setOpenSeason] = useState(null);
   return (
     <section className="bg-white p-7 rounded-[2.5rem] border border-slate-200 shadow-sm">
       <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4 flex items-center gap-2"><Layers size={14}/> Seasonal Checklists</h3>
       <div className="space-y-3">
-        {checklistCatalog.map(({season, label, items}) => {
+        {checklists.map(({season, label, items}) => {
           const doneCount = items.filter(item => checkedIds.has(`${season}__${item.id}`)).length;
           const open = openSeason === season;
           return (
@@ -1955,7 +2032,7 @@ export function EmergencyBinder({ plan, inventory = [], stats, settings, checkli
       <section className="break-inside-avoid">
         <h2 className="text-sm font-black uppercase tracking-widest border-b border-slate-300 pb-2 mb-3">Seasonal checklists</h2>
         <div className="space-y-4">
-          {checklistCatalog.map(season => (
+          {checklistsFor(plan).map(season => (
             <div key={season.season}>
               <h3 className="text-xs font-black uppercase text-slate-600 mb-1">{season.label}</h3>
               <ul className="text-sm space-y-0.5">
@@ -2110,6 +2187,7 @@ function MembersPanel({ currentUserId }) {
   const [error, setError] = useState(null);
   const [inviteForm, setInviteForm] = useState({ email: '', role: 'member' });
   const [inviteLink, setInviteLink] = useState(null);
+  const [invitedEmail, setInvitedEmail] = useState(null);
   const [resetLink, setResetLink] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -2121,6 +2199,7 @@ function MembersPanel({ currentUserId }) {
     try {
       const result = await request('members', { type: 'invite', email: inviteForm.email, role: inviteForm.role });
       setInviteLink(`${window.location.origin}${window.location.pathname}?invite=${result.token}`);
+      setInvitedEmail(result.emailed ? inviteForm.email : null);
       setInviteForm({ email: '', role: 'member' });
       await load();
     } catch (err) { setError(err.message); } finally { setBusy(false); }
@@ -2138,7 +2217,7 @@ function MembersPanel({ currentUserId }) {
     setError(null);
     try {
       const result = await request('members', { type: 'reset-link', userId });
-      setResetLink({ userId, url: `${window.location.origin}${window.location.pathname}?reset=${result.token}` });
+      setResetLink({ userId, url: `${window.location.origin}${window.location.pathname}?reset=${result.token}`, emailed: Boolean(result.emailed) });
     } catch (err) { setError(err.message); }
   };
   const copyLink = () => { if (inviteLink) navigator.clipboard?.writeText(inviteLink).catch(() => {}); };
@@ -2164,7 +2243,11 @@ function MembersPanel({ currentUserId }) {
       </ul>
       {resetLink && (
         <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 space-y-2 text-xs">
-          <p className="font-black text-blue-900">Send this password reset link to {data.members.find(m => m.user_id === resetLink.userId)?.email || 'the member'}:</p>
+          <p role="status" className="font-black text-blue-900">
+            {resetLink.emailed
+              ? <>Emailed a password reset link to {data.members.find(m => m.user_id === resetLink.userId)?.email || 'the member'}. You can also share it yourself:</>
+              : <>Send this password reset link to {data.members.find(m => m.user_id === resetLink.userId)?.email || 'the member'}:</>}
+          </p>
           <input readOnly value={resetLink.url} onFocus={e => e.target.select()} className="w-full bg-white rounded-lg p-2 text-[10px] font-mono border border-blue-200" />
           <button type="button" onClick={copyResetLink} className="rounded-lg bg-blue-600 text-white px-3 py-1.5 font-black">Copy link</button>
           <p className="text-blue-800">Expires in 1 hour and can only be used once.</p>
@@ -2177,11 +2260,12 @@ function MembersPanel({ currentUserId }) {
               <Input val={inviteForm.email} set={v => setInviteForm({...inviteForm, email: v})} type="email" placeholder="Invite by email" />
               <Select val={inviteForm.role} set={v => setInviteForm({...inviteForm, role: v})} opts={['member', 'owner']} />
             </div>
-            <button type="submit" disabled={busy || !inviteForm.email} className="w-full rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">Create invite link</button>
+            <button type="submit" disabled={busy || !inviteForm.email} className="w-full rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">{data.emailEnabled ? 'Send invitation' : 'Create invite link'}</button>
+            {!data.emailEnabled && <p className="text-[11px] text-slate-500">Email isn't set up, so you'll get a link to send yourself.</p>}
           </form>
           {inviteLink && (
             <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 space-y-2 text-xs">
-              <p className="font-black text-emerald-900">Send this link to the person you invited:</p>
+              <p role="status" className="font-black text-emerald-900">{invitedEmail ? `Invitation emailed to ${invitedEmail}. You can also share the link yourself:` : 'Send this link to the person you invited:'}</p>
               <input readOnly value={inviteLink} onFocus={e => e.target.select()} className="w-full bg-white rounded-lg p-2 text-[10px] font-mono border border-emerald-200" />
               <button type="button" onClick={copyLink} className="rounded-lg bg-emerald-600 text-white px-3 py-1.5 font-black">Copy link</button>
             </div>
@@ -2205,6 +2289,43 @@ function MembersPanel({ currentUserId }) {
 
 // Self-service password change for a signed-in user who still knows their current password.
 // A locked-out member instead needs a reset link from an owner (see MembersPanel).
+// Push notifications for this device: a daily digest of what needs attention, plus an alert when
+// the plan is activated or a member needs help. Per device, because each browser subscribes itself.
+function NotificationsPanel() {
+  const [server, setServer] = useState(null);
+  const [subscribed, setSubscribed] = useState(false);
+  const [message, setMessage] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const supported = pushSupported();
+  useEffect(() => {
+    request('push').then(setServer).catch(() => setServer({configured: false}));
+    currentSubscription().then(sub => setSubscribed(Boolean(sub))).catch(() => {});
+  }, []);
+  const run = async action => { setBusy(true); setMessage(null); setNotice(null); try { await action(); } catch (err) { setMessage(err.message); } finally { setBusy(false); } };
+  const turnOn = () => run(async () => { await subscribePush(server.publicKey); setSubscribed(true); setNotice('Notifications are on for this device.'); });
+  const turnOff = () => run(async () => { await unsubscribePush(); setSubscribed(false); setNotice('Notifications are off for this device.'); });
+  const sendTest = () => run(async () => { const result = await request('push', {type: 'test'}); setNotice(result.sent ? 'Test notification sent.' : 'No notification could be delivered to this device.'); });
+
+  return (
+    <div className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Notifications</h3>
+      <p className="text-xs text-slate-600">A daily summary of overdue reminders, refills, expiring supplies and restocks (counts only, never item names), and an alert when the plan is activated or someone needs help.</p>
+      {message && <p role="alert" className="text-xs font-bold text-red-600">{message}</p>}
+      {notice && <p role="status" className="text-xs font-bold text-emerald-700">{notice}</p>}
+      {!server ? <p className="text-xs text-slate-500">Checking…</p>
+        : !server.configured ? <p className="text-xs text-slate-500">Push notifications aren't set up for this household yet.</p>
+        : !supported ? <p className="text-xs text-slate-500">This browser can't receive push notifications. On iPhone, add NorthStar Prep to your Home Screen first.</p>
+        : subscribed ? (
+          <div className="grid grid-cols-2 gap-2">
+            <button type="button" disabled={busy} onClick={sendTest} className="rounded-xl p-3 bg-slate-100 text-slate-800 font-bold text-sm disabled:opacity-50">Send a test</button>
+            <button type="button" disabled={busy} onClick={turnOff} className="rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">Turn off</button>
+          </div>
+        ) : <button type="button" disabled={busy} onClick={turnOn} className="w-full rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">Turn on for this device</button>}
+    </div>
+  );
+}
+
 function ChangePasswordPanel() {
   const [form, setForm] = useState({ currentPassword: '', newPassword: '' });
   const [message, setMessage] = useState(null);
@@ -2252,7 +2373,7 @@ function ActivityPanel() {
   );
 }
 
-function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pendingImportSource,onConfirmImport,onCancelImport,onApplyTemplate,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,onOpenBinder}) {
+function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pendingImportSource,onConfirmImport,onCancelImport,onApplyTemplate,onRestoreBackup,onLogout,settings,onUpdateSettings,currentUserId,plan,onOpenBinder}) {
   const dialogRef = useRef(null);
   useDialogFocus(dialogRef, onClose);
   return <div className="fixed inset-0 z-[100] bg-slate-950/80 flex items-center justify-center p-6">
@@ -2265,7 +2386,7 @@ function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pen
         <label className="block text-sm font-bold">Import inventory/shopping CSV<input type="file" accept=".csv,text/csv" onChange={onImportCsv} className="block mt-2 w-full text-xs" /></label>
         <button type="button" onClick={onDownloadCsv} className="w-full rounded-xl p-3 bg-slate-50 border border-slate-200 text-sm font-bold flex items-center justify-center gap-2"><Download size={16}/> Export inventory/shopping CSV</button>
       </div>
-      <StarterTemplatesPanel settings={settings} onApply={onApplyTemplate} disabled={Boolean(pendingImport)} />
+      <StarterTemplatesPanel templates={supplyTemplatesFor(plan)} settings={settings} onApply={onApplyTemplate} disabled={Boolean(pendingImport)} />
       {pendingImport && <div role="status" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 space-y-2 text-sm">
         <p className="font-black text-amber-900">{pendingImportSource?.kind === 'template' ? `${pendingImportSource.label} ready to review` : pendingImportSource?.kind === 'csv' ? 'CSV ready to review' : 'Backup ready to review'}</p>
         <p className="text-amber-800">{pendingImport.inventory.length} inventory items, {pendingImport.shoppingList.length} shopping items, {pendingImport.appliances.length} appliances, {pendingImport.consumption?.length ?? 0} consumption events and {pendingImport.plan ? 'a family plan' : 'no family plan'} will be merged by ID.</p>
@@ -2293,6 +2414,7 @@ function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pen
       <ServiceHealthPanel />
       <BackupsPanel onRestore={onRestoreBackup} />
       <MembersPanel currentUserId={currentUserId} />
+      <NotificationsPanel />
       <ChangePasswordPanel />
       <ActivityPanel />
       <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>
@@ -2303,7 +2425,7 @@ function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pen
 
 // Starter supply templates for a household staring at an empty screen. Applying one runs through
 // the same preview-and-merge path as a JSON backup, so nothing is overwritten without confirmation.
-function StarterTemplatesPanel({ settings, onApply, disabled }) {
+function StarterTemplatesPanel({ templates, settings, onApply, disabled }) {
   const [open, setOpen] = useState(false);
   return (
     <section className="rounded-2xl border border-slate-200 bg-slate-50 p-4 space-y-3">
@@ -2319,7 +2441,7 @@ function StarterTemplatesPanel({ settings, onApply, disabled }) {
             You will see exactly what gets added before anything is saved.
           </p>
           <ul className="space-y-2">
-            {supplyTemplateCatalog.map(template => (
+            {templates.map(template => (
               <li key={template.id} className="bg-white border border-slate-200 rounded-xl p-3 flex items-start justify-between gap-3">
                 <div>
                   <div className="text-xs font-black text-slate-800">{template.label}</div>
@@ -2412,21 +2534,26 @@ function BackupsPanel({ onRestore }) {
     </div>
   );
 }
-function Login({configured,error,onLogin}) {
+function Login({configured,emailEnabled,error,onLogin}) {
   const [email,setEmail]=useState('');
   const [password,setPassword]=useState('');
   const [message,setMessage]=useState(null);
+  const [notice,setNotice]=useState(null);
   const [pending,setPending]=useState(false);
+  const [forgot,setForgot]=useState(false);
   const submit=async event=>{event.preventDefault();setPending(true);setMessage(null);try{const result=await request('session',{email,password});setPassword('');onLogin(result.user);}catch(error){setMessage(error.message);}finally{setPending(false);}};
+  const requestReset=async event=>{event.preventDefault();setPending(true);setMessage(null);setNotice(null);try{const result=await request('password-reset',{type:'request',email});setNotice(result.message);}catch(error){setMessage(error.message);}finally{setPending(false);}};
   return <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
-    <form onSubmit={submit} className="w-full max-w-sm space-y-6">
+    <form onSubmit={forgot?requestReset:submit} className="w-full max-w-sm space-y-6">
       <Shield className="text-blue-400" size={40}/><h1 className="text-3xl font-black">NorthStar Prep</h1>
-      <p className="text-slate-300">Sign in to your household supplies and emergency plan.</p>
+      <p className="text-slate-300">{forgot?'Enter your email and we will send you a link to choose a new password.':'Sign in to your household supplies and emergency plan.'}</p>
       {!configured && <p role="alert" className="text-amber-200">Setup required: connect the database and configure household login in Vercel.</p>}
       {(message||error) && <p role="alert" className="text-red-300">{message||error}</p>}
+      {notice && <p role="status" className="text-emerald-300">{notice}</p>}
       <label className="block">Email<input autoComplete="username" type="email" required value={email} onChange={e=>setEmail(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
-      <label className="block">Password<input autoComplete="current-password" type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
-      <button disabled={pending||!configured} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{pending?'Signing in…':'Sign in'}</button>
+      {!forgot && <label className="block">Password<input autoComplete="current-password" type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>}
+      <button disabled={pending||!configured} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{forgot?(pending?'Sending…':'Email me a reset link'):(pending?'Signing in…':'Sign in')}</button>
+      {emailEnabled && <button type="button" onClick={()=>{setForgot(!forgot);setMessage(null);setNotice(null);}} className="text-sm text-blue-300 underline">{forgot?'Back to sign in':'Forgot password?'}</button>}
       <p className="text-xs text-slate-400">Household members join by invitation from an existing owner. Ask them for an invite link if you don't have an account yet.</p>
     </form>
   </main>;

@@ -46,7 +46,8 @@ export default async function globalSetup() {
 
   const server = spawn(process.execPath, ['--import', pathToFileURL(registerPath).href, 'scripts/dev.js'], {
     cwd: repoRoot,
-    env: {...process.env, ...secrets, DATABASE_URL: database.url, PORT: String(port), NODE_ENV: 'development', NWS_API_BASE: stubBase},
+    env: {...process.env, ...secrets, DATABASE_URL: database.url, PORT: String(port), NODE_ENV: 'development', NWS_API_BASE: stubBase,
+      RESEND_API_KEY: 'e2e-resend-key', EMAIL_FROM: 'NorthStar Prep <prep@example.test>', EMAIL_API_BASE: stubBase, APP_URL: baseURL},
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const signal = {exited: false, output: ''};

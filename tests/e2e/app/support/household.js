@@ -20,6 +20,12 @@ export async function query(text, values = []) {
 export async function resetHousehold() {
   await query(`TRUNCATE ${collections.join(', ')}`);
   await query('UPDATE northstar_household SET version = 0, writer_token = NULL WHERE id = 1');
+  // Accounts a spec created (an invited member, say) go too; only the owner the suite signs in as stays.
+  const owner = environment().userId;
+  await query('DELETE FROM northstar_invitations');
+  await query('DELETE FROM northstar_password_resets');
+  await query('DELETE FROM northstar_household_members WHERE user_id <> $1', [owner]);
+  await query('DELETE FROM northstar_users WHERE id <> $1', [owner]);
 }
 
 export async function inventoryNames() {

@@ -30,6 +30,7 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [configured, setConfigured] = useState(true);
+  const [emailEnabled, setEmailEnabled] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [inventory, setInventory] = useState([]);
   const [shoppingList, setShoppingList] = useState([]);
@@ -78,7 +79,7 @@ export default function App() {
     return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
   }, []);
   useEffect(() => {
-    request('session').then(value => { setUser(value.authenticated ? value.user : null); setConfigured(value.configured); })
+    request('session').then(value => { setUser(value.authenticated ? value.user : null); setConfigured(value.configured); setEmailEnabled(Boolean(value.emailEnabled)); })
       .catch(error=>setGlobalError(error.message)).finally(()=>setAuthReady(true));
   }, []);
   useEffect(() => {
@@ -314,7 +315,7 @@ export default function App() {
     if (inviteToken) return <AcceptInvite token={inviteToken} onJoined={handleAuthenticated} />;
     const resetToken = params.get('reset');
     if (resetToken) return <ResetPassword token={resetToken} onReset={handleAuthenticated} />;
-    return <Login configured={configured} error={globalError} onLogin={handleAuthenticated} />;
+    return <Login configured={configured} emailEnabled={emailEnabled} error={globalError} onLogin={handleAuthenticated} />;
   }
   if (loading && !inventory.length && !globalError) return <LoadingScreen />;
   if (showGo) return <GoTime go={go} online={online} plan={plan} kits={kits} inventory={inventory} medications={medications} appliances={appliances} stats={stats} settings={settings} pendingCheckin={pendingCheckin}
@@ -2175,6 +2176,7 @@ function MembersPanel({ currentUserId }) {
   const [error, setError] = useState(null);
   const [inviteForm, setInviteForm] = useState({ email: '', role: 'member' });
   const [inviteLink, setInviteLink] = useState(null);
+  const [invitedEmail, setInvitedEmail] = useState(null);
   const [resetLink, setResetLink] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -2186,6 +2188,7 @@ function MembersPanel({ currentUserId }) {
     try {
       const result = await request('members', { type: 'invite', email: inviteForm.email, role: inviteForm.role });
       setInviteLink(`${window.location.origin}${window.location.pathname}?invite=${result.token}`);
+      setInvitedEmail(result.emailed ? inviteForm.email : null);
       setInviteForm({ email: '', role: 'member' });
       await load();
     } catch (err) { setError(err.message); } finally { setBusy(false); }
@@ -2203,7 +2206,7 @@ function MembersPanel({ currentUserId }) {
     setError(null);
     try {
       const result = await request('members', { type: 'reset-link', userId });
-      setResetLink({ userId, url: `${window.location.origin}${window.location.pathname}?reset=${result.token}` });
+      setResetLink({ userId, url: `${window.location.origin}${window.location.pathname}?reset=${result.token}`, emailed: Boolean(result.emailed) });
     } catch (err) { setError(err.message); }
   };
   const copyLink = () => { if (inviteLink) navigator.clipboard?.writeText(inviteLink).catch(() => {}); };
@@ -2229,7 +2232,11 @@ function MembersPanel({ currentUserId }) {
       </ul>
       {resetLink && (
         <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 space-y-2 text-xs">
-          <p className="font-black text-blue-900">Send this password reset link to {data.members.find(m => m.user_id === resetLink.userId)?.email || 'the member'}:</p>
+          <p role="status" className="font-black text-blue-900">
+            {resetLink.emailed
+              ? <>Emailed a password reset link to {data.members.find(m => m.user_id === resetLink.userId)?.email || 'the member'}. You can also share it yourself:</>
+              : <>Send this password reset link to {data.members.find(m => m.user_id === resetLink.userId)?.email || 'the member'}:</>}
+          </p>
           <input readOnly value={resetLink.url} onFocus={e => e.target.select()} className="w-full bg-white rounded-lg p-2 text-[10px] font-mono border border-blue-200" />
           <button type="button" onClick={copyResetLink} className="rounded-lg bg-blue-600 text-white px-3 py-1.5 font-black">Copy link</button>
           <p className="text-blue-800">Expires in 1 hour and can only be used once.</p>
@@ -2242,11 +2249,12 @@ function MembersPanel({ currentUserId }) {
               <Input val={inviteForm.email} set={v => setInviteForm({...inviteForm, email: v})} type="email" placeholder="Invite by email" />
               <Select val={inviteForm.role} set={v => setInviteForm({...inviteForm, role: v})} opts={['member', 'owner']} />
             </div>
-            <button type="submit" disabled={busy || !inviteForm.email} className="w-full rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">Create invite link</button>
+            <button type="submit" disabled={busy || !inviteForm.email} className="w-full rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">{data.emailEnabled ? 'Send invitation' : 'Create invite link'}</button>
+            {!data.emailEnabled && <p className="text-[11px] text-slate-500">Email isn't set up, so you'll get a link to send yourself.</p>}
           </form>
           {inviteLink && (
             <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 space-y-2 text-xs">
-              <p className="font-black text-emerald-900">Send this link to the person you invited:</p>
+              <p role="status" className="font-black text-emerald-900">{invitedEmail ? `Invitation emailed to ${invitedEmail}. You can also share the link yourself:` : 'Send this link to the person you invited:'}</p>
               <input readOnly value={inviteLink} onFocus={e => e.target.select()} className="w-full bg-white rounded-lg p-2 text-[10px] font-mono border border-emerald-200" />
               <button type="button" onClick={copyLink} className="rounded-lg bg-emerald-600 text-white px-3 py-1.5 font-black">Copy link</button>
             </div>
@@ -2477,21 +2485,26 @@ function BackupsPanel({ onRestore }) {
     </div>
   );
 }
-function Login({configured,error,onLogin}) {
+function Login({configured,emailEnabled,error,onLogin}) {
   const [email,setEmail]=useState('');
   const [password,setPassword]=useState('');
   const [message,setMessage]=useState(null);
+  const [notice,setNotice]=useState(null);
   const [pending,setPending]=useState(false);
+  const [forgot,setForgot]=useState(false);
   const submit=async event=>{event.preventDefault();setPending(true);setMessage(null);try{const result=await request('session',{email,password});setPassword('');onLogin(result.user);}catch(error){setMessage(error.message);}finally{setPending(false);}};
+  const requestReset=async event=>{event.preventDefault();setPending(true);setMessage(null);setNotice(null);try{const result=await request('password-reset',{type:'request',email});setNotice(result.message);}catch(error){setMessage(error.message);}finally{setPending(false);}};
   return <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
-    <form onSubmit={submit} className="w-full max-w-sm space-y-6">
+    <form onSubmit={forgot?requestReset:submit} className="w-full max-w-sm space-y-6">
       <Shield className="text-blue-400" size={40}/><h1 className="text-3xl font-black">NorthStar Prep</h1>
-      <p className="text-slate-300">Sign in to your household supplies and emergency plan.</p>
+      <p className="text-slate-300">{forgot?'Enter your email and we will send you a link to choose a new password.':'Sign in to your household supplies and emergency plan.'}</p>
       {!configured && <p role="alert" className="text-amber-200">Setup required: connect the database and configure household login in Vercel.</p>}
       {(message||error) && <p role="alert" className="text-red-300">{message||error}</p>}
+      {notice && <p role="status" className="text-emerald-300">{notice}</p>}
       <label className="block">Email<input autoComplete="username" type="email" required value={email} onChange={e=>setEmail(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
-      <label className="block">Password<input autoComplete="current-password" type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>
-      <button disabled={pending||!configured} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{pending?'Signing in…':'Sign in'}</button>
+      {!forgot && <label className="block">Password<input autoComplete="current-password" type="password" required value={password} onChange={e=>setPassword(e.target.value)} className="mt-2 w-full rounded-xl bg-white p-4 text-slate-900"/></label>}
+      <button disabled={pending||!configured} className="w-full rounded-xl bg-blue-600 p-4 font-bold disabled:opacity-50">{forgot?(pending?'Sending…':'Email me a reset link'):(pending?'Signing in…':'Sign in')}</button>
+      {emailEnabled && <button type="button" onClick={()=>{setForgot(!forgot);setMessage(null);setNotice(null);}} className="text-sm text-blue-300 underline">{forgot?'Back to sign in':'Forgot password?'}</button>}
       <p className="text-xs text-slate-400">Household members join by invitation from an existing owner. Ask them for an invite link if you don't have an account yet.</p>
     </form>
   </main>;

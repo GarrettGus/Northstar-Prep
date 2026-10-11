@@ -12,9 +12,20 @@ const alerts = {features: [{properties: {
   areaDesc: 'Hennepin', onset: '2026-10-11T00:00:00Z', ends: '2026-10-12T00:00:00Z',
 }}]};
 
-createServer((req, res) => {
+// Emails "sent" through the Resend stand-in, newest last; specs read them back from GET /sent.
+const sent = [];
+
+createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const json = (status, body) => { res.writeHead(status, {'Content-Type': 'application/geo+json'}); res.end(JSON.stringify(body)); };
+  if (req.method === 'POST' && url.pathname === '/emails') {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    if (req.headers.authorization !== 'Bearer e2e-resend-key') return json(401, {message: 'bad key'});
+    sent.push(JSON.parse(body));
+    return json(200, {id: `email-${sent.length}`});
+  }
+  if (url.pathname === '/sent') { if (req.method === 'DELETE') sent.length = 0; return json(200, sent); }
   if (url.pathname === `/points/${known}`) return json(200, {properties: {cwa: 'MPX', relativeLocation: {properties: {city: 'Minneapolis', state: 'MN'}}}});
   if (url.pathname.startsWith('/points/')) return json(404, {title: 'Data Unavailable For Requested Point'});
   if (url.pathname === '/alerts/active') return json(200, url.searchParams.get('point') === known ? alerts : {features: []});

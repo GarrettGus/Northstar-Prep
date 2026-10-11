@@ -1,6 +1,7 @@
 import { sameOrigin, validSession } from '../server/auth.js';
-import { endActivation, getActivation, getMembership, insertAuditLog, listCheckins, listMembers, startActivation, upsertCheckin } from '../server/db.js';
-import { activationModes, checkinStatuses } from '../shared/gotime.js';
+import { deletePushSubscription, endActivation, getActivation, getMembership, insertAuditLog, listCheckins, listMembers, listPushSubscriptions, startActivation, upsertCheckin } from '../server/db.js';
+import { broadcast, pushConfigured } from '../server/push.js';
+import { activationModeLabels, activationModes, checkinStatuses } from '../shared/gotime.js';
 import { beginRequest, logFailure, logIssue, observe } from '../server/observability.js';
 
 // "Go time": activating the household plan and checking in during an event. Any member may
@@ -9,7 +10,16 @@ import { beginRequest, logFailure, logIssue, observe } from '../server/observabi
 // set their own check-in; the user ID comes from the session, never from the request body.
 const note = value => typeof value === 'string' ? value.trim().slice(0, 280) : '';
 
-export function createHandler(repository = {getMembership, getActivation, startActivation, endActivation, upsertCheckin, listCheckins, listMembers, logAudit: insertAuditLog}, authenticate = validSession) {
+// Who gets a push, and what it says. Never the activation note or a check-in note: those are the
+// household's own words and a lock screen is not private. Everyone but the sender is notified.
+function pushFor(body) {
+  if (body.type === 'activate') return {title: `Household plan activated: ${activationModeLabels[body.mode]}`, body: 'Open NorthStar Prep to see the plan and check in.', tag: 'plan-activation', url: '/?go=1', requireInteraction: true};
+  if (body.type === 'checkin' && body.status === 'need_help') return {title: 'A household member needs help', body: 'Open NorthStar Prep to see who and where.', tag: 'need-help', url: '/?go=1', requireInteraction: true};
+  if (body.type === 'stand_down') return {title: 'Household plan stood down', body: 'The emergency has been marked over.', tag: 'plan-activation', url: '/'};
+  return null;
+}
+
+export function createHandler(repository = {getMembership, getActivation, startActivation, endActivation, upsertCheckin, listCheckins, listMembers, logAudit: insertAuditLog, listPushSubscriptions, deletePushSubscription}, authenticate = validSession, push = {configured: pushConfigured, broadcast}) {
   return async function handler(req, res) {
     const request = beginRequest(req, res);
     res.setHeader('Cache-Control', 'no-store');
@@ -37,6 +47,13 @@ export function createHandler(repository = {getMembership, getActivation, startA
         if (audit) {
           try { await repository.logAudit({userId: session.userId, collection: 'plan_activation', itemId: null, ...audit}); }
           catch (error) { logIssue(request, '/api/go', 'audit_log_failure', error); }
+          const notification = pushFor(body);
+          if (notification && push.configured() && repository.listPushSubscriptions) {
+            try {
+              const subscriptions = await repository.listPushSubscriptions(1, {excludeUserId: session.userId});
+              await push.broadcast(subscriptions, notification, {remove: id => repository.deletePushSubscription(id), onError: error => logIssue(request, '/api/go', 'push_send_failure', error)});
+            } catch (error) { logIssue(request, '/api/go', 'push_send_failure', error); }
+          }
         }
       }
       const [activation, checkins, members] = await Promise.all([repository.getActivation(), repository.listCheckins(), repository.listMembers()]);

@@ -535,3 +535,27 @@ export async function readPlanLocation(householdId = 1) {
   const rows = await sql`SELECT latitude, longitude FROM northstar_plan WHERE household_id = ${householdId} AND latitude IS NOT NULL AND longitude IS NOT NULL`;
   return rows[0] ? {latitude: Number(rows[0].latitude), longitude: Number(rows[0].longitude)} : null;
 }
+
+// --- Web Push subscriptions. ---
+export async function savePushSubscription({householdId = 1, id, userId, endpoint, p256dh, auth}) {
+  const sql = database();
+  // Re-subscribing a browser (or the same browser after another member signs in) takes the row over.
+  await sql`INSERT INTO northstar_push_subscriptions (id, household_id, user_id, endpoint, p256dh, auth)
+    VALUES (${id}, ${householdId}, ${userId}, ${endpoint}, ${p256dh}, ${auth})
+    ON CONFLICT (id) DO UPDATE SET household_id = EXCLUDED.household_id, user_id = EXCLUDED.user_id, endpoint = EXCLUDED.endpoint, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth`;
+}
+export async function deletePushSubscription(id, userId = null) {
+  const sql = database();
+  if (userId) await sql`DELETE FROM northstar_push_subscriptions WHERE id = ${id} AND user_id = ${userId}`;
+  else await sql`DELETE FROM northstar_push_subscriptions WHERE id = ${id}`;
+}
+// Only subscriptions whose user is still a household member: removing someone stops their pushes.
+export async function listPushSubscriptions(householdId = 1, {userId = null, excludeUserId = null} = {}) {
+  const sql = database();
+  return sql`SELECT s.id, s.user_id AS "userId", s.endpoint, s.p256dh, s.auth
+    FROM northstar_push_subscriptions s
+    JOIN northstar_household_members m ON m.user_id = s.user_id AND m.household_id = s.household_id
+    WHERE s.household_id = ${householdId}
+      AND (${userId}::uuid IS NULL OR s.user_id = ${userId}::uuid)
+      AND (${excludeUserId}::uuid IS NULL OR s.user_id <> ${excludeUserId}::uuid)`;
+}

@@ -23,3 +23,28 @@ self.addEventListener('fetch', event => {
     return response;
   }).catch(() => caches.match(event.request).then(response => response || caches.match('/'))));
 });
+
+// Push notifications (daily digest, plan activation, a member needing help). Payloads carry
+// counts and generic text only; see shared/digest.js and api/go.js.
+self.addEventListener('push', event => {
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch { data = {}; }
+  event.waitUntil(self.registration.showNotification(data.title || 'NorthStar Prep', {
+    body: data.body || '',
+    tag: data.tag || undefined,
+    renotify: Boolean(data.tag),
+    requireInteraction: Boolean(data.requireInteraction),
+    data: {url: data.url || '/'},
+  }));
+});
+self.addEventListener('notificationclick', event => {
+  event.notification.close();
+  // Only ever open a page of this app, whatever the payload says.
+  let target = new URL('/', self.location.origin);
+  try { const candidate = new URL(event.notification.data?.url || '/', self.location.origin); if (candidate.origin === self.location.origin) target = candidate; } catch { /* keep "/" */ }
+  event.waitUntil(self.clients.matchAll({type: 'window', includeUncontrolled: true}).then(windows => {
+    const open = windows.find(client => new URL(client.url).origin === self.location.origin);
+    if (open) return open.navigate(target.href).then(client => (client || open).focus());
+    return self.clients.openWindow(target.href);
+  }));
+});

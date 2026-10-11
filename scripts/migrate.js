@@ -346,6 +346,19 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_checkins (
   PRIMARY KEY (household_id, user_id)
 )`;
 
+// --- Web Push subscriptions: one row per browser a member turned notifications on in. The id is a
+// hash of the endpoint so re-subscribing the same browser updates its row instead of adding one.
+await sql`CREATE TABLE IF NOT EXISTS northstar_push_subscriptions (
+  id text PRIMARY KEY,
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  user_id uuid NOT NULL REFERENCES northstar_users(id) ON DELETE CASCADE,
+  endpoint text NOT NULL,
+  p256dh text NOT NULL,
+  auth text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+)`;
+await sql`CREATE INDEX IF NOT EXISTS northstar_push_subscriptions_household_idx ON northstar_push_subscriptions (household_id, user_id)`;
+
 await sql`CREATE TABLE IF NOT EXISTS northstar_alert_state (
   key text PRIMARY KEY,
   last_sent_at timestamptz NOT NULL DEFAULT now()

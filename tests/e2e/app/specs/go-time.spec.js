@@ -75,3 +75,15 @@ test('a drill runs on this device only: the grab list shows each person\'s go-ba
   await page.getByRole('button', {name: 'Practice drill on this device'}).click();
   await expect(page.getByRole('checkbox', {name: /Water bottle/})).toBeChecked();
 });
+
+test('notification deep links open Go time or a tab, and the notifications panel explains when push is not set up', async ({page}) => {
+  await page.goto('/?go=1');
+  await expect(page.getByRole('button', {name: 'Activate for the household'})).toBeVisible();
+  await expect(page).toHaveURL(/\/$/);
+  await page.goto('/?tab=power');
+  await expect(page.getByRole('button', {name: 'Power'})).toHaveAttribute('aria-current', 'page');
+
+  await page.getByRole('button', {name: 'Open household settings'}).click();
+  await expect(page.getByRole('heading', {name: 'Notifications'})).toBeVisible();
+  await expect(page.getByText("Push notifications aren't set up for this household yet.")).toBeVisible();
+});

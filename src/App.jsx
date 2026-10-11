@@ -18,6 +18,7 @@ import { checklistsFor } from '../shared/checklists.js';
 import { roundCoordinate } from '../shared/hazards.js';
 import { kitCompleteness } from '../shared/kits.js';
 import { GoTime, GoTimeBanner } from './GoTime.jsx';
+import { currentSubscription, pushSupported, subscribe as subscribePush, unsubscribe as unsubscribePush } from './push.js';
 import { HazardProfileSection, WeatherAlerts } from './Hazards.jsx';
 import { clearDeviceData, loadPendingCheckin, savePendingCheckin, enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
 
@@ -78,6 +79,15 @@ export default function App() {
     window.addEventListener('offline', handleOffline);
     return () => { window.removeEventListener('online', handleOnline); window.removeEventListener('offline', handleOffline); };
   }, []);
+  // Notifications deep-link with ?tab=<tab> or ?go=1; read once signed in, then tidy the URL.
+  useEffect(() => {
+    if (!user) return;
+    const params = new URLSearchParams(window.location.search);
+    const tab = params.get('tab');
+    if (['dashboard','inventory','shopping','power','plan'].includes(tab)) setActiveTab(tab);
+    if (params.get('go') === '1') setShowGo(true);
+    if (tab || params.get('go')) window.history.replaceState(null, '', window.location.pathname);
+  }, [user]);
   useEffect(() => {
     request('session').then(value => { setUser(value.authenticated ? value.user : null); setConfigured(value.configured); setEmailEnabled(Boolean(value.emailEnabled)); })
       .catch(error=>setGlobalError(error.message)).finally(()=>setAuthReady(true));
@@ -192,6 +202,7 @@ export default function App() {
   const logout = async () => {
     const queued = loadQueuedActions().length;
     if (queued && !window.confirm(`${queued} change${queued === 1 ? ' has' : 's have'} not synced yet and will be discarded from this device if you sign out. Sign out anyway?`)) return;
+    await unsubscribePush();
     try {await request('session',{},'DELETE');await clearDeviceData();setPendingSync(0);setLastSyncedAt(null);epoch.current++;setUser(null);setGo(null);setWeather(null);setShowGo(false);setPendingCheckin(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
@@ -2278,6 +2289,43 @@ function MembersPanel({ currentUserId }) {
 
 // Self-service password change for a signed-in user who still knows their current password.
 // A locked-out member instead needs a reset link from an owner (see MembersPanel).
+// Push notifications for this device: a daily digest of what needs attention, plus an alert when
+// the plan is activated or a member needs help. Per device, because each browser subscribes itself.
+function NotificationsPanel() {
+  const [server, setServer] = useState(null);
+  const [subscribed, setSubscribed] = useState(false);
+  const [message, setMessage] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const supported = pushSupported();
+  useEffect(() => {
+    request('push').then(setServer).catch(() => setServer({configured: false}));
+    currentSubscription().then(sub => setSubscribed(Boolean(sub))).catch(() => {});
+  }, []);
+  const run = async action => { setBusy(true); setMessage(null); setNotice(null); try { await action(); } catch (err) { setMessage(err.message); } finally { setBusy(false); } };
+  const turnOn = () => run(async () => { await subscribePush(server.publicKey); setSubscribed(true); setNotice('Notifications are on for this device.'); });
+  const turnOff = () => run(async () => { await unsubscribePush(); setSubscribed(false); setNotice('Notifications are off for this device.'); });
+  const sendTest = () => run(async () => { const result = await request('push', {type: 'test'}); setNotice(result.sent ? 'Test notification sent.' : 'No notification could be delivered to this device.'); });
+
+  return (
+    <div className="space-y-2 border-t border-slate-100 pt-5">
+      <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Notifications</h3>
+      <p className="text-xs text-slate-600">A daily summary of overdue reminders, refills, expiring supplies and restocks (counts only, never item names), and an alert when the plan is activated or someone needs help.</p>
+      {message && <p role="alert" className="text-xs font-bold text-red-600">{message}</p>}
+      {notice && <p role="status" className="text-xs font-bold text-emerald-700">{notice}</p>}
+      {!server ? <p className="text-xs text-slate-500">Checking…</p>
+        : !server.configured ? <p className="text-xs text-slate-500">Push notifications aren't set up for this household yet.</p>
+        : !supported ? <p className="text-xs text-slate-500">This browser can't receive push notifications. On iPhone, add NorthStar Prep to your Home Screen first.</p>
+        : subscribed ? (
+          <div className="grid grid-cols-2 gap-2">
+            <button type="button" disabled={busy} onClick={sendTest} className="rounded-xl p-3 bg-slate-100 text-slate-800 font-bold text-sm disabled:opacity-50">Send a test</button>
+            <button type="button" disabled={busy} onClick={turnOff} className="rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">Turn off</button>
+          </div>
+        ) : <button type="button" disabled={busy} onClick={turnOn} className="w-full rounded-xl p-3 bg-slate-900 text-white font-bold text-sm disabled:opacity-50">Turn on for this device</button>}
+    </div>
+  );
+}
+
 function ChangePasswordPanel() {
   const [form, setForm] = useState({ currentPassword: '', newPassword: '' });
   const [message, setMessage] = useState(null);
@@ -2366,6 +2414,7 @@ function SyncModal({onClose,onImport,onImportCsv,onDownloadCsv,pendingImport,pen
       <ServiceHealthPanel />
       <BackupsPanel onRestore={onRestoreBackup} />
       <MembersPanel currentUserId={currentUserId} />
+      <NotificationsPanel />
       <ChangePasswordPanel />
       <ActivityPanel />
       <button onClick={onLogout} className="w-full rounded-xl p-3 bg-slate-100">Sign out</button>

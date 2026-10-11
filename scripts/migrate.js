@@ -166,6 +166,9 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_kits (
   target_contents jsonb NOT NULL DEFAULT '[]',
   PRIMARY KEY (household_id, id)
 )`;
+// Which household member a kit belongs to (blank for a shared kit), so "everyone has a packed
+// go-bag" can be checked rather than only listed on the evacuation checklist.
+await sql`ALTER TABLE northstar_kits ADD COLUMN IF NOT EXISTS assigned_to text NOT NULL DEFAULT ''`;
 // --- Medications and prescriptions: sensitive household health data (see README privacy notes). ---
 await sql`CREATE TABLE IF NOT EXISTS northstar_medications (
   household_id integer NOT NULL REFERENCES northstar_household(id),
@@ -306,6 +309,25 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_readiness_history (
   PRIMARY KEY (household_id, day)
 )`;
 await sql`CREATE INDEX IF NOT EXISTS northstar_readiness_history_day_idx ON northstar_readiness_history (household_id, day DESC)`;
+
+// --- Plan activation ("Go time"): at most one active event per household, plus each member's
+// latest check-in. Deliberately outside household state: it is live coordination, not something a
+// backup should restore, and a check-in must be attributable to the member who sent it.
+await sql`CREATE TABLE IF NOT EXISTS northstar_activation (
+  household_id integer PRIMARY KEY REFERENCES northstar_household(id),
+  mode text NOT NULL CHECK (mode IN ('evacuate','shelter')),
+  note text NOT NULL DEFAULT '',
+  started_by uuid REFERENCES northstar_users(id) ON DELETE SET NULL,
+  started_at timestamptz NOT NULL DEFAULT now()
+)`;
+await sql`CREATE TABLE IF NOT EXISTS northstar_checkins (
+  household_id integer NOT NULL REFERENCES northstar_household(id),
+  user_id uuid NOT NULL REFERENCES northstar_users(id) ON DELETE CASCADE,
+  status text NOT NULL,
+  note text NOT NULL DEFAULT '',
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (household_id, user_id)
+)`;
 
 await sql`CREATE TABLE IF NOT EXISTS northstar_alert_state (
   key text PRIMARY KEY,

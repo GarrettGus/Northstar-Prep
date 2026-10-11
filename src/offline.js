@@ -1,5 +1,7 @@
 const STATE_KEY = 'northstar-state-cache-v1';
 const QUEUE_KEY = 'northstar-action-queue-v1';
+const CHECKIN_KEY = 'northstar-pending-checkin-v1';
+const GRAB_KEY = 'northstar-grab-checks-v1';
 
 function read(key, fallback) {
   try {
@@ -27,7 +29,7 @@ export function saveCachedState(state) {
 // Clears the cached state, any queued edits, and every Cache Storage entry the service worker
 // holds, including API responses that versions before the shell-only worker cached.
 export async function clearDeviceData() {
-  try { localStorage.removeItem(STATE_KEY); localStorage.removeItem(QUEUE_KEY); } catch { /* storage unavailable: nothing to clear */ }
+  try { for (const key of [STATE_KEY, QUEUE_KEY, CHECKIN_KEY, GRAB_KEY]) localStorage.removeItem(key); } catch { /* storage unavailable: nothing to clear */ }
   try { if (typeof caches !== 'undefined') await Promise.all((await caches.keys()).map(key => caches.delete(key))); } catch { /* best effort */ }
 }
 
@@ -55,4 +57,20 @@ export function enqueueAction(action) {
 
 export function clearQueuedActions() {
   saveQueuedActions([]);
+}
+
+// A check-in sent while offline is held here (only the latest one matters) and sent on reconnect.
+export function loadPendingCheckin() { return read(CHECKIN_KEY, null); }
+export function savePendingCheckin(checkin) {
+  try { if (checkin) localStorage.setItem(CHECKIN_KEY, JSON.stringify(checkin)); else localStorage.removeItem(CHECKIN_KEY); } catch { /* storage unavailable */ }
+}
+
+// Grab-list check-offs are per device and per event: `scope` is the activation's start time (or
+// "drill"), so starting a new event starts with an unchecked list.
+export function loadGrabChecks(scope) {
+  const stored = read(GRAB_KEY, null);
+  return stored && stored.scope === scope && Array.isArray(stored.ids) ? stored.ids : [];
+}
+export function saveGrabChecks(scope, ids) {
+  try { localStorage.setItem(GRAB_KEY, JSON.stringify({scope, ids})); } catch { /* storage unavailable */ }
 }

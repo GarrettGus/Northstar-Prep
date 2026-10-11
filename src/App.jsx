@@ -16,7 +16,8 @@ import { supplyTemplateCatalog, templateToBackup, findSupplyTemplate } from '../
 import { effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, todayLocal, addDaysISO } from '../shared/reminders.js';
 import { checklistCatalog } from '../shared/checklists.js';
 import { kitCompleteness } from '../shared/kits.js';
-import { clearDeviceData, enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
+import { GoTime, GoTimeBanner } from './GoTime.jsx';
+import { clearDeviceData, loadPendingCheckin, savePendingCheckin, enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
 
 // --- Constants ---
 const SYSTEM_ID = 'Household';
@@ -41,6 +42,9 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [showSyncModal, setShowSyncModal] = useState(false);
   const [showBinder, setShowBinder] = useState(false);
+  const [showGo, setShowGo] = useState(false);
+  const [go, setGo] = useState(null);
+  const [pendingCheckin, setPendingCheckin] = useState(() => loadPendingCheckin());
   const [outage, setOutage] = useState(null);
   const [globalError, setGlobalError] = useState(null);
   const [settings, setSettings] = useState(() => settingsSchema.parse({}));
@@ -121,6 +125,34 @@ export default function App() {
     flush();
     return () => { cancelled = true; };
   }, [user, online]);
+  // Plan activation and check-ins: polled at the household cadence while an event is active or
+  // the Go time screen is open, and every minute otherwise so an activation by another member
+  // still surfaces on the Dashboard. A check-in made offline is sent once the connection returns.
+  const goActive = Boolean(go?.activation);
+  useEffect(() => {
+    if (!user || !online) return;
+    let cancelled = false;
+    const refreshGo = async () => {
+      try {
+        const queued = loadPendingCheckin();
+        const result = queued ? await request('go', {type:'checkin', ...queued}) : await request('go');
+        if (queued) { savePendingCheckin(null); if (!cancelled) setPendingCheckin(null); }
+        if (!cancelled) setGo(result);
+      } catch (error) { if (!cancelled && error.status === 401) setUser(null); }
+    };
+    refreshGo();
+    const timer = setInterval(refreshGo, goActive || showGo ? 15000 : 60000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [user, online, goActive, showGo]);
+  const goAction = async body => {
+    try { setGo(await request('go', body)); setGlobalError(null); return true; }
+    catch (error) { setGlobalError(error.message); if (error.status === 401) setUser(null); return false; }
+  };
+  const handleCheckin = async (status, note) => {
+    if (!online) { const checkin = {status, note}; savePendingCheckin(checkin); setPendingCheckin(checkin); return true; }
+    return goAction({type:'checkin', status, note});
+  };
+
   const queueOffline = action => {
     try {
       const next = applyAction({inventory, shoppingList, appliances, reminders, checklistChecks, kits, medications, plan, consumption, settings}, action);
@@ -145,7 +177,7 @@ export default function App() {
   const logout = async () => {
     const queued = loadQueuedActions().length;
     if (queued && !window.confirm(`${queued} change${queued === 1 ? ' has' : 's have'} not synced yet and will be discarded from this device if you sign out. Sign out anyway?`)) return;
-    try {await request('session',{},'DELETE');await clearDeviceData();setPendingSync(0);setLastSyncedAt(null);epoch.current++;setUser(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    try {await request('session',{},'DELETE');await clearDeviceData();setPendingSync(0);setLastSyncedAt(null);epoch.current++;setUser(null);setGo(null);setShowGo(false);setPendingCheckin(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
@@ -271,6 +303,8 @@ export default function App() {
     return <Login configured={configured} error={globalError} onLogin={handleAuthenticated} />;
   }
   if (loading && !inventory.length && !globalError) return <LoadingScreen />;
+  if (showGo) return <GoTime go={go} online={online} plan={plan} kits={kits} inventory={inventory} medications={medications} appliances={appliances} stats={stats} settings={settings} pendingCheckin={pendingCheckin}
+    onActivate={(mode, note) => goAction({type:'activate', mode, note})} onStandDown={() => goAction({type:'stand_down'})} onCheckin={handleCheckin} onClose={() => setShowGo(false)} />;
   if (showBinder) return <EmergencyBinder plan={plan} inventory={inventory} stats={stats} settings={settings} checklistChecks={checklistChecks} medications={medications} onClose={() => setShowBinder(false)} />;
 
   return (
@@ -280,6 +314,7 @@ export default function App() {
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
+        {(activeTab === 'dashboard' || goActive) && <div className="mb-6"><GoTimeBanner activation={go?.activation} checkins={go?.checkins} members={go?.members} onOpen={() => setShowGo(true)} /></div>}
         {activeTab === 'dashboard' && <Dashboard stats={stats} settings={settings} gaps={gaps} onAddGapShortfall={handleAddGapShortfall} overdueReminders={overdueReminders} refillDueMedications={refillDueMedications} onViewReminders={() => setActiveTab('plan')} onViewRotation={() => setActiveTab('inventory')} />}
         {activeTab === 'inventory' && (
           <InventoryManager
@@ -290,6 +325,7 @@ export default function App() {
             stats={stats}
             settings={settings}
             kits={kits}
+            family={plan?.family || []}
             onAdd={(i) => handleAdd('inventory', i)}
             onUpdate={(id, i) => handleUpdate('inventory', id, i)}
             onDelete={(id) => handleDelete('inventory', id)}
@@ -653,7 +689,7 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
 }
 
 // --- Inventory Manager (Reused for Shop) ---
-function InventoryManager({ title, items, shoppingList = [], consumption = [], stats, settings, kits = [], onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onConsume, onDeleteConsumption, onBuy, isShoppingMode, onAddKit, onUpdateKit, onDeleteKit }) {
+function InventoryManager({ title, items, shoppingList = [], consumption = [], stats, settings, kits = [], onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onConsume, onDeleteConsumption, onBuy, isShoppingMode, onAddKit, onUpdateKit, onDeleteKit, family = [] }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
   const [sortBy, setSortBy] = useState(''); // 'expiry', 'calories', 'date'
@@ -983,7 +1019,7 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
         </div>
       )}
 
-      {!isShoppingMode && <KitsSection kits={kits} inventory={items} onAdd={onAddKit} onUpdate={onUpdateKit} onDelete={onDeleteKit} />}
+      {!isShoppingMode && <KitsSection kits={kits} inventory={items} family={family} onAdd={onAddKit} onUpdate={onUpdateKit} onDelete={onDeleteKit} />}
 
       {isShoppingMode && (
          <div className="bg-emerald-50 border border-emerald-100 rounded-[2.5rem] p-5 shadow-sm flex items-center justify-between mb-6">
@@ -1028,9 +1064,10 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
 }
 
 // --- Storage kits (go-bag, basement, vehicle, ...) ---
-const emptyKitForm = () => ({ name: '', purpose: '', targetContents: [] });
+const emptyKitForm = () => ({ name: '', purpose: '', assignedTo: '', targetContents: [] });
 
-function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
+function KitsSection({ kits, inventory, family = [], onAdd, onUpdate, onDelete }) {
+  const memberNames = family.map(member => member.name).filter(name => name && name.trim());
   const [showAdd, setShowAdd] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState(emptyKitForm);
@@ -1043,7 +1080,7 @@ function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
   const submit = async (e) => {
     e.preventDefault();
     const data = {
-      name: form.name, purpose: form.purpose,
+      name: form.name, purpose: form.purpose, assignedTo: form.assignedTo,
       targetContents: form.targetContents.filter(row => String(row.name || '').trim()).map(row => ({ name: row.name.trim(), quantity: Number(row.quantity) || 0, unit: row.unit || 'units' })),
     };
     if (editingId) { if (!await onUpdate(editingId, data)) return; }
@@ -1051,7 +1088,7 @@ function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
     reset();
   };
   const handleEdit = (kit) => {
-    setForm({ name: kit.name, purpose: kit.purpose, targetContents: kit.targetContents.map(row => ({...row})) });
+    setForm({ name: kit.name, purpose: kit.purpose, assignedTo: kit.assignedTo || '', targetContents: kit.targetContents.map(row => ({...row})) });
     setEditingId(kit.id);
     setShowAdd(true);
   };
@@ -1073,6 +1110,13 @@ function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
           </div>
           <div><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Go-bag — Dad" /></div>
           <div><Label>Purpose (optional)</Label><Input val={form.purpose} set={v => setForm({...form, purpose: v})} placeholder="e.g. Grab-and-go bag for evacuation" /></div>
+          <div>
+            <Label>Belongs to</Label>
+            <select aria-label="Kit belongs to" value={form.assignedTo} onChange={e => setForm({...form, assignedTo: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold text-slate-700">
+              <option value="">Shared (whole household)</option>
+              {[...new Set([...memberNames, ...(form.assignedTo && !memberNames.includes(form.assignedTo) ? [form.assignedTo] : [])])].map(name => <option key={name} value={name}>{name}</option>)}
+            </select>
+          </div>
           <div>
             <Label>Target contents</Label>
             <div className="space-y-2">
@@ -1101,7 +1145,7 @@ function KitsSection({ kits, inventory, onAdd, onUpdate, onDelete }) {
               <div className="flex justify-between items-center gap-3">
                 <div className="min-w-0">
                   <div className="font-black text-slate-800 text-sm truncate">{kit.name}</div>
-                  {kit.purpose && <div className="text-[10px] text-slate-500 truncate">{kit.purpose}</div>}
+                  {(kit.assignedTo || kit.purpose) && <div className="text-[10px] text-slate-500 truncate">{[kit.assignedTo && `For ${kit.assignedTo}`, kit.purpose].filter(Boolean).join(' · ')}</div>}
                 </div>
                 <div className={`text-[10px] font-black uppercase shrink-0 ${ready ? 'text-emerald-600' : 'text-amber-600'}`}>
                   {completeness.totalCount > 0 ? `${completeness.metCount}/${completeness.totalCount} packed` : `${completeness.assignedCount} item${completeness.assignedCount === 1 ? '' : 's'}`}

@@ -42,7 +42,7 @@ export async function readState() {
           last_completed_date AS "lastCompletedDate", snoozed_until AS "snoozedUntil"
         FROM northstar_reminders WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, completed_at AS "completedAt" FROM northstar_checklist_checks WHERE household_id = ${householdId}`,
-    sql`SELECT id, name, purpose, target_contents AS "targetContents" FROM northstar_kits WHERE household_id = ${householdId} ORDER BY seq`,
+    sql`SELECT id, name, purpose, target_contents AS "targetContents", assigned_to AS "assignedTo" FROM northstar_kits WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT id, person, name, dose, quantity_on_hand AS "quantityOnHand", refill_date AS "refillDate", prescriber, notes
         FROM northstar_medications WHERE household_id = ${householdId} ORDER BY seq`,
     sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary"
@@ -119,11 +119,11 @@ function upsertChecklistCheck(tx, check, guard) {
     ON CONFLICT (household_id, id) DO UPDATE SET completed_at = EXCLUDED.completed_at`;
 }
 function upsertKit(tx, kit, guard) {
-  return tx`INSERT INTO northstar_kits (household_id, id, name, purpose, target_contents)
-    SELECT ${householdId}, ${kit.id}, ${kit.name}, ${kit.purpose}, ${JSON.stringify(kit.targetContents)}::jsonb
+  return tx`INSERT INTO northstar_kits (household_id, id, name, purpose, target_contents, assigned_to)
+    SELECT ${householdId}, ${kit.id}, ${kit.name}, ${kit.purpose}, ${JSON.stringify(kit.targetContents)}::jsonb, ${kit.assignedTo ?? ''}
     WHERE ${guard}
     ON CONFLICT (household_id, id) DO UPDATE SET
-      name = EXCLUDED.name, purpose = EXCLUDED.purpose, target_contents = EXCLUDED.target_contents`;
+      name = EXCLUDED.name, purpose = EXCLUDED.purpose, target_contents = EXCLUDED.target_contents, assigned_to = EXCLUDED.assigned_to`;
 }
 function upsertMedication(tx, medication, guard) {
   return tx`INSERT INTO northstar_medications (household_id, id, person, name, dose, quantity_on_hand, refill_date, prescriber, notes)
@@ -482,4 +482,41 @@ export async function claimAlert(key, cooldownMinutes = 60) {
     WHERE northstar_alert_state.last_sent_at < now() - make_interval(mins => ${Math.round(cooldownMinutes)})
     RETURNING key`;
   return Boolean(rows[0]);
+}
+
+// --- Plan activation ("Go time") and member check-ins. ---
+export async function getActivation(householdId = 1) {
+  const sql = database();
+  const rows = await sql`SELECT a.mode, a.note, a.started_at AS "startedAt", u.email AS "startedBy"
+    FROM northstar_activation a LEFT JOIN northstar_users u ON u.id = a.started_by
+    WHERE a.household_id = ${householdId}`;
+  return rows[0] ?? null;
+}
+// Starting (or switching) an activation clears earlier check-ins so a "safe" from last month's
+// event is never read as a status for this one.
+export async function startActivation({householdId = 1, mode, note, userId}) {
+  const sql = database();
+  await sql.transaction(tx => [
+    tx`DELETE FROM northstar_checkins WHERE household_id = ${householdId}`,
+    tx`INSERT INTO northstar_activation (household_id, mode, note, started_by, started_at)
+      VALUES (${householdId}, ${mode}, ${note}, ${userId}, now())
+      ON CONFLICT (household_id) DO UPDATE SET mode = EXCLUDED.mode, note = EXCLUDED.note, started_by = EXCLUDED.started_by, started_at = now()`,
+  ]);
+}
+export async function endActivation(householdId = 1) {
+  const sql = database();
+  const rows = await sql`DELETE FROM northstar_activation WHERE household_id = ${householdId} RETURNING mode`;
+  return Boolean(rows[0]);
+}
+export async function upsertCheckin({householdId = 1, userId, status, note}) {
+  const sql = database();
+  await sql`INSERT INTO northstar_checkins (household_id, user_id, status, note, updated_at)
+    VALUES (${householdId}, ${userId}, ${status}, ${note}, now())
+    ON CONFLICT (household_id, user_id) DO UPDATE SET status = EXCLUDED.status, note = EXCLUDED.note, updated_at = now()`;
+}
+export async function listCheckins(householdId = 1) {
+  const sql = database();
+  return sql`SELECT c.user_id AS "userId", u.email, c.status, c.note, c.updated_at AS "updatedAt"
+    FROM northstar_checkins c JOIN northstar_users u ON u.id = c.user_id
+    WHERE c.household_id = ${householdId} ORDER BY c.updated_at DESC`;
 }

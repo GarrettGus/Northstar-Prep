@@ -118,6 +118,8 @@ export const kitTargetItemSchema = z.object({
 export const kitSchema = z.object({
   id: idSchema, name: z.string().trim().min(1).max(200), purpose: text.default(''),
   targetContents: z.array(kitTargetItemSchema).max(200).default([]),
+  // The household member (by name, as in the Family Hub) this kit belongs to; blank = shared.
+  assignedTo: z.string().trim().max(100).default(''),
 });
 
 // --- Medications and prescriptions: who takes what, at what dose, and when it needs a refill. ---

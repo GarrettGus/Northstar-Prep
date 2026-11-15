@@ -8,6 +8,7 @@ if (!url) { console.error('Set DATABASE_URL_UNPOOLED (or DATABASE_URL).'); proce
 const sql = neon(url);
 
 const requiredColumns = {
+  northstar_users: ['session_version'],
   northstar_activation: ['mode', 'note', 'started_by', 'started_at'],
   northstar_checkins: ['user_id', 'status', 'note', 'updated_at'],
   northstar_push_subscriptions: ['id', 'user_id', 'endpoint', 'p256dh', 'auth'],

@@ -14,7 +14,8 @@ import { createHandler as createInviteHandler } from '../api/invite.js';
 import { createHandler as createPasswordResetHandler } from '../api/password-reset.js';
 import { createHandler as createPasswordHandler } from '../api/password.js';
 import { createReminderHistoryHandler, createReadinessHistoryHandler } from '../api/_history.js';
-import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds, daysUntilExpiry, expirationQueue, expirationSummary, deriveBurnRate, consumptionForecast } from '../shared/readiness.js';
+import { dailyDigest } from '../shared/digest.js';
+import { expiryTiers, rotationWindows, isExpiringWithin, waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds, daysUntilExpiry, expirationQueue, expirationSummary, deriveBurnRate, consumptionForecast } from '../shared/readiness.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
 process.env.DATABASE_URL='postgres://test-only/db';
 const item={id:'rice',name:'Rice',quantity:2,category:'Food'};
@@ -1043,4 +1044,25 @@ test('reminder history API enforces membership and returns entries',async()=>{
   const unauthed=response();
   await createReminderHistoryHandler(repository,()=>false)({method:'GET',headers:{}},unauthed);
   assert.equal(unauthed.code,401);
+});
+test('the three "expiring" windows come from one place, are nested, and agree on the same item',()=>{
+  assert.deepEqual(expiryTiers,{thisWeek:7,soon:30,quarter:90});
+  assert.deepEqual(rotationWindows,[30,60,90],'the rotation queue spans soon..quarter');
+  assert.ok(expiryTiers.thisWeek<expiryTiers.soon&&expiryTiers.soon<expiryTiers.quarter);
+  // Relative to today, since computeReadiness (the Dashboard's number) reads the real clock.
+  const now=new Date();
+  const inDays=days=>{const d=new Date(now.getFullYear(),now.getMonth(),now.getDate()+days);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;};
+  const item=days=>({id:`i${days}`,name:`in ${days}`,quantity:1,expiryDate:inDays(days)});
+  // [days left, expiring this week?, soon?, this quarter?]
+  for(const [days,week,soon,quarter] of [[-1,false,false,false],[0,true,true,true],[7,true,true,true],[8,false,true,true],[30,false,true,true],[31,false,false,true],[90,false,false,true],[91,false,false,false]]){
+    assert.equal(isExpiringWithin(item(days),expiryTiers.thisWeek,now),week,`${days}d this week`);
+    assert.equal(isExpiringWithin(item(days),expiryTiers.soon,now),soon,`${days}d soon`);
+    assert.equal(isExpiringWithin(item(days),expiryTiers.quarter,now),quarter,`${days}d quarter`);
+  }
+  assert.equal(isExpiringWithin({name:'no date'},expiryTiers.quarter,now),false);
+  // The Dashboard's number is the quarter window, the digest's is the week window.
+  const inventory=[-1,0,7,8,30,31,90,91].map(item);
+  assert.equal(computeReadiness({inventory,appliances:[],settings:settingsSchema.parse({})},settingsSchema.parse({})).expiringSoon,expirationSummary(inventory,now).total);
+  assert.equal(expirationSummary(inventory,now).total,6,'0,7,8,30,31 and 90 days; not the expired one or the one beyond 90');
+  assert.equal(dailyDigest({inventory},now).counts.expiringSoon,2,'only 0 and 7 days');
 });

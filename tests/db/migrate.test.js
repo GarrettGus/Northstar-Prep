@@ -235,6 +235,15 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       assert.deepEqual(await db.listPushSubscriptions(), []);
     });
 
+    it('the daily prune drops rate-limit windows that have lapsed and keeps live ones', async () => {
+      const db = await loadDb(database.url);
+      await db.rateLimit('live-key');
+      await query(database.url, `INSERT INTO northstar_login_limits (key, attempts, reset_at) VALUES ('lapsed-key', 10, now() - interval '1 minute')`);
+      await db.pruneRequestMetrics(14);
+      const keys = (await query(database.url, 'SELECT key FROM northstar_login_limits ORDER BY key')).map(row => row.key);
+      assert.deepEqual(keys, ['live-key']);
+    });
+
     it('carries the old hardcoded quick links over to an existing plan the first time links are added', async () => {
       await query(database.url, 'ALTER TABLE northstar_plan DROP COLUMN links');
       await migrate(database.url);

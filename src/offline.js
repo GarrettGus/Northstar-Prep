@@ -55,10 +55,6 @@ export function enqueueAction(action) {
   return queue.length;
 }
 
-export function clearQueuedActions() {
-  saveQueuedActions([]);
-}
-
 // A check-in sent while offline is held here (only the latest one matters) and sent on reconnect.
 export function loadPendingCheckin() { return read(CHECKIN_KEY, null); }
 export function savePendingCheckin(checkin) {

@@ -221,6 +221,7 @@ test('API reapplies a mutation after a concurrent write without losing either it
   let state=emptyState(),version=0,conflict=true;
   const auditEntries=[];
   const repository={
+    async getMembership(){return {role:'member'};},
     async readState(){return {data:structuredClone(state),version};},
     async compareAndSave(expected,next){
       if(conflict){conflict=false;state=applyAction(state,{type:'add',collection:'inventory',id:'other',item:{name:'Other device item'}});version++;return undefined;}
@@ -237,6 +238,7 @@ test('add/update actions upload base64 images to object storage before saving; d
   let state=emptyState(),version=0;
   const stored=[],removed=[];
   const repository={
+    async getMembership(){return {role:'member'};},
     async readState(){return {data:structuredClone(state),version};},
     async compareAndSave(expected,next){if(expected!==version)return undefined;state=next;return ++version;},
     async logAudit(){},
@@ -259,7 +261,7 @@ test('add/update actions upload base64 images to object storage before saving; d
 });
 test('image storage failures surface as 503 when unconfigured or 400 when invalid, without saving',async()=>{
   let saved=false;
-  const repository={async readState(){return {data:emptyState(),version:0};},async compareAndSave(){saved=true;return 1;},async logAudit(){}};
+  const repository={async getMembership(){return {role:'member'};},async readState(){return {data:emptyState(),version:0};},async compareAndSave(){saved=true;return 1;},async logAudit(){}};
   const unconfigured=createHandler(repository,()=>({userId:'user-1'}),{async store(){const error=new Error('Object storage is not configured.');error.status=503;throw error;},async remove(){}});
   const res1=response();
   await unconfigured({method:'POST',headers:{'content-type':'application/json'},body:{type:'add',collection:'inventory',id:'x',item:{name:'X',image:'data:image/png;base64,AAAA'}}},res1);
@@ -918,6 +920,7 @@ test('API records reminder completion and snooze history, but not plain field ed
   let version=0;
   const historyEvents=[];
   const repository={
+    async getMembership(){return {role:'member'};},
     async readState(){return {data:structuredClone(state),version};},
     async compareAndSave(expected,next){if(expected!==version)return undefined;state=next;return ++version;},
     async logAudit(){},

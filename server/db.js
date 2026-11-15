@@ -21,45 +21,48 @@ export async function readVersion() {
   return Number(rows[0].version);
 }
 
+// Read as one read-only snapshot in a single round trip. As separate queries, a save landing
+// between them could pair one version number with rows from either side of that save -- and a
+// device holding such a mix would keep it, because its next poll sees a version it already has.
 export async function readState() {
   const sql = database();
-  const [households, inventory, shoppingList, appliances, reminders, checklistChecks, kitRows, medications, planRows, familyRows, contactRows, settingsRows, consumption] = await Promise.all([
-    sql`SELECT version FROM northstar_household WHERE id = ${householdId}`,
-    sql`SELECT id, name, quantity, unit, category,
+  const [households, inventory, shoppingList, appliances, reminders, checklistChecks, kitRows, medications, planRows, familyRows, contactRows, settingsRows, consumption] = await sql.transaction(tx => [
+    tx`SELECT version FROM northstar_household WHERE id = ${householdId}`,
+    tx`SELECT id, name, quantity, unit, category,
           calories_per_unit AS "caloriesPerUnit", hours_per_unit AS "hoursPerUnit", capacity_per_unit AS "capacityPerUnit",
           price, gallons_per_unit AS "gallonsPerUnit", target, store, emoji, image,
           macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate",
           barcode, recurring_days AS "recurringDays", location, kit_id AS "kitId"
         FROM northstar_inventory WHERE household_id = ${householdId} ORDER BY seq`,
-    sql`SELECT id, name, quantity, unit, category,
+    tx`SELECT id, name, quantity, unit, category,
           calories_per_unit AS "caloriesPerUnit", hours_per_unit AS "hoursPerUnit", capacity_per_unit AS "capacityPerUnit",
           price, gallons_per_unit AS "gallonsPerUnit", target, store, emoji, image,
           macro_tag AS "macroTag", fuel_type AS "fuelType", purchase_date AS "purchaseDate", expiry_date AS "expiryDate",
           barcode, recurring_days AS "recurringDays", location, kit_id AS "kitId"
         FROM northstar_shopping_items WHERE household_id = ${householdId} ORDER BY seq`,
-    sql`SELECT id, name, watts, hours, active, priority FROM northstar_appliances WHERE household_id = ${householdId} ORDER BY seq`,
-    sql`SELECT id, title, category, recurring_days AS "recurringDays", notes, start_date AS "startDate",
+    tx`SELECT id, name, watts, hours, active, priority FROM northstar_appliances WHERE household_id = ${householdId} ORDER BY seq`,
+    tx`SELECT id, title, category, recurring_days AS "recurringDays", notes, start_date AS "startDate",
           last_completed_date AS "lastCompletedDate", snoozed_until AS "snoozedUntil"
         FROM northstar_reminders WHERE household_id = ${householdId} ORDER BY seq`,
-    sql`SELECT id, completed_at AS "completedAt" FROM northstar_checklist_checks WHERE household_id = ${householdId}`,
-    sql`SELECT id, name, purpose, target_contents AS "targetContents", assigned_to AS "assignedTo" FROM northstar_kits WHERE household_id = ${householdId} ORDER BY seq`,
-    sql`SELECT id, person, name, dose, quantity_on_hand AS "quantityOnHand", refill_date AS "refillDate", prescriber, notes
+    tx`SELECT id, completed_at AS "completedAt" FROM northstar_checklist_checks WHERE household_id = ${householdId}`,
+    tx`SELECT id, name, purpose, target_contents AS "targetContents", assigned_to AS "assignedTo" FROM northstar_kits WHERE household_id = ${householdId} ORDER BY seq`,
+    tx`SELECT id, person, name, dose, quantity_on_hand AS "quantityOnHand", refill_date AS "refillDate", prescriber, notes
         FROM northstar_medications WHERE household_id = ${householdId} ORDER BY seq`,
-    sql`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary",
+    tx`SELECT shelter_spot AS "shelterSpot", meeting_primary AS "meetingPrimary", meeting_secondary AS "meetingSecondary",
           location_label AS "locationLabel", latitude, longitude, hazards, links
         FROM northstar_plan WHERE household_id = ${householdId}`,
-    sql`SELECT name, role, dob, kind, calories_per_day AS "caloriesPerDay", water_gallons_per_day AS "waterGallonsPerDay"
+    tx`SELECT name, role, dob, kind, calories_per_day AS "caloriesPerDay", water_gallons_per_day AS "waterGallonsPerDay"
         FROM northstar_family_members WHERE household_id = ${householdId} ORDER BY position`,
-    sql`SELECT name, phone, type FROM northstar_contacts WHERE household_id = ${householdId} ORDER BY position`,
-    sql`SELECT household_size AS "householdSize", calories_per_person_per_day AS "caloriesPerPersonPerDay",
+    tx`SELECT name, phone, type FROM northstar_contacts WHERE household_id = ${householdId} ORDER BY position`,
+    tx`SELECT household_size AS "householdSize", calories_per_person_per_day AS "caloriesPerPersonPerDay",
           water_gallons_per_person_per_day AS "waterGallonsPerPersonPerDay", survival_goal_days AS "survivalGoalDays",
           heat_goal_hours AS "heatGoalHours", power_goal_kwh AS "powerGoalKwh",
           battery_usable_fraction AS "batteryUsableFraction", inverter_efficiency AS "inverterEfficiency"
         FROM northstar_settings WHERE household_id = ${householdId}`,
-    sql`SELECT id, item_id AS "itemId", event_date AS date, quantity, note
+    tx`SELECT id, item_id AS "itemId", event_date AS date, quantity, note
         FROM northstar_consumption_events WHERE household_id = ${householdId}
         ORDER BY event_date ASC, created_at ASC, id ASC`,
-  ]);
+  ], {isolationLevel: 'RepeatableRead', readOnly: true});
   if (!households.length) throw new Error('Run the database migration before using the app.');
   const planRow = planRows[0];
   const plan = planRow ? {
@@ -152,8 +155,6 @@ export async function compareAndSave(version, next, current = emptyState()) {
   const writerToken = randomUUID();
   const inventoryDiff = diffById(current.inventory, next.inventory);
   const shoppingDiff = diffById(current.shoppingList, next.shoppingList);
-  // priority is written as `|| 'normal'` below: the column is NOT NULL, and compareAndSave must
-  // not depend on every caller having parsed its input through applianceSchema first.
   const applianceDiff = diffById(current.appliances, next.appliances);
   const consumptionDiff = diffById(current.consumption, next.consumption);
   const reminderDiff = diffById(current.reminders, next.reminders);
@@ -175,6 +176,8 @@ export async function compareAndSave(version, next, current = emptyState()) {
     for (const id of shoppingDiff.toDelete) statements.push(tx`DELETE FROM northstar_shopping_items WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
     for (const item of shoppingDiff.toUpsert) statements.push(upsertShoppingItem(tx, item, guard));
     for (const id of applianceDiff.toDelete) statements.push(tx`DELETE FROM northstar_appliances WHERE household_id = ${householdId} AND id = ${id} AND ${guard}`);
+    // priority is written as `|| 'normal'`: the column is NOT NULL, and compareAndSave must not
+    // depend on every caller having parsed its input through applianceSchema first.
     for (const appliance of applianceDiff.toUpsert) statements.push(tx`
       INSERT INTO northstar_appliances (household_id, id, name, watts, hours, active, priority)
       SELECT ${householdId}, ${appliance.id}, ${appliance.name}, ${appliance.watts}, ${appliance.hours}, ${appliance.active}, ${appliance.priority || 'normal'}
@@ -454,6 +457,9 @@ export async function pruneRequestMetrics(retentionDays = 14) {
   const sql = database();
   await sql`DELETE FROM northstar_request_metrics WHERE bucket < now() - make_interval(days => ${Math.round(retentionDays)})`;
   await sql`DELETE FROM northstar_alert_state WHERE last_sent_at < now() - make_interval(days => ${Math.round(retentionDays)})`;
+  // A lapsed rate-limit window is reset the next time its key is used (see rateLimit), so its
+  // row carries nothing once it has expired; without this the table only ever grows.
+  await sql`DELETE FROM northstar_login_limits WHERE reset_at < now()`;
 }
 // --- Readiness history. ---
 // Aggregate figures only (days of supply, totals, counts): no item names, quantities or
@@ -476,7 +482,7 @@ export async function listReadinessHistory(householdId = 1, limit = 90) {
   // Oldest first so the client can plot it straight through without reversing.
   return rows.slice().reverse();
 }
-export async function pruneReadinessHistory(retentionDays = 90, householdId = 1) {
+export async function pruneReadinessHistory(retentionDays = 365, householdId = 1) {
   const sql = database();
   await sql`DELETE FROM northstar_readiness_history WHERE household_id = ${householdId} AND day < (now() - make_interval(days => ${Math.round(retentionDays)}))::date`;
 }

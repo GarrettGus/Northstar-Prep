@@ -9,14 +9,14 @@ const signedIn=()=>({userId:'user-1'});
 
 test('a poll that already holds the current version gets an unchanged reply without a full read',async()=>{
   let fullReads=0;
-  const repository={async readVersion(){return 7;},async readState(){fullReads++;return {data:emptyState(),version:7};}};
+  const repository={async getMembership(){return {role:'member'};},async readVersion(){return 7;},async readState(){fullReads++;return {data:emptyState(),version:7};}};
   const res=response();
   await createHandler(repository,signedIn)({method:'GET',url:'/api/hub?since=7',headers:{}},res);
   assert.equal(res.code,200);assert.deepEqual(res.data,{unchanged:true,version:7});assert.equal(fullReads,0);
 });
 
 test('a poll with an older version, no version, or a malformed one gets the full household',async()=>{
-  const repository={async readVersion(){return 8;},async readState(){return {data:emptyState(),version:8};}};
+  const repository={async getMembership(){return {role:'member'};},async readVersion(){return 8;},async readState(){return {data:emptyState(),version:8};}};
   for (const url of ['/api/hub?since=7','/api/hub','/api/hub?since=abc','/api/hub?since=-1']) {
     const res=response();
     await createHandler(repository,signedIn)({method:'GET',url,headers:{}},res);
@@ -25,7 +25,7 @@ test('a poll with an older version, no version, or a malformed one gets the full
 });
 
 test('Vercel-style parsed query strings are honored too',async()=>{
-  const repository={async readVersion(){return 3;},async readState(){throw new Error('should not read');}};
+  const repository={async getMembership(){return {role:'member'};},async readVersion(){return 3;},async readState(){throw new Error('should not read');}};
   const res=response();
   await createHandler(repository,signedIn)({method:'GET',url:'/api/hub?since=3',query:{since:'3'},headers:{}},res);
   assert.equal(res.data.unchanged,true);

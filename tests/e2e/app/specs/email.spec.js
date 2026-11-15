@@ -1,5 +1,5 @@
 import { test, expect } from '../support/app.js';
-import { environment } from '../support/environment.js';
+import { environment, storageStatePath } from '../support/environment.js';
 import { query } from '../support/household.js';
 
 // The dev server sends through a local stand-in for the email provider (support/stubServices.js).
@@ -38,7 +38,13 @@ test('an owner\'s invitation is emailed, and the emailed link lets the new membe
 test.describe('signed out', () => {
   test.use({storageState: {cookies: [], origins: []}});
 
-  test('a member who forgot their password can email themselves a reset link and sign in with the new password', async ({page}) => {
+  test('a member who forgot their password can email themselves a reset link and sign in with the new password, which signs out every other device', async ({page, browser}) => {
+    // Another device that is already signed in as this member, from before the reset.
+    const otherDevice = await browser.newContext({storageState: storageStatePath});
+    const otherPage = await otherDevice.newPage();
+    await otherPage.goto('/');
+    await expect(otherPage.getByRole('button', {name: 'Open household settings'})).toBeVisible();
+
     await page.goto('/');
     await page.getByRole('button', {name: 'Forgot password?'}).click();
     await page.getByLabel('Email').fill(environment().owner.email);
@@ -52,6 +58,14 @@ test.describe('signed out', () => {
     await page.getByLabel('New password').fill(environment().owner.password);
     await page.getByRole('button', {name: 'Set new password'}).click();
     await expect(page.getByRole('button', {name: 'Open household settings'})).toBeVisible();
+
+    // The device that reset is signed in with its fresh cookie; the other one is signed out
+    // the next time it asks the server anything, even though its cookie has not expired.
+    await page.reload();
+    await expect(page.getByRole('button', {name: 'Open household settings'})).toBeVisible();
+    await otherPage.reload();
+    await expect(otherPage.getByRole('button', {name: 'Sign in'})).toBeVisible();
+    await otherDevice.close();
   });
 
   test('asking for an address that is not a member looks the same and sends nothing', async ({page}) => {

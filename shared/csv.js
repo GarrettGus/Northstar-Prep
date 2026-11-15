@@ -13,8 +13,23 @@ export const csvColumns = [
 // Same per-collection row cap the JSON backup schema enforces (see shared/schema.js).
 export const maxCsvRowsPerCollection = 2000;
 
+// Spreadsheet apps run a cell that starts with = + - @ (or a tab/CR, which some strip first) as a
+// formula, so an item named `=HYPERLINK(...)` would execute when the export is opened. Text
+// cells that start that way get a leading apostrophe, which Excel, Sheets and Numbers all show
+// as nothing and treat as "this is text" (OWASP's CSV-injection guidance). Real numbers are
+// left alone: `-5` as a number is not a formula, and quantities must stay numeric.
+const formulaStart = /^[=+\-@\t\r]/;
+export function neutralizeFormula(value) {
+  return typeof value === 'string' && formulaStart.test(value) ? `'${value}` : value;
+}
+// The inverse, applied on import so a file this app exported comes back as the original text.
+const guardedFormula = /^'[=+\-@\t\r]/;
+export function restoreFormula(value) {
+  return typeof value === 'string' && guardedFormula.test(value) ? value.slice(1) : value;
+}
+
 function csvEscape(value) {
-  const text = value === null || value === undefined ? '' : String(value);
+  const text = value === null || value === undefined ? '' : String(neutralizeFormula(value));
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
@@ -69,10 +84,10 @@ export function csvToBackup(text, makeId) {
       errors.push({ row: lineNumber, message: `Skipped: ${isShopping ? 'shopping list' : 'inventory'} limit of ${maxCsvRowsPerCollection} rows reached.` });
       continue;
     }
-    const candidate = { id: (raw.id || '').trim() || makeId() };
+    const candidate = { id: restoreFormula((raw.id || '').trim()) || makeId() };
     for (const key of csvColumns) {
       if (key === 'collection' || key === 'id') continue;
-      const value = typeof raw[key] === 'string' ? raw[key].trim() : raw[key];
+      const value = typeof raw[key] === 'string' ? restoreFormula(raw[key].trim()) : raw[key];
       if (value !== '' && value !== undefined) candidate[key] = value;
     }
     const result = itemSchema.safeParse(candidate);

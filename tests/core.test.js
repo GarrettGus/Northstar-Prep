@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createHmac } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema, planSchema, kitSchema, medicationSchema } from '../shared/schema.js';
 import { nextReminderDueDate, effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, addDaysISO } from '../shared/reminders.js';
@@ -12,8 +13,7 @@ import { createHandler as createMembersHandler } from '../api/members.js';
 import { createHandler as createInviteHandler } from '../api/invite.js';
 import { createHandler as createPasswordResetHandler } from '../api/password-reset.js';
 import { createHandler as createPasswordHandler } from '../api/password.js';
-import { createHandler as createReminderHistoryHandler } from '../api/reminder-history.js';
-import { createHandler as createReadinessHistoryHandler } from '../api/readiness-history.js';
+import { createReminderHistoryHandler, createReadinessHistoryHandler } from '../api/_history.js';
 import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds, daysUntilExpiry, expirationQueue, expirationSummary, deriveBurnRate, consumptionForecast } from '../shared/readiness.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
 process.env.DATABASE_URL='postgres://test-only/db';
@@ -199,13 +199,23 @@ test('invitation tokens are opaque, single-use secrets that hash deterministical
 test('sessions carry the signed-in user, reject tampering/expiry, and rotating SESSION_SECRET invalidates them',()=>{
   const now=Date.now();const value=token('user-1',now);
   const req={headers:{cookie:cookie(value)}};
-  assert.deepEqual(validSession(req,now),{userId:'user-1'});
+  assert.deepEqual(validSession(req,now),{userId:'user-1',version:0});
   assert.equal(validSession(req,now+8*86400000),false);
   assert.equal(validSession({headers:{cookie:cookie(value+'x')}},now),false);
   const previousSecret=process.env.SESSION_SECRET;
   process.env.SESSION_SECRET='a-different-secret-that-is-also-long-enough';
   assert.equal(validSession(req,now),false);
   process.env.SESSION_SECRET=previousSecret;
+});
+test('a session cookie carries the session version it was issued at, and legacy cookies count as version 0',()=>{
+  const now=Date.now();
+  assert.deepEqual(validSession({headers:{cookie:cookie(token('user-1',now,3))}},now),{userId:'user-1',version:3});
+  // A cookie signed before the version field existed has no `ver`, so every existing sign-in survives the upgrade.
+  const payload=Buffer.from(JSON.stringify({sub:'user-1',exp:Math.floor(now/1000)+3600})).toString('base64url');
+  const signature=createHmac('sha256',process.env.SESSION_SECRET).update(payload).digest('base64url');
+  assert.deepEqual(validSession({headers:{cookie:cookie(`${payload}.${signature}`)}},now),{userId:'user-1',version:0});
+  assert.equal(validSession({headers:{cookie:cookie(token('user-1',now,-1))}},now),false);
+  assert.equal(validSession({headers:{cookie:cookie(token('user-1',now,1.5))}},now),false);
 });
 test('mutations reject cross-site origins and non-JSON forms',()=>{
   assert.equal(sameOrigin({headers:{host:'example.com',origin:'https://evil.com','content-type':'application/json'}}),false);
@@ -221,6 +231,7 @@ test('API reapplies a mutation after a concurrent write without losing either it
   let state=emptyState(),version=0,conflict=true;
   const auditEntries=[];
   const repository={
+    async getMembership(){return {role:'member'};},
     async readState(){return {data:structuredClone(state),version};},
     async compareAndSave(expected,next){
       if(conflict){conflict=false;state=applyAction(state,{type:'add',collection:'inventory',id:'other',item:{name:'Other device item'}});version++;return undefined;}
@@ -237,6 +248,7 @@ test('add/update actions upload base64 images to object storage before saving; d
   let state=emptyState(),version=0;
   const stored=[],removed=[];
   const repository={
+    async getMembership(){return {role:'member'};},
     async readState(){return {data:structuredClone(state),version};},
     async compareAndSave(expected,next){if(expected!==version)return undefined;state=next;return ++version;},
     async logAudit(){},
@@ -259,7 +271,7 @@ test('add/update actions upload base64 images to object storage before saving; d
 });
 test('image storage failures surface as 503 when unconfigured or 400 when invalid, without saving',async()=>{
   let saved=false;
-  const repository={async readState(){return {data:emptyState(),version:0};},async compareAndSave(){saved=true;return 1;},async logAudit(){}};
+  const repository={async getMembership(){return {role:'member'};},async readState(){return {data:emptyState(),version:0};},async compareAndSave(){saved=true;return 1;},async logAudit(){}};
   const unconfigured=createHandler(repository,()=>({userId:'user-1'}),{async store(){const error=new Error('Object storage is not configured.');error.status=503;throw error;},async remove(){}});
   const res1=response();
   await unconfigured({method:'POST',headers:{'content-type':'application/json'},body:{type:'add',collection:'inventory',id:'x',item:{name:'X',image:'data:image/png;base64,AAAA'}}},res1);
@@ -421,7 +433,7 @@ test('password-reset API validates tokens, rejects expired/used links, and signs
       return undefined;
     },
     async getMembership(userId){return userId==='member-1' ? {role:'member'} : undefined;},
-    async resetPassword(entry){passwordSet=entry;},
+    async resetPassword(entry){passwordSet=entry;return 4;},
   };
   const handler=createPasswordResetHandler(repository);
 
@@ -449,6 +461,8 @@ test('password-reset API validates tokens, rejects expired/used links, and signs
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',password:'longenoughpw'}},success);
   assert.equal(success.code,200);assert.equal(success.data.user.id,'member-1');assert.match(success.headers['Set-Cookie'],/northstar=/);
   assert.equal(passwordSet.userId,'member-1');
+  // The reset bumps the account's session version; the cookie it hands back carries the new one.
+  assert.equal(validSession({headers:{cookie:success.headers['Set-Cookie'].split(';')[0]}})?.version,4);
 
   const limited=response();
   await createPasswordResetHandler({...repository,async rateLimit(){return false;}})({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',password:'longenoughpw'}},limited);
@@ -460,7 +474,7 @@ test('password API lets a signed-in user change their own password after re-ente
   const repository={
     async rateLimit(){return true;},
     async findCredentialsById(userId){return userId==='user-1' ? {id:'user-1',email:'me@example.com',password_hash:hash} : undefined;},
-    async setPassword(userId,passwordHash){updated={userId,passwordHash};},
+    async setPassword(userId,passwordHash){updated={userId,passwordHash};return 2;},
   };
   const handler=createPasswordHandler(repository,()=>({userId:'user-1'}));
 
@@ -471,6 +485,8 @@ test('password API lets a signed-in user change their own password after re-ente
   const success=response();
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},success);
   assert.equal(success.code,200);assert.equal(updated.userId,'user-1');assert.ok(verifyPassword('new-password-123',updated.passwordHash));
+  // Other devices are signed out by the version bump; this one is kept signed in with a fresh cookie.
+  assert.deepEqual(validSession({headers:{cookie:success.headers['Set-Cookie'].split(';')[0]}}),{userId:'user-1',version:2});
 
   const unauthenticated=response();
   await createPasswordHandler(repository,()=>false)({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},unauthenticated);
@@ -479,6 +495,25 @@ test('password API lets a signed-in user change their own password after re-ente
   const limited=response();
   await createPasswordHandler({...repository,async rateLimit(){return false;}},()=>({userId:'user-1'}))({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},limited);
   assert.equal(limited.code,429);
+});
+test('the household API passes the cookie\'s session version to the membership check and answers 401 when it no longer matches',async()=>{
+  const seen=[];
+  const repository={
+    async getMembership(userId,householdId,version){seen.push([userId,householdId,version]);return version===2?{role:'member'}:undefined;},
+    async readState(){return {data:emptyState(),version:1};},
+  };
+  const stale=response();
+  await createHandler(repository,()=>({userId:'user-1',version:1}))({method:'GET',headers:{}},stale);
+  assert.equal(stale.code,401);assert.equal(stale.data.data,undefined);
+  const current=response();
+  await createHandler(repository,()=>({userId:'user-1',version:2}))({method:'GET',headers:{}},current);
+  assert.equal(current.code,200);
+  assert.deepEqual(seen,[['user-1',1,1],['user-1',1,2]]);
+  // A removed member (no membership at all) is turned away on writes too, before anything is applied.
+  let saved=false;
+  const removed=response();
+  await createHandler({...repository,async getMembership(){return undefined;},async compareAndSave(){saved=true;}},()=>({userId:'user-1',version:2}))({method:'POST',headers:{'content-type':'application/json'},body:{type:'add',collection:'inventory',id:'x',item:{name:'X'}}},removed);
+  assert.equal(removed.code,401);assert.equal(saved,false);
 });
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{
   assert.equal(waterGallons({quantity:3.785411784,unit:'liters'}),1);
@@ -918,6 +953,7 @@ test('API records reminder completion and snooze history, but not plain field ed
   let version=0;
   const historyEvents=[];
   const repository={
+    async getMembership(){return {role:'member'};},
     async readState(){return {data:structuredClone(state),version};},
     async compareAndSave(expected,next){if(expected!==version)return undefined;state=next;return ++version;},
     async logAudit(){},

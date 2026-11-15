@@ -16,7 +16,7 @@ export function createHandler(repository = {rateLimit, findUserByEmail, getMembe
       const session = validSession(req);
       if (!session) return res.status(200).json({authenticated: false, configured: configured(), emailEnabled: emailConfigured()});
       try {
-        const membership = await repository.getMembership(session.userId);
+        const membership = await repository.getMembership(session.userId, 1, session.version);
         if (!membership) return res.status(200).json({authenticated: false, configured: configured(), emailEnabled: emailConfigured()});
         return res.status(200).json({authenticated: true, configured: configured(), user: {id: session.userId, role: membership.role}});
       } catch (error) { logFailure(request, '/api/session', 503, error); return res.status(503).json({error: 'Account lookup unavailable.'}); }
@@ -36,7 +36,7 @@ export function createHandler(repository = {rateLimit, findUserByEmail, getMembe
       if (!user || !passwordOk) return res.status(401).json({error: 'Incorrect email or password.'});
       const membership = await repository.getMembership(user.id);
       if (!membership) return res.status(403).json({error: 'This account is not a member of the household.'});
-      res.setHeader('Set-Cookie', cookie(token(user.id)));
+      res.setHeader('Set-Cookie', cookie(token(user.id, Date.now(), user.session_version ?? 0)));
       return res.status(200).json({authenticated: true, user: {id: user.id, role: membership.role}});
     } catch (error) { logFailure(request, '/api/session', 503, error); return res.status(503).json({error: 'Login is unavailable. Check database setup.'}); }
   };

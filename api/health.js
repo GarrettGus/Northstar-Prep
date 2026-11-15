@@ -1,6 +1,6 @@
 import { database, getMembership, recordRequestMetric, summarizeRequestMetrics } from '../server/db.js';
 import { validSession } from '../server/auth.js';
-import { alertPolicy, beginRequest, logFailure, logIssue, metricsRetentionDays, observe } from '../server/observability.js';
+import { alertPolicy, beginRequest, logFailure, logIssue, metricsRetentionDays, observe, skipTelemetry } from '../server/observability.js';
 
 const metricsWindowMinutes = 1440;
 
@@ -62,23 +62,32 @@ export function createHandler(
     try { await repository.probeDatabase(); }
     catch (error) { databaseOk = false; logFailure(request, '/api/health', 503, error); }
     const latencyMs = Date.now() - started;
-    // Recorded as its own pseudo-route so database latency is visible separately from the
-    // request latency of the endpoints that depend on it.
-    try { await repository.recordRequestMetric({route: 'database', outcome: databaseOk ? 'ok' : 'server_error', status: databaseOk ? 200 : 503, latencyMs}); }
-    catch { /* The probe result is still reported; only its history is lost. */ }
-
-    if (!databaseOk) return res.status(503).json({status: 'error', database: 'unavailable', latencyMs, requestId: request.id, error: 'Database is unavailable.'});
-    const body = {status: 'ok', database: 'ok', latencyMs, requestId: request.id};
 
     // Aggregate counters are household-neutral but still operational detail, so they are
     // shown only to a signed-in member rather than to every unauthenticated caller.
     const session = authenticate(req);
-    if (session) {
+    let member = false;
+    if (session && databaseOk) {
+      try { member = Boolean(await repository.getMembership(session.userId, 1, session.version)); }
+      catch (error) { logIssue(request, '/api/health', 'membership_lookup_failure', error); }
+    }
+
+    // This endpoint is open to anyone, so an anonymous call is a read-only `SELECT 1` and writes
+    // nothing (not its own request metric, not a latency probe). A signed-in member's call is
+    // recorded, as its own pseudo-route so database latency is visible separately from the
+    // request latency of the endpoints that depend on it; that is what feeds Service health.
+    if (!member) skipTelemetry(res);
+    else {
+      try { await repository.recordRequestMetric({route: 'database', outcome: 'ok', status: 200, latencyMs}); }
+      catch { /* The probe result is still reported; only its history is lost. */ }
+    }
+
+    if (!databaseOk) return res.status(503).json({status: 'error', database: 'unavailable', latencyMs, requestId: request.id, error: 'Database is unavailable.'});
+    const body = {status: 'ok', database: 'ok', latencyMs, requestId: request.id};
+    if (member) {
       try {
-        if (await repository.getMembership(session.userId)) {
-          const rows = await repository.summarizeRequestMetrics(metricsWindowMinutes);
-          body.metrics = summarize(rows, metricsRetentionDays(), latencyMs);
-        }
+        const rows = await repository.summarizeRequestMetrics(metricsWindowMinutes);
+        body.metrics = summarize(rows, metricsRetentionDays(), latencyMs);
       } catch (error) { logIssue(request, '/api/health', 'metrics_summary_failure', error); }
     }
     return res.status(200).json(body);

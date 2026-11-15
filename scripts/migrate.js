@@ -16,6 +16,9 @@ await sql`CREATE TABLE IF NOT EXISTS northstar_users (
   password_hash text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 )`;
+// Bumped on every password change or reset; session cookies carry the value they were issued
+// at, so bumping it signs out every other device (see getMembership in server/db.js).
+await sql`ALTER TABLE northstar_users ADD COLUMN IF NOT EXISTS session_version integer NOT NULL DEFAULT 0`;
 await sql`CREATE TABLE IF NOT EXISTS northstar_household_members (
   household_id integer NOT NULL REFERENCES northstar_household(id),
   user_id uuid NOT NULL REFERENCES northstar_users(id),

@@ -8,6 +8,8 @@ import { recordRequestMetric, countRecentFailures, claimAlert } from './db.js';
 // running the deployment without exposing what the household keeps in it.
 
 const requests = new WeakMap();
+// Responses a handler has asked not to be counted in the metrics tables (see skipTelemetry).
+const untracked = new WeakSet();
 const failureOutcomes = new Set(['write_failure', 'server_error']);
 
 export function environment() {
@@ -24,6 +26,11 @@ export function beginRequest(req, res) {
   requests.set(res, request);
   return request;
 }
+
+// For an endpoint anyone can call without signing in: its request is still logged, but it must
+// not write to the database, or a stranger could grow the metrics tables and keep a sleeping
+// database awake just by calling it.
+export function skipTelemetry(res) { untracked.add(res); }
 
 export function logFailure({ id, started }, route, status, error) {
   console.error(JSON.stringify({
@@ -127,7 +134,7 @@ async function maybeAlert(request, route, telemetry) {
   if (webhook) await telemetry.sendAlert(payload);
 }
 
-async function report(request, route, method, status, telemetry) {
+async function report(request, route, method, status, telemetry, res) {
   const latencyMs = Date.now() - request.started;
   const outcome = classifyOutcome(method, status);
   const line = JSON.stringify({
@@ -135,6 +142,7 @@ async function report(request, route, method, status, telemetry) {
     latencyMs, environment: environment(),
   });
   if (isFailure(outcome)) console.error(line); else console.log(line);
+  if (untracked.has(res)) return;
   try {
     await telemetry.record({ route, outcome, status, latencyMs });
     if (isFailure(outcome)) await maybeAlert(request, route, telemetry);
@@ -156,11 +164,11 @@ export function observe(route, handler, telemetry = defaultTelemetry) {
     const request = beginRequest(req, res);
     try {
       const result = await handler(req, res);
-      await report(request, route, req.method, statusOf(res), telemetry);
+      await report(request, route, req.method, statusOf(res), telemetry, res);
       return result;
     } catch (error) {
       logFailure(request, route, 500, error);
-      await report(request, route, req.method, 500, telemetry);
+      await report(request, route, req.method, 500, telemetry, res);
       throw error;
     }
   };

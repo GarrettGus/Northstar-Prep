@@ -22,6 +22,10 @@ export async function resetHousehold() {
   await query('UPDATE northstar_household SET version = 0, writer_token = NULL WHERE id = 1');
   // Accounts a spec created (an invited member, say) go too; only the owner the suite signs in as stays.
   const owner = environment().userId;
+  // A spec that resets or changes the owner's password bumps session_version and signs out the
+  // suite's shared, pre-made session cookie (which is the point of that behaviour); start each
+  // spec with the version that cookie carries.
+  await query('UPDATE northstar_users SET session_version = 0 WHERE id = $1', [owner]);
   await query('DELETE FROM northstar_invitations');
   await query('DELETE FROM northstar_password_resets');
   await query('DELETE FROM northstar_household_members WHERE user_id <> $1', [owner]);

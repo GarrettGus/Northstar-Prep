@@ -31,6 +31,13 @@ async function query(url, text, values = []) {
   try { return (await client.query(text, values)).rows; } finally { await client.end(); }
 }
 
+// Creates a household member the way production does: an owner invites an email, and accepting
+// the invitation creates the user and their membership in one transaction.
+async function addMember(db, email, role, passwordHash = 'x') {
+  const invitationId = await db.createInvitation({email, role, invitedBy: null, tokenHash: `token-${email}`, expiresAt: new Date(Date.now() + 3600_000).toISOString()});
+  return db.acceptInvitation({invitationId, householdId: 1, role, email, passwordHash});
+}
+
 function disposableDatabase() {
   const state = {};
   before(async () => { Object.assign(state, await createDisposableDatabase()); });
@@ -216,8 +223,8 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
 
     it('stores push subscriptions per member, filters by member, and stops listing a removed member', async () => {
       const db = await loadDb(database.url);
-      const owner = await db.createUserWithMembership({email: 'push-owner@example.com', passwordHash: 'x', role: 'owner'});
-      const member = await db.createUserWithMembership({email: 'push-member@example.com', passwordHash: 'x', role: 'member'});
+      const owner = await addMember(db, 'push-owner@example.com', 'owner');
+      const member = await addMember(db, 'push-member@example.com', 'member');
       await db.savePushSubscription({id: 'sub-owner', userId: owner, endpoint: 'https://push.example/o', p256dh: 'k', auth: 'a'});
       await db.savePushSubscription({id: 'sub-member', userId: member, endpoint: 'https://push.example/m', p256dh: 'k', auth: 'a'});
       // Re-subscribing the same browser updates its row.
@@ -233,6 +240,26 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       assert.deepEqual(ids(await db.listPushSubscriptions()), ['sub-owner']);
       await db.deletePushSubscription('sub-owner', owner);
       assert.deepEqual(await db.listPushSubscriptions(), []);
+    });
+
+    it('signs a user out everywhere when their password changes or is reset, and only then', async () => {
+      const db = await loadDb(database.url);
+      const userId = await addMember(db, 'sessions@example.com', 'member');
+      assert.equal((await db.findUserByEmail('sessions@example.com')).session_version, 0);
+      // No version supplied (a lookup that is not about a cookie), and the version every cookie starts at.
+      assert.deepEqual(await db.getMembership(userId), {role: 'member'});
+      assert.deepEqual(await db.getMembership(userId, 1, 0), {role: 'member'});
+      assert.equal(await db.getMembership(userId, 1, 1), undefined);
+
+      assert.equal(await db.setPassword(userId, 'new-hash'), 1);
+      assert.equal(await db.getMembership(userId, 1, 0), undefined, 'a cookie from before the change is rejected');
+      assert.deepEqual(await db.getMembership(userId, 1, 1), {role: 'member'}, 'the cookie issued by the change itself works');
+
+      await db.createPasswordReset({userId, tokenHash: 'reset-token-hash', expiresAt: new Date(Date.now() + 3600_000).toISOString()});
+      assert.equal(await db.resetPassword({userId, passwordHash: 'reset-hash'}), 2);
+      assert.equal(await db.getMembership(userId, 1, 1), undefined);
+      assert.deepEqual(await db.getMembership(userId, 1, 2), {role: 'member'});
+      assert.equal((await db.findUserByEmail('sessions@example.com')).session_version, 2);
     });
 
     it('carries the old hardcoded quick links over to an existing plan the first time links are added', async () => {

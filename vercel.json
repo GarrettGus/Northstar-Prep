@@ -1,1 +1,68 @@
-{"framework": "vite", "buildCommand": "npm run build", "outputDirectory": "dist", "crons": [{"path": "/api/backup", "schedule": "0 8 * * *"}], "rewrites": [{"source": "/api/go", "destination": "/api/live?route=go"}, {"source": "/api/alerts", "destination": "/api/live?route=alerts"}, {"source": "/api/push", "destination": "/api/live?route=push"}]}
+{
+  "framework": "vite",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "crons": [
+    {
+      "path": "/api/backup",
+      "schedule": "0 8 * * *"
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/api/go",
+      "destination": "/api/live?route=go"
+    },
+    {
+      "source": "/api/alerts",
+      "destination": "/api/live?route=alerts"
+    },
+    {
+      "source": "/api/push",
+      "destination": "/api/live?route=push"
+    },
+    {
+      "source": "/api/audit",
+      "destination": "/api/history?route=audit"
+    },
+    {
+      "source": "/api/readiness-history",
+      "destination": "/api/history?route=readiness-history"
+    },
+    {
+      "source": "/api/reminder-history",
+      "destination": "/api/history?route=reminder-history"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Content-Security-Policy",
+          "value": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.public.blob.vercel-storage.com; media-src 'self' blob:; connect-src 'self'; font-src 'self'; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        },
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "same-origin"
+        },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(self), geolocation=(self), microphone=(), payment=(), usb=()"
+        },
+        {
+          "key": "Strict-Transport-Security",
+          "value": "max-age=31536000"
+        }
+      ]
+    }
+  ]
+}

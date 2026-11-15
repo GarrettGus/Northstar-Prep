@@ -23,7 +23,7 @@ export function createHandler(repository = {getMembership, savePushSubscription,
     if (!['GET', 'POST'].includes(req.method)) return res.status(405).json({error: 'Method not allowed.'});
     if (req.method === 'POST' && !sameOrigin(req)) return res.status(403).json({error: 'Request origin rejected.'});
     try {
-      if (!await repository.getMembership(session.userId)) return res.status(403).json({error: 'Not a member of this household.'});
+      if (!await repository.getMembership(session.userId, 1, session.version)) return res.status(403).json({error: 'Not a member of this household.'});
       if (req.method === 'GET') return res.status(200).json({configured: push.configured(), publicKey: push.publicKey()});
       const body = req.body || {};
       if (body.type === 'unsubscribe') {

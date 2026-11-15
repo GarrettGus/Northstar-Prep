@@ -117,7 +117,7 @@ export function createHandler(
     if (!session) { logFailure(request, '/api/backup', 401); return res.status(401).json({error: 'Please sign in again.'}); }
     if (req.method === 'POST' && !sameOrigin(req)) return res.status(403).json({error: 'Request origin rejected.'});
     try {
-      const membership = await repository.getMembership(session.userId);
+      const membership = await repository.getMembership(session.userId, 1, session.version);
       if (!membership) return res.status(403).json({error: 'Not a member of this household.'});
 
       if (req.method === 'GET') {

@@ -34,8 +34,12 @@ export function hashToken(value) { return createHash('sha256').update(String(val
 
 // --- Session cookies signed with SESSION_SECRET, carrying the authenticated user's ID. ---
 function signature(payload) { return createHmac('sha256', sessionSecret()).update(payload).digest('base64url'); }
-export function token(userId, now = Date.now()) {
-  const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Math.floor(now / 1000) + lifetime })).toString('base64url');
+// `version` is the user's session_version at the time of issue. Changing or resetting a password
+// bumps it in the database, so every cookie signed before then stops working (the handlers
+// compare it through getMembership). Cookies issued before this field existed carry none and
+// count as version 0, which is what every account starts at.
+export function token(userId, now = Date.now(), version = 0) {
+  const payload = Buffer.from(JSON.stringify({ sub: userId, ver: version, exp: Math.floor(now / 1000) + lifetime })).toString('base64url');
   return `${payload}.${signature(payload)}`;
 }
 export function validSession(req, now = Date.now()) {
@@ -45,10 +49,11 @@ export function validSession(req, now = Date.now()) {
     if (!value || value.length > 1024) return false;
     const [payload, sig, ...extra] = value.split('.');
     if (extra.length || !sig || !timingSafeEqual(digest(sig), digest(signature(payload)))) return false;
-    const { sub, exp } = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    const { sub, exp, ver = 0 } = JSON.parse(Buffer.from(payload, 'base64url').toString());
     if (typeof sub !== 'string' || !sub) return false;
+    if (!Number.isSafeInteger(ver) || ver < 0) return false;
     if (!Number.isFinite(exp) || exp <= Math.floor(now / 1000) || exp > Math.floor(now / 1000) + lifetime) return false;
-    return { userId: sub };
+    return { userId: sub, version: ver };
   } catch { return false; }
 }
 export function cookie(value, clear = false) {

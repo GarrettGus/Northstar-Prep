@@ -20,7 +20,7 @@ import { kitCompleteness } from '../shared/kits.js';
 import { GoTime, GoTimeBanner } from './GoTime.jsx';
 import { currentSubscription, pushSupported, subscribe as subscribePush, unsubscribe as unsubscribePush } from './push.js';
 import { HazardProfileSection, WeatherAlerts } from './Hazards.jsx';
-import { clearDeviceData, loadPendingCheckin, savePendingCheckin, enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
+import { actionBody, clearDeviceData, describeAction, discardRejectedAction, enqueueAction, isPermanentRejection, loadCachedState, loadPendingCheckin, loadQueuedActions, loadRejectedActions, peekQueuedAction, rejectQueuedAction, retryDelayMs, retryRejectedAction, savePendingCheckin, saveCachedState, shiftQueuedAction } from './offline.js';
 
 // --- Constants ---
 const SYSTEM_ID = 'Household';
@@ -58,6 +58,12 @@ export default function App() {
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
   const [online, setOnline] = useState(() => typeof navigator === 'undefined' ? true : navigator.onLine);
   const [pendingSync, setPendingSync] = useState(() => loadQueuedActions().length);
+  const [rejectedActions, setRejectedActions] = useState(() => loadRejectedActions());
+  // Bumped to make the queue-flush effect run again: after a failed attempt (with a delay), when
+  // the tab comes back into view, and when an edit is queued while the connection is up.
+  const [flushNonce, setFlushNonce] = useState(0);
+  const flushAttempts = useRef(0);
+  const kickTimer = useRef(null);
   const revision = useRef(-1);
   const busy = useRef(false);
   const epoch = useRef(0);
@@ -120,25 +126,65 @@ export default function App() {
     window.addEventListener('focus',refresh);
     return () => {cancelled=true;clearInterval(timer);window.removeEventListener('focus',refresh);};
   }, [user, online]);
+  const kickFlush = (delay = 0) => {
+    clearTimeout(kickTimer.current);
+    kickTimer.current = setTimeout(() => setFlushNonce(n => n + 1), delay);
+  };
+  useEffect(() => () => clearTimeout(kickTimer.current), []);
+  // Sends queued edits to the server in order. A failure that is the connection's or the server's
+  // fault leaves the edit queued and tries again after a growing delay; an edit the server rejects
+  // for good is set aside (see rejectQueuedAction) so the edits behind it still go through.
   useEffect(() => {
-    if (!user || !online || busy.current || !loadQueuedActions().length) return;
+    if (!user || !online || !loadQueuedActions().length) return;
     let cancelled = false;
+    let retryTimer = null;
+    const retryLater = delay => { retryTimer = setTimeout(() => setFlushNonce(n => n + 1), delay); };
+    // A save is in flight (it reads the queue first), so look again in a moment.
+    if (busy.current) { retryLater(1000); return () => { cancelled = true; clearTimeout(retryTimer); }; }
     const flush = async () => {
-      const queue = loadQueuedActions();
       busy.current = true; setIsSyncing(true);
+      let setAside = false;
       try {
-        while (queue.length && !cancelled) {
-          const result = await request('hub', queue[0]);
-          accept(result); queue.shift(); saveQueuedActions(queue); setPendingSync(queue.length);
+        // The queue is re-read every time round, never held in a local copy: an edit queued while
+        // one is in flight lands behind it in storage and must not be overwritten.
+        for (let entry = peekQueuedAction(); entry && !cancelled; entry = peekQueuedAction()) {
+          try {
+            const result = await request('hub', actionBody(entry));
+            accept(result); setPendingSync(shiftQueuedAction());
+            flushAttempts.current = 0;
+          } catch (error) {
+            if (!isPermanentRejection(error.status)) throw error;
+            setPendingSync(rejectQueuedAction(error.message));
+            setRejectedActions(loadRejectedActions());
+            setAside = true;
+          }
         }
-        if (!cancelled && !queue.length) setGlobalError(null);
+        if (cancelled) return;
+        if (setAside) {
+          // The screen still shows the rejected edit (it was applied locally while queued); the server's copy is the truth.
+          try { accept(await request('hub')); } catch { /* the next poll will do it */ }
+        }
+        if (!loadQueuedActions().length) setGlobalError(null);
       } catch (error) {
-        if (!cancelled) setGlobalError(error.status === 409 ? 'Queued changes conflict with another device. Refresh and review before retrying.' : 'Could not sync queued changes yet. We will retry when you reconnect.');
+        if (cancelled) return;
+        if (error.status === 401) { setUser(null); return; }
+        setGlobalError(error.status === 409
+          ? 'Queued changes conflict with another device. We will keep retrying.'
+          : 'Could not sync queued changes yet. We will keep retrying.');
+        retryLater(retryDelayMs(flushAttempts.current++));
       } finally { busy.current = false; setIsSyncing(false); }
     };
     flush();
-    return () => { cancelled = true; };
-  }, [user, online]);
+    return () => { cancelled = true; clearTimeout(retryTimer); };
+  }, [user, online, flushNonce]);
+  // Coming back to the app is a good moment to try again rather than wait out a long delay.
+  useEffect(() => {
+    if (!user) return;
+    const retryNow = () => { if (document.visibilityState !== 'hidden' && loadQueuedActions().length) kickFlush(0); };
+    window.addEventListener('focus', retryNow);
+    document.addEventListener('visibilitychange', retryNow);
+    return () => { window.removeEventListener('focus', retryNow); document.removeEventListener('visibilitychange', retryNow); };
+  }, [user]);
   // Plan activation and check-ins: polled at the household cadence while an event is active or
   // the Go time screen is open, and every minute otherwise so an activation by another member
   // still surfaces on the Dashboard. A check-in made offline is sent once the connection returns.
@@ -178,32 +224,39 @@ export default function App() {
     return goAction({type:'checkin', status, note});
   };
 
-  const queueOffline = action => {
+  const queueOffline = (action, notice = 'Offline: saved on this device and queued for sync.') => {
     try {
       const next = applyAction({inventory, shoppingList, appliances, reminders, checklistChecks, kits, medications, plan, consumption, settings}, action);
       const count = enqueueAction(action);
       accept({data:next,version:revision.current}, false);
-      setPendingSync(count); setGlobalError('Offline: saved on this device and queued for sync.');
+      setPendingSync(count); setGlobalError(notice);
       return true;
     } catch (error) { setGlobalError(error.message); return false; }
   };
   const mutate = async action => {
     if (!online) return queueOffline(action);
+    // Edits already waiting to sync go first. Sending this one past them could apply it before an
+    // earlier edit it depends on (an update before its add), so it joins the queue instead.
+    if (loadQueuedActions().length) {
+      const queued = queueOffline(action, 'Saved on this device. It will sync as soon as earlier changes do.');
+      if (queued) kickFlush(0);
+      return queued;
+    }
     if (busy.current) return false;
     busy.current=true; setIsSyncing(true);
     const started = epoch.current;
     try { const result=await request('hub',action); if(started===epoch.current){accept(result);setPendingSync(loadQueuedActions().length);setGlobalError(null);} return true; }
     catch(error) {
-      if(started===epoch.current && !error.status) return queueOffline(action);
+      if(started===epoch.current && !error.status) { const queued = queueOffline(action); if (queued) kickFlush(retryDelayMs(0)); return queued; }
       if(started===epoch.current){setGlobalError(error.message);if(error.status===401)setUser(null);} return false;
     }
     finally {busy.current=false;setIsSyncing(false);}
   };
   const logout = async () => {
-    const queued = loadQueuedActions().length;
+    const queued = loadQueuedActions().length + loadRejectedActions().length;
     if (queued && !window.confirm(`${queued} change${queued === 1 ? ' has' : 's have'} not synced yet and will be discarded from this device if you sign out. Sign out anyway?`)) return;
     await unsubscribePush();
-    try {await request('session',{},'DELETE');await clearDeviceData();setPendingSync(0);setLastSyncedAt(null);epoch.current++;setUser(null);setGo(null);setWeather(null);setShowGo(false);setPendingCheckin(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    try {await request('session',{},'DELETE');await clearDeviceData();setPendingSync(0);setRejectedActions([]);setLastSyncedAt(null);epoch.current++;setUser(null);setGo(null);setWeather(null);setShowGo(false);setPendingCheckin(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
@@ -336,6 +389,9 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans select-none">
       {globalError && <div role="alert" aria-live="assertive" className="bg-red-100 text-red-900 p-4">{globalError}</div>}
+      <RejectedChanges items={rejectedActions}
+        onDiscard={id => { discardRejectedAction(id); setRejectedActions(loadRejectedActions()); }}
+        onRetry={id => { try { setPendingSync(retryRejectedAction(id)); setRejectedActions(loadRejectedActions()); kickFlush(0); } catch (error) { setGlobalError(error.message); } }} />
       <Header hubId={hubId} isSyncing={isSyncing} online={online} pendingSync={pendingSync} lastSyncedAt={lastSyncedAt} onSyncClick={() => setShowSyncModal(true)} error={globalError} onDownload={downloadBackup} />
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
@@ -2076,6 +2132,36 @@ function NavButton({ active, onClick, icon, label }) {
       <div className={`${active ? 'scale-110' : 'scale-100'} transition-transform text-slate-600 ${active ? 'text-blue-600' : ''}`}>{icon}</div>
       <span className="text-[9px] font-black uppercase tracking-widest">{label}</span>
     </button>
+  );
+}
+
+// Edits the server refused outright. They were applied on this device while queued, so the person
+// has seen them "save"; this is where they learn they did not, and choose what happens next.
+export function RejectedChanges({ items, onDiscard, onRetry }) {
+  if (!items.length) return null;
+  return (
+    <section role="alert" aria-labelledby="rejected-changes-heading" className="bg-amber-50 border-b border-amber-200 text-amber-950 px-4 py-3">
+      <div className="max-w-xl mx-auto space-y-2">
+        <h2 id="rejected-changes-heading" className="text-xs font-black uppercase tracking-widest">
+          {items.length === 1 ? '1 change could not be saved' : `${items.length} changes could not be saved`}
+        </h2>
+        <p className="text-xs">The server turned these down, so they are not in your household. Everything else has synced.</p>
+        <ul className="space-y-2">
+          {items.map(entry => (
+            <li key={entry.id} className="flex items-center justify-between gap-3 bg-white/70 rounded-xl px-3 py-2">
+              <div className="min-w-0">
+                <p className="text-sm font-bold truncate">{describeAction(entry.action)}</p>
+                <p className="text-xs text-amber-800">{entry.message}</p>
+              </div>
+              <div className="flex gap-2 shrink-0">
+                <button onClick={() => onRetry(entry.id)} aria-label={`Try again: ${describeAction(entry.action)}`} className="px-3 py-1.5 rounded-full bg-amber-600 text-white text-[10px] font-black uppercase tracking-widest">Try again</button>
+                <button onClick={() => onDiscard(entry.id)} aria-label={`Discard: ${describeAction(entry.action)}`} className="px-3 py-1.5 rounded-full bg-white border border-amber-300 text-amber-900 text-[10px] font-black uppercase tracking-widest">Discard</button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </section>
   );
 }
 

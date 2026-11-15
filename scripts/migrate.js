@@ -438,4 +438,23 @@ if (count === 0 && process.env.HOUSEHOLD_OWNER_EMAIL && process.env.HOUSEHOLD_PA
   console.log('No accounts exist yet. Set HOUSEHOLD_OWNER_EMAIL and HOUSEHOLD_PASSWORD, then re-run this migration to create the first owner account.');
 }
 
+// Deleting a supply used to leave its usage history behind, and deleting a kit left items
+// assigned to it (applyAction now cleans both up as part of the delete). This sweeps up what was
+// left by earlier deletes. Idempotent: a second run finds nothing. The household version is bumped
+// only if something changed, so devices polling with the old version fetch the cleaned-up copy.
+const orphanedUsage = await sql`DELETE FROM northstar_consumption_events e
+  WHERE NOT EXISTS (SELECT 1 FROM northstar_inventory i WHERE i.household_id = e.household_id AND i.id = e.item_id)
+  RETURNING 1 AS removed`;
+const orphanedInventoryKits = await sql`UPDATE northstar_inventory i SET kit_id = ''
+  WHERE i.kit_id <> '' AND NOT EXISTS (SELECT 1 FROM northstar_kits k WHERE k.household_id = i.household_id AND k.id = i.kit_id)
+  RETURNING 1 AS cleared`;
+const orphanedShoppingKits = await sql`UPDATE northstar_shopping_items i SET kit_id = ''
+  WHERE i.kit_id <> '' AND NOT EXISTS (SELECT 1 FROM northstar_kits k WHERE k.household_id = i.household_id AND k.id = i.kit_id)
+  RETURNING 1 AS cleared`;
+const orphanTotal = orphanedUsage.length + orphanedInventoryKits.length + orphanedShoppingKits.length;
+if (orphanTotal) {
+  await sql`UPDATE northstar_household SET version = version + 1 WHERE id = 1`;
+  console.log(`Cleaned up ${orphanedUsage.length} usage entries for deleted supplies and ${orphanedInventoryKits.length + orphanedShoppingKits.length} items still assigned to deleted kits.`);
+}
+
 console.log('Database schema ready. Existing household data preserved.');

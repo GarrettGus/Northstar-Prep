@@ -262,6 +262,64 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       assert.equal((await db.findUserByEmail('sessions@example.com')).session_version, 2);
     });
 
+    it('reads usage events back as ISO date strings (a bare date column arrives as a JS Date and fails the state schema)', async () => {
+      const db = await loadDb(database.url);
+      const {stateSchema} = await import('../../shared/schema.js');
+      const {data, version} = await db.readState();
+      const withUsage = stateSchema.parse({...data, inventory: [{id: 'usage-rice', name: 'Rice', quantity: 4}],
+        consumption: [{id: 'use-a', itemId: 'usage-rice', date: '2026-09-10', quantity: 1, note: 'dinner'}]});
+      assert.ok(await db.compareAndSave(version, withUsage, data));
+      const read = await db.readState();
+      assert.deepEqual(read.data.consumption, [{id: 'use-a', itemId: 'usage-rice', date: '2026-09-10', quantity: 1, note: 'dinner'}]);
+      await query(database.url, 'DELETE FROM northstar_consumption_events');
+      await query(database.url, 'DELETE FROM northstar_inventory');
+    });
+
+    it('sweeps up usage history and kit assignments left behind by earlier deletes, once', async () => {
+      const db = await loadDb(database.url);
+      const item = id => ({id, name: id, quantity: 1, unit: 'units', category: 'Gear', calories: 0});
+      const kit = {id: 'kit-live', name: 'Live kit', purpose: '', targetContents: [], assignedTo: ''};
+      let {data, version} = await db.readState();
+      const next = {...data,
+        inventory: [{...data.inventory[0] ?? {}, ...item('alive'), kitId: 'kit-live'}, {...item('stray'), kitId: 'kit-gone'}],
+        shoppingList: [{...item('wish'), kitId: 'kit-gone'}],
+        kits: [kit],
+        consumption: [{id: 'use-ok', itemId: 'alive', date: '2026-09-10', quantity: 1, note: ''}, {id: 'use-orphan', itemId: 'deleted-long-ago', date: '2026-09-10', quantity: 1, note: ''}]};
+      assert.ok(await db.compareAndSave(version, (await import('../../shared/schema.js')).stateSchema.parse(next), data));
+      const before = (await db.readState()).version;
+
+      await migrate(database.url);
+      const after = await db.readState();
+      assert.deepEqual(after.data.consumption.map(event => event.id), ['use-ok']);
+      assert.deepEqual(Object.fromEntries([...after.data.inventory, ...after.data.shoppingList].map(row => [row.id, row.kitId])), {alive: 'kit-live', stray: '', wish: ''});
+      assert.equal(Number(after.version), Number(before) + 1, 'devices polling with the old version are told to refetch');
+
+      await migrate(database.url);
+      assert.equal(Number((await db.readState()).version), Number(after.version), 'a second run finds nothing and changes nothing');
+    });
+
+    it('prunes reset links and unaccepted invitations only once they expired long ago, and never accepted invitations', async () => {
+      const db = await loadDb(database.url);
+      const daysAgo = days => new Date(Date.now() - days * 86_400_000).toISOString();
+      const userId = await addMember(db, 'prune-user@example.com', 'member');
+      await db.createPasswordReset({userId, tokenHash: 'reset-old', expiresAt: daysAgo(10)});
+      await db.createPasswordReset({userId, tokenHash: 'reset-just-expired', expiresAt: daysAgo(1)});
+      await db.createPasswordReset({userId, tokenHash: 'reset-live', expiresAt: daysAgo(-1)});
+      await db.createInvitation({email: 'old-invite@example.com', role: 'member', invitedBy: userId, tokenHash: 'invite-old', expiresAt: daysAgo(45)});
+      await db.createInvitation({email: 'recent-invite@example.com', role: 'member', invitedBy: userId, tokenHash: 'invite-recent', expiresAt: daysAgo(5)});
+      await db.createInvitation({email: 'live-invite@example.com', role: 'member', invitedBy: userId, tokenHash: 'invite-live', expiresAt: daysAgo(-5)});
+      // addMember's own invitation was accepted; make it ancient to prove accepted ones are kept as history.
+      await query(database.url, `UPDATE northstar_invitations SET expires_at = now() - interval '400 days' WHERE token_hash = 'token-prune-user@example.com'`);
+
+      assert.deepEqual(await db.pruneExpiredCredentials(), {resets: 1, invitations: 1});
+      const resets = (await query(database.url, 'SELECT token_hash FROM northstar_password_resets ORDER BY token_hash')).map(row => row.token_hash);
+      assert.ok(resets.includes('reset-just-expired') && resets.includes('reset-live') && !resets.includes('reset-old'));
+      const invitations = (await query(database.url, 'SELECT token_hash FROM northstar_invitations')).map(row => row.token_hash);
+      assert.ok(invitations.includes('invite-recent') && invitations.includes('invite-live') && invitations.includes('token-prune-user@example.com'));
+      assert.ok(!invitations.includes('invite-old'));
+      assert.deepEqual(await db.pruneExpiredCredentials(), {resets: 0, invitations: 0}, 'a second run finds nothing');
+    });
+
     it('carries the old hardcoded quick links over to an existing plan the first time links are added', async () => {
       await query(database.url, 'ALTER TABLE northstar_plan DROP COLUMN links');
       await migrate(database.url);

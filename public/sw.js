@@ -1,8 +1,8 @@
 // Caches the app shell and static assets only. Household data never goes into Cache Storage:
 // API responses carry the household's records (including medications) and must not outlive a
 // sign-out. Offline data lives in src/offline.js, which sign-out clears.
-const CACHE = 'northstar-shell-v2';
-const SHELL = ['/', '/index.html', '/manifest.webmanifest'];
+const CACHE = 'northstar-shell-v3';
+const SHELL = ['/', '/index.html', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png', '/icons/icon.svg'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });

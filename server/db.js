@@ -56,7 +56,9 @@ export async function readState() {
           heat_goal_hours AS "heatGoalHours", power_goal_kwh AS "powerGoalKwh",
           battery_usable_fraction AS "batteryUsableFraction", inverter_efficiency AS "inverterEfficiency"
         FROM northstar_settings WHERE household_id = ${householdId}`,
-    sql`SELECT id, item_id AS "itemId", event_date AS date, quantity, note
+    // to_char, not the bare date column: the driver parses a `date` into a JS Date, which the
+    // state schema (an ISO date string) rejects, failing every read once any usage is recorded.
+    sql`SELECT id, item_id AS "itemId", to_char(event_date, 'YYYY-MM-DD') AS date, quantity, note
         FROM northstar_consumption_events WHERE household_id = ${householdId}
         ORDER BY event_date ASC, created_at ASC, id ASC`,
   ]);
@@ -358,6 +360,18 @@ export async function resetPassword({userId, passwordHash}) {
     tx`UPDATE northstar_password_resets SET used_at = now() WHERE user_id = ${userId} AND used_at IS NULL`,
   ]);
   return results[0][0]?.session_version ?? 0;
+}
+// Reset links and invitations that expired long ago can never be used again, and nothing refers to
+// them, so the daily cron removes them. They are kept for a while after expiry so an owner who
+// sees "expired" in the member list is not met with a link that has silently vanished. Accepted
+// invitations are history (who joined, invited by whom) and are never removed here.
+export async function pruneExpiredCredentials({resetDays = 7, invitationDays = 30} = {}) {
+  const sql = database();
+  const resets = await sql`DELETE FROM northstar_password_resets
+    WHERE expires_at < now() - make_interval(days => ${Math.round(resetDays)}) RETURNING 1 AS removed`;
+  const invitations = await sql`DELETE FROM northstar_invitations
+    WHERE accepted_at IS NULL AND expires_at < now() - make_interval(days => ${Math.round(invitationDays)}) RETURNING 1 AS removed`;
+  return {resets: resets.length, invitations: invitations.length};
 }
 export async function insertAuditLog({householdId = 1, userId, action, collection = null, itemId = null, itemName = null}) {
   const sql = database();

@@ -180,6 +180,19 @@ export function normalizeBackup(input, makeId) {
   return backupSchema.parse(result);
 }
 
+// Deleting a supply or a kit must not leave other records pointing at something that is gone:
+// a supply's usage history would sit in the consumption log with no supply to belong to, and
+// items assigned to a deleted kit would be filed under an "Unknown kit". Both are cleaned up
+// in the same save as the delete, so every device and the audit trail see one consistent change.
+function dropDanglingReferences(next, key, removedIds) {
+  if (key === 'inventory') next.consumption = next.consumption.filter(event => !removedIds.has(event.itemId));
+  if (key === 'kits') {
+    for (const list of ['inventory', 'shoppingList']) {
+      next[list] = next[list].map(row => removedIds.has(row.kitId) ? {...row, kitId: ''} : row);
+    }
+  }
+}
+
 export function applyAction(state, action) {
   const next = structuredClone(state);
   if (!Array.isArray(next.consumption)) next.consumption = [];
@@ -225,6 +238,7 @@ export function applyAction(state, action) {
       const key = collectionKey[action.collection];
       const ids = new Set(action.ids.map(idSchema.parse));
       next[key] = next[key].filter(row => !ids.has(row.id));
+      dropDanglingReferences(next, key, ids);
       return stateSchema.parse(next);
     }
     if (action.type === 'bulk_update') {
@@ -251,7 +265,10 @@ export function applyAction(state, action) {
     const key = collectionKey[action.collection];
     const id = idSchema.parse(action.id);
     const index = next[key].findIndex(row => row.id === id);
-    if (action.type === 'delete') next[key] = next[key].filter(row => row.id !== id);
+    if (action.type === 'delete') {
+      next[key] = next[key].filter(row => row.id !== id);
+      dropDanglingReferences(next, key, new Set([id]));
+    }
     else if (action.type === 'add' || action.type === 'update') {
       if (action.type === 'update' && index < 0) throw new Error('Item no longer exists. Refresh and retry.');
       if (action.type === 'add' && index >= 0) throw new Error('Item already exists.');

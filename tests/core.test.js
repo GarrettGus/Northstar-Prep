@@ -830,6 +830,35 @@ test('fuel hours are grouped by fuel type for explainability',()=>{
   assert.equal(stats.totalFuelHours,30);
   assert.deepEqual(stats.fuelByType,{Propane:20,Gasoline:6,Other:4});
 });
+test('deleting a supply removes its usage history, and only its own, in the same change',()=>{
+  let state=emptyState();
+  for(const id of ['rice','beans']) state=applyAction(state,{type:'add',collection:'inventory',id,item:{name:id,quantity:5}});
+  for(const [id,itemId] of [['use-1','rice'],['use-2','rice'],['use-3','beans']]) state=applyAction(state,{type:'consume',id,itemId,date:'2026-09-10',quantity:1});
+  const afterDelete=applyAction(state,{type:'delete',collection:'inventory',id:'rice'});
+  assert.deepEqual(afterDelete.consumption.map(event=>event.id),['use-3']);
+  assert.deepEqual(afterDelete.inventory.map(item=>item.id),['beans']);
+  // The same holds for a bulk delete, and for deleting something nothing refers to.
+  const afterBulk=applyAction(state,{type:'bulk_delete',collection:'inventory',ids:['rice','beans']});
+  assert.deepEqual(afterBulk.consumption,[]);
+  assert.equal(applyAction(state,{type:'delete',collection:'inventory',id:'never-existed'}).consumption.length,3);
+  // Deleting a shopping-list row never touches usage history (usage belongs to inventory).
+  const withShopping=applyAction(state,{type:'add',collection:'shopping_list',id:'rice',item:{name:'Rice'}});
+  assert.equal(applyAction(withShopping,{type:'delete',collection:'shopping_list',id:'rice'}).consumption.length,3);
+});
+test('deleting a kit detaches its items instead of leaving them assigned to a kit that is gone',()=>{
+  let state=emptyState();
+  for(const id of ['go-bag','car-kit']) state=applyAction(state,{type:'add',collection:'kits',id,item:{name:id}});
+  state=applyAction(state,{type:'add',collection:'inventory',id:'tarp',item:{name:'Tarp',kitId:'go-bag',location:'Garage'}});
+  state=applyAction(state,{type:'add',collection:'inventory',id:'jack',item:{name:'Jack',kitId:'car-kit'}});
+  state=applyAction(state,{type:'add',collection:'shopping_list',id:'rope',item:{name:'Rope',kitId:'go-bag'}});
+  const after=applyAction(state,{type:'delete',collection:'kits',id:'go-bag'});
+  assert.deepEqual(after.kits.map(kit=>kit.id),['car-kit']);
+  const byId=Object.fromEntries([...after.inventory,...after.shoppingList].map(row=>[row.id,row]));
+  assert.equal(byId.tarp.kitId,'');assert.equal(byId.tarp.location,'Garage','only the kit link is cleared');
+  assert.equal(byId.rope.kitId,'');
+  assert.equal(byId.jack.kitId,'car-kit','items in other kits are untouched');
+  assert.deepEqual(applyAction(state,{type:'bulk_delete',collection:'kits',ids:['go-bag','car-kit']}).inventory.map(row=>row.kitId),['','']);
+});
 test('consumption events validate, merge by ID and leave current stock unchanged',()=>{
   const stocked=applyAction(emptyState(),{type:'add',collection:'inventory',id:'rice',item:{name:'Rice',category:'Food',quantity:10,unit:'bags'}});
   const first=applyAction(stocked,{type:'consume',id:'use-1',itemId:'rice',event:{date:'2026-09-10',quantity:2,note:'Dinner'}});

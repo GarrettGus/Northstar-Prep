@@ -1,5 +1,5 @@
 import { validSession, sameOrigin } from '../server/auth.js';
-import { readState, getMembership, listMembers, listPushSubscriptions, deletePushSubscription, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory } from '../server/db.js';
+import { readState, getMembership, listMembers, listPushSubscriptions, deletePushSubscription, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, pruneExpiredCredentials, recordReadinessSnapshot, pruneReadinessHistory } from '../server/db.js';
 import { backupsConfigured, encryptBackup, decryptBackup } from '../server/backupCrypto.js';
 import { configured as offSiteConfigured, uploadBackupCopy, downloadBackupCopy, deleteBackupCopy } from '../server/backupBlobStore.js';
 import { stateSchema, backupSchema } from '../shared/schema.js';
@@ -31,7 +31,7 @@ async function notifyOwnersOfFailure(request, req, repository, mailer) {
 }
 
 export function createHandler(
-  repository = {readState, getMembership, listMembers, listPushSubscriptions, deletePushSubscription, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, recordReadinessSnapshot, pruneReadinessHistory},
+  repository = {readState, getMembership, listMembers, listPushSubscriptions, deletePushSubscription, insertBackupRecord, updateBackupOffSiteStatus, listBackupRecords, getBackupRecord, pruneBackups, pruneRequestMetrics, pruneExpiredCredentials, recordReadinessSnapshot, pruneReadinessHistory},
   authenticate = validSession,
   offSite = {configured: offSiteConfigured, upload: uploadBackupCopy, download: downloadBackupCopy, remove: deleteBackupCopy},
   mailer = {configured: emailConfigured, send: sendEmail},
@@ -75,6 +75,10 @@ export function createHandler(
         let metricsPruned = true;
         try { await repository.pruneRequestMetrics(metricsRetentionDays()); }
         catch (error) { metricsPruned = false; logIssue(request, '/api/backup', 'metrics_prune_failure', error); }
+        // Expired reset links and invitations are cleared out by the same run.
+        let credentialsPruned = true;
+        try { await repository.pruneExpiredCredentials(); }
+        catch (error) { credentialsPruned = false; logIssue(request, '/api/backup', 'credential_prune_failure', error); }
         // The same run records the day's readiness snapshot, for the same reason: the Hobby plan
         // allows one scheduled run a day, so this is the only cron there is. A snapshot failure
         // must never fail the backup the cron exists for, so it is logged and reported instead.
@@ -104,7 +108,7 @@ export function createHandler(
             }
           } catch (error) { pushDigest = 'failed'; logIssue(request, '/api/backup', 'push_digest_failure', error); }
         }
-        return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length, metricsPruned, readinessRecorded, offSiteStatus, pushDigest});
+        return res.status(200).json({status: 'success', checksum, sizeBytes: ciphertext.length, metricsPruned, credentialsPruned, readinessRecorded, offSiteStatus, pushDigest});
       } catch (error) {
         logFailure(request, '/api/backup', 500, error);
         await notifyOwnersOfFailure(request, req, repository, mailer);
@@ -117,7 +121,7 @@ export function createHandler(
     if (!session) { logFailure(request, '/api/backup', 401); return res.status(401).json({error: 'Please sign in again.'}); }
     if (req.method === 'POST' && !sameOrigin(req)) return res.status(403).json({error: 'Request origin rejected.'});
     try {
-      const membership = await repository.getMembership(session.userId);
+      const membership = await repository.getMembership(session.userId, 1, session.version);
       if (!membership) return res.status(403).json({error: 'Not a member of this household.'});
 
       if (req.method === 'GET') {

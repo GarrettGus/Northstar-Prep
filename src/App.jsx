@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { createContext, useContext, useId, useState, useEffect, useMemo, useRef } from 'react';
 import {
   Shield, Package, Map, AlertTriangle, CheckCircle, Plus, Trash2, Home,
   Droplets, Phone, RefreshCw, ChevronRight,
@@ -8,7 +8,7 @@ import {
   Siren, SearchCheck, Power, Tag, Calendar
 } from 'lucide-react';
 import { request } from './api.js';
-import { computeReadiness, computeReadinessGaps, consumptionForecast, isExpired, isRecurringDue, expirationQueue } from '../shared/readiness.js';
+import { computeReadiness, computeReadinessGaps, consumptionForecast, daysUntilExpiry, expirationQueue, expiryTiers, isExpired, isExpiringWithin, isRecurringDue } from '../shared/readiness.js';
 import { applyAction, normalizeBackup, settingsSchema, fuelTypes, categories, reminderCategories } from '../shared/schema.js';
 import { backupToCsv, csvToBackupPreview } from '../shared/csv.js';
 import { simulateOutage, appliancePriorities, appliancePriorityLabels } from '../shared/outage.js';
@@ -20,7 +20,7 @@ import { kitCompleteness } from '../shared/kits.js';
 import { GoTime, GoTimeBanner } from './GoTime.jsx';
 import { currentSubscription, pushSupported, subscribe as subscribePush, unsubscribe as unsubscribePush } from './push.js';
 import { HazardProfileSection, WeatherAlerts } from './Hazards.jsx';
-import { clearDeviceData, loadPendingCheckin, savePendingCheckin, enqueueAction, loadCachedState, loadQueuedActions, saveCachedState, saveQueuedActions } from './offline.js';
+import { actionBody, clearDeviceData, describeAction, discardRejectedAction, enqueueAction, isPermanentRejection, loadCachedState, loadPendingCheckin, loadQueuedActions, loadRejectedActions, peekQueuedAction, rejectQueuedAction, retryDelayMs, retryRejectedAction, savePendingCheckin, saveCachedState, shiftQueuedAction } from './offline.js';
 
 // --- Constants ---
 const progressPercent = (value, goal) => goal > 0 ? (value / goal) * 100 : 0;
@@ -57,6 +57,12 @@ export default function App() {
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
   const [online, setOnline] = useState(() => typeof navigator === 'undefined' ? true : navigator.onLine);
   const [pendingSync, setPendingSync] = useState(() => loadQueuedActions().length);
+  const [rejectedActions, setRejectedActions] = useState(() => loadRejectedActions());
+  // Bumped to make the queue-flush effect run again: after a failed attempt (with a delay), when
+  // the tab comes back into view, and when an edit is queued while the connection is up.
+  const [flushNonce, setFlushNonce] = useState(0);
+  const flushAttempts = useRef(0);
+  const kickTimer = useRef(null);
   const revision = useRef(-1);
   const busy = useRef(false);
   const epoch = useRef(0);
@@ -128,29 +134,69 @@ export default function App() {
     window.addEventListener('focus',refresh);
     return () => {cancelled=true;clearInterval(timer);window.removeEventListener('focus',refresh);};
   }, [user, online]);
+  const kickFlush = (delay = 0) => {
+    clearTimeout(kickTimer.current);
+    kickTimer.current = setTimeout(() => setFlushNonce(n => n + 1), delay);
+  };
+  useEffect(() => () => clearTimeout(kickTimer.current), []);
+  // Sends queued edits to the server in order. A failure that is the connection's or the server's
+  // fault leaves the edit queued and tries again after a growing delay; an edit the server rejects
+  // for good is set aside (see rejectQueuedAction) so the edits behind it still go through.
   useEffect(() => {
-    if (!user || !online || busy.current || !loadQueuedActions().length) return;
+    if (!user || !online || !loadQueuedActions().length) return;
     let cancelled = false;
+    let retryTimer = null;
+    const retryLater = delay => { retryTimer = setTimeout(() => setFlushNonce(n => n + 1), delay); };
+    // A save is in flight (it reads the queue first), so look again in a moment.
+    if (busy.current) { retryLater(1000); return () => { cancelled = true; clearTimeout(retryTimer); }; }
     const flush = async () => {
-      const queue = loadQueuedActions();
       const started = epoch.current;
       busy.current = true; setIsSyncing(true);
+      let setAside = false;
       try {
-        while (queue.length && !cancelled) {
-          const result = await request('hub', queue[0]);
-          // Signed out while this was in flight: sign-out already cleared this device, and
-          // nothing may be written back to it.
-          if (started !== epoch.current) return;
-          accept(result); queue.shift(); saveQueuedActions(queue); setPendingSync(queue.length);
+        // The queue is re-read every time round, never held in a local copy: an edit queued while
+        // one is in flight lands behind it in storage and must not be overwritten.
+        for (let entry = peekQueuedAction(); entry && !cancelled; entry = peekQueuedAction()) {
+          try {
+            const result = await request('hub', actionBody(entry));
+            // Signed out while this was in flight: sign-out already cleared this device, and
+            // nothing may be written back to it.
+            if (started !== epoch.current) return;
+            accept(result); setPendingSync(shiftQueuedAction());
+            flushAttempts.current = 0;
+          } catch (error) {
+            if (!isPermanentRejection(error.status)) throw error;
+            setPendingSync(rejectQueuedAction(error.message));
+            setRejectedActions(loadRejectedActions());
+            setAside = true;
+          }
         }
-        if (!cancelled && !queue.length) setGlobalError(null);
+        if (cancelled) return;
+        if (setAside) {
+          // The screen still shows the rejected edit (it was applied locally while queued); the server's copy is the truth.
+          try { accept(await request('hub')); } catch { /* the next poll will do it */ }
+        }
+        if (!loadQueuedActions().length) setGlobalError(null);
       } catch (error) {
-        if (!cancelled && started === epoch.current) setGlobalError(error.status === 409 ? 'Queued changes conflict with another device. Refresh and review before retrying.' : 'Could not sync queued changes yet. We will retry when you reconnect.');
+        if (cancelled || started !== epoch.current) return;
+        if (error.status === 401) { setUser(null); return; }
+        setGlobalError(error.status === 409
+          ? 'Queued changes conflict with another device. We will keep retrying.'
+          : 'Could not sync queued changes yet. We will keep retrying.');
+        retryLater(retryDelayMs(flushAttempts.current++));
       } finally { busy.current = false; setIsSyncing(false); }
     };
     flush();
-    return () => { cancelled = true; };
-  }, [user, online]);
+    return () => { cancelled = true; clearTimeout(retryTimer); };
+  }, [user, online, flushNonce]);
+  // Coming back to the app is a good moment to try again rather than wait out a long delay.
+  useEffect(() => {
+    if (!user) return;
+    const retryNow = () => { if (document.visibilityState !== 'hidden' && loadQueuedActions().length) kickFlush(0); };
+    window.addEventListener('focus', retryNow);
+    document.addEventListener('visibilitychange', retryNow);
+    return () => { window.removeEventListener('focus', retryNow); document.removeEventListener('visibilitychange', retryNow); };
+  }, [user]);
   // Plan activation and check-ins: polled at the household cadence while an event is active or
   // the Go time screen is open, and every minute otherwise so an activation by another member
   // still surfaces on the Dashboard. A check-in made offline is sent once the connection returns.
@@ -190,23 +236,30 @@ export default function App() {
     return goAction({type:'checkin', status, note});
   };
 
-  const queueOffline = action => {
+  const queueOffline = (action, notice = 'Offline: saved on this device and queued for sync.') => {
     try {
       const next = applyAction({inventory, shoppingList, appliances, reminders, checklistChecks, kits, medications, plan, consumption, settings}, action);
       const count = enqueueAction(action);
       accept({data:next,version:revision.current}, false);
-      setPendingSync(count); setGlobalError('Offline: saved on this device and queued for sync.');
+      setPendingSync(count); setGlobalError(notice);
       return true;
     } catch (error) { setGlobalError(error.message); return false; }
   };
   const mutate = async action => {
     if (!online) return queueOffline(action);
+    // Edits already waiting to sync go first. Sending this one past them could apply it before an
+    // earlier edit it depends on (an update before its add), so it joins the queue instead.
+    if (loadQueuedActions().length) {
+      const queued = queueOffline(action, 'Saved on this device. It will sync as soon as earlier changes do.');
+      if (queued) kickFlush(0);
+      return queued;
+    }
     if (busy.current) return false;
     busy.current=true; setIsSyncing(true);
     const started = epoch.current;
     try { const result=await request('hub',action); if(started===epoch.current){accept(result);setPendingSync(loadQueuedActions().length);setGlobalError(null);} return true; }
     catch(error) {
-      if(started===epoch.current && !error.status) return queueOffline(action);
+      if(started===epoch.current && !error.status) { const queued = queueOffline(action); if (queued) kickFlush(retryDelayMs(0)); return queued; }
       if(started===epoch.current){setGlobalError(error.message);if(error.status===401)setUser(null);} return false;
     }
     finally {busy.current=false;setIsSyncing(false);}
@@ -217,12 +270,12 @@ export default function App() {
   const forgetHousehold = async () => {
     epoch.current++;
     await clearDeviceData();
-    setPendingSync(0);setLastSyncedAt(null);setUser(null);setGo(null);setWeather(null);setOutage(null);setShowGo(false);setShowBinder(false);setPendingCheckin(null);
+    setPendingSync(0);setRejectedActions([]);setLastSyncedAt(null);setUser(null);setGo(null);setWeather(null);setOutage(null);setShowGo(false);setShowBinder(false);setPendingCheckin(null);
     setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);
     setSettings(settingsSchema.parse({}));setPendingImport(null);setPendingImportSource(null);revision.current=-1;setLoading(true);setShowSyncModal(false);
   };
   const logout = async () => {
-    const queued = loadQueuedActions().length;
+    const queued = loadQueuedActions().length + loadRejectedActions().length;
     if (queued && !window.confirm(`${queued} change${queued === 1 ? ' has' : 's have'} not synced yet and will be discarded from this device if you sign out. Sign out anyway?`)) return;
     await unsubscribePush();
     try {await request('session',{},'DELETE');await forgetHousehold();}
@@ -359,6 +412,9 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans select-none">
       {globalError && <div role="alert" aria-live="assertive" className="bg-red-100 text-red-900 p-4">{globalError}</div>}
+      <RejectedChanges items={rejectedActions}
+        onDiscard={id => { discardRejectedAction(id); setRejectedActions(loadRejectedActions()); }}
+        onRetry={id => { try { setPendingSync(retryRejectedAction(id)); setRejectedActions(loadRejectedActions()); kickFlush(0); } catch (error) { setGlobalError(error.message); } }} />
       <Header isSyncing={isSyncing} online={online} pendingSync={pendingSync} lastSyncedAt={lastSyncedAt} onSyncClick={() => setShowSyncModal(true)} error={globalError} onDownload={downloadBackup} />
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
@@ -459,7 +515,7 @@ function Dashboard({ stats, settings, gaps = [], onAddGapShortfall, overdueRemin
         <button onClick={onViewRotation} className="w-full flex items-center justify-between gap-3 bg-orange-50 border border-orange-100 rounded-2xl px-4 py-3 text-sm text-left active:scale-95 transition-all">
           <span className="flex items-center gap-2 font-bold text-orange-800">
             <Calendar size={16}/>
-            {stats.expiringSoon > 0 && <>{stats.expiringSoon} item{stats.expiringSoon === 1 ? '' : 's'} expiring within 90 days</>}
+            {stats.expiringSoon > 0 && <>{stats.expiringSoon} item{stats.expiringSoon === 1 ? '' : 's'} expiring within {expiryTiers.quarter} days</>}
             {stats.expiringSoon > 0 && stats.expired > 0 && <> · </>}
             {stats.expired > 0 && <>{stats.expired} already expired</>}
           </span>
@@ -689,16 +745,16 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
                 {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 flex items-center gap-1 text-[10px] font-black uppercase"><Trash2 size={12}/> Delete</button>}
              </div>
              <div className="grid grid-cols-2 gap-4">
-                <div className="col-span-2"><Label>Device Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Fridge" /></div>
-                <div><Label>Watts (Running)</Label><Input val={form.watts} set={v => setForm({...form, watts: v})} type="number" placeholder="150" /></div>
-                <div><Label>Hours/Day</Label><Input val={form.hours} set={v => setForm({...form, hours: v})} type="number" placeholder="24" /></div>
-                <div className="col-span-2">
-                  <Label>Outage priority</Label>
-                  <select aria-label="Outage priority" value={form.priority || 'normal'} onChange={e => setForm({...form, priority: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold text-slate-700">
+                <Field className="col-span-2"><Label>Device Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Fridge" /></Field>
+                <Field><Label>Watts (Running)</Label><Input val={form.watts} set={v => setForm({...form, watts: v})} type="number" placeholder="150" /></Field>
+                <Field><Label>Hours/Day</Label><Input val={form.hours} set={v => setForm({...form, hours: v})} type="number" placeholder="24" /></Field>
+                <Field className="col-span-2">
+                  <Label htmlFor="appliance-priority">Outage priority</Label>
+                  <select id="appliance-priority" aria-label="Outage priority" value={form.priority || 'normal'} onChange={e => setForm({...form, priority: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold text-slate-700">
                     {appliancePriorities.map(level => <option key={level} value={level}>{appliancePriorityLabels[level]}</option>)}
                   </select>
                   <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">Lowest priority loads are shed first when the outage simulator works out what to turn off.</p>
-                </div>
+                </Field>
              </div>
              <button type="submit" className="w-full bg-violet-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl active:bg-violet-700 transition-colors mt-2">
                {editingId ? 'Update Device' : 'Add to Load'}
@@ -830,7 +886,7 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
     return items.filter(item => {
       if (needle && ![item.name, item.category, item.store, item.unit, item.location].some(value => String(value || '').toLowerCase().includes(needle))) return false;
       if (statusFilter === 'expired' && !isExpired(item.expiryDate)) return false;
-      if (statusFilter === 'expiring' && (isExpired(item.expiryDate) || !item.expiryDate || new Date(item.expiryDate) > new Date(Date.now() + 30 * 24 * 60 * 60 * 1000))) return false;
+      if (statusFilter === 'expiring' && !isExpiringWithin(item, expiryTiers.soon)) return false;
       if (statusFilter === 'low' && Number(item.quantity || 0) >= Number(item.target || 1) * 0.25) return false;
       if (!isShoppingMode && locationFilter && (item.location || '') !== locationFilter) return false;
       if (!isShoppingMode && kitFilter && (item.kitId || '') !== (kitFilter === '__none__' ? '' : kitFilter)) return false;
@@ -886,7 +942,7 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
       <div className="grid grid-cols-[1fr_auto] gap-2">
         <input aria-label={`Search ${title.toLowerCase()}`} value={query} onChange={event => setQuery(event.target.value)} placeholder="Search name, category, store or location" className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-3 text-sm outline-none focus:border-blue-400" />
         <select aria-label="Filter items" value={statusFilter} onChange={event => setStatusFilter(event.target.value)} className="bg-white border border-slate-200 rounded-2xl px-3 text-xs font-bold">
-          <option value="all">All</option><option value="low">Low stock</option><option value="expiring">Expiring</option><option value="expired">Expired</option>
+          <option value="all">All</option><option value="low">Low stock</option><option value="expiring">{`Expiring in ${expiryTiers.soon} days`}</option><option value="expired">Expired</option>
         </select>
       </div>
       {!isShoppingMode && (
@@ -975,56 +1031,56 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
             </div>
 
             <div className="grid grid-cols-2 gap-4">
-              <div className="col-span-2"><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} /></div>
-              <div><Label>Quantity</Label><Input val={form.quantity} set={v => setForm({...form, quantity: v})} type="number" /></div>
-              <div><Label>Unit</Label><Input val={form.unit} set={v => setForm({...form, unit: v})} /></div>
+              <Field className="col-span-2"><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} /></Field>
+              <Field><Label>Quantity</Label><Input val={form.quantity} set={v => setForm({...form, quantity: v})} type="number" /></Field>
+              <Field><Label>Unit</Label><Input val={form.unit} set={v => setForm({...form, unit: v})} /></Field>
 
-              <div><Label>Purchase Date</Label><Input val={form.purchaseDate} set={v => setForm({...form, purchaseDate: v})} type="date" /></div>
-              <div><Label>Expiry Date</Label><Input val={form.expiryDate} set={v => setForm({...form, expiryDate: v})} type="date" /></div>
+              <Field><Label>Purchase Date</Label><Input val={form.purchaseDate} set={v => setForm({...form, purchaseDate: v})} type="date" /></Field>
+              <Field><Label>Expiry Date</Label><Input val={form.expiryDate} set={v => setForm({...form, expiryDate: v})} type="date" /></Field>
 
-              <div><Label>Price ($/Unit)</Label><Input val={form.price} set={v => setForm({...form, price: v})} type="number" placeholder="0.00" /></div>
-              <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={categories} /></div>
+              <Field><Label>Price ($/Unit)</Label><Input val={form.price} set={v => setForm({...form, price: v})} type="number" placeholder="0.00" /></Field>
+              <Field><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={categories} /></Field>
 
-              {isShoppingMode && <div className="col-span-2"><Label>Store</Label><Input val={form.store} set={v => setForm({...form, store: v})} placeholder="e.g. Costco" /></div>}
+              {isShoppingMode && <Field className="col-span-2"><Label>Store</Label><Input val={form.store} set={v => setForm({...form, store: v})} placeholder="e.g. Costco" /></Field>}
               {!isShoppingMode && (
                 <>
-                  <div><Label>Location (optional)</Label><Input val={form.location} set={v => setForm({...form, location: v})} placeholder="e.g. Basement, Go-bag, Vehicle" /></div>
-                  <div>
-                    <Label>Kit (optional)</Label>
-                    <select className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none border border-transparent" value={form.kitId} onChange={e => setForm({...form, kitId: e.target.value})}>
+                  <Field><Label>Location (optional)</Label><Input val={form.location} set={v => setForm({...form, location: v})} placeholder="e.g. Basement, Go-bag, Vehicle" /></Field>
+                  <Field>
+                    <Label htmlFor="item-kit">Kit (optional)</Label>
+                    <select id="item-kit" className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none border border-transparent" value={form.kitId} onChange={e => setForm({...form, kitId: e.target.value})}>
                       <option value="">Unassigned</option>
                       {kits.map(kit => <option key={kit.id} value={kit.id}>{kit.name}</option>)}
                     </select>
-                  </div>
+                  </Field>
                 </>
               )}
 
-              <div className="col-span-2">
+              <Field className="col-span-2">
                 <Label>Barcode (optional)</Label>
                 <div className="flex gap-2">
                   <div className="flex-1"><Input val={form.barcode} set={v => setForm({...form, barcode: v})} placeholder="Scan or type a barcode" /></div>
                   <BarcodeScanButton onDetected={code => setForm(prev => ({...prev, barcode: code}))} />
                 </div>
-              </div>
-              <div className="col-span-2">
+              </Field>
+              <Field className="col-span-2">
                 <Label>Restock every N days (0 = never)</Label>
                 <Input val={form.recurringDays} set={v => setForm({...form, recurringDays: v})} type="number" placeholder="e.g. 30" />
-              </div>
+              </Field>
 
               {form.category === 'Food' && (
                 <>
-                  <div><Label>Cals/Unit</Label><Input val={form.caloriesPerUnit} set={v => setForm({...form, caloriesPerUnit: v})} type="number" /></div>
-                  <div><Label>Macro Tag</Label><Select val={form.macroTag} set={v => setForm({...form, macroTag: v})} opts={["", "Carbs", "Protein", "Fat", "Balanced"]} /></div>
+                  <Field><Label>Cals/Unit</Label><Input val={form.caloriesPerUnit} set={v => setForm({...form, caloriesPerUnit: v})} type="number" /></Field>
+                  <Field><Label>Macro Tag</Label><Select val={form.macroTag} set={v => setForm({...form, macroTag: v})} opts={["", "Carbs", "Protein", "Fat", "Balanced"]} /></Field>
                 </>
               )}
-              {form.category === 'Water' && <div className="col-span-2"><Label>Gallons per unit (for bottles or cases)</Label><Input val={form.gallonsPerUnit} set={v => setForm({...form, gallonsPerUnit:v})} type="number" placeholder="e.g. 0.132 for a 500 mL bottle" /><p className="text-xs text-slate-500 mt-2">Leave zero when your unit is gallons, liters, mL or fl oz. Other units need this value to count toward readiness.</p></div>}
+              {form.category === 'Water' && <Field className="col-span-2"><Label>Gallons per unit (for bottles or cases)</Label><Input val={form.gallonsPerUnit} set={v => setForm({...form, gallonsPerUnit:v})} type="number" placeholder="e.g. 0.132 for a 500 mL bottle" /><p className="text-xs text-slate-500 mt-2">Leave zero when your unit is gallons, liters, mL or fl oz. Other units need this value to count toward readiness.</p></Field>}
               {form.category === 'Fuel' && (
                 <>
-                  <div><Label>Fuel Type</Label><Select val={form.fuelType} set={v => setForm({...form, fuelType: v})} opts={fuelTypes} /></div>
-                  <div><Label>Hours/Unit (Heat)</Label><Input val={form.hoursPerUnit} set={v => setForm({...form, hoursPerUnit: v})} type="number" /></div>
+                  <Field><Label>Fuel Type</Label><Select val={form.fuelType} set={v => setForm({...form, fuelType: v})} opts={fuelTypes} /></Field>
+                  <Field><Label>Hours/Unit (Heat)</Label><Input val={form.hoursPerUnit} set={v => setForm({...form, hoursPerUnit: v})} type="number" /></Field>
                 </>
               )}
-              {form.category === 'Power' && <div className="col-span-2"><Label>Capacity (kWh)</Label><Input val={form.capacityPerUnit} set={v => setForm({...form, capacityPerUnit: v})} type="number" placeholder="e.g. 1.5"/></div>}
+              {form.category === 'Power' && <Field className="col-span-2"><Label>Capacity (kWh)</Label><Input val={form.capacityPerUnit} set={v => setForm({...form, capacityPerUnit: v})} type="number" placeholder="e.g. 1.5"/></Field>}
             </div>
             {formError && <p role="alert" className="text-xs font-bold text-red-600">{formError}</p>}
             <button type="submit" className="w-full bg-blue-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl active:bg-blue-700 transition-colors mt-2">
@@ -1156,23 +1212,23 @@ function KitsSection({ kits, inventory, family = [], onAdd, onUpdate, onDelete }
             <h4 className="text-[10px] font-black uppercase text-blue-600">{editingId ? 'Edit Kit' : 'New Kit'}</h4>
             {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
           </div>
-          <div><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Go-bag — Dad" /></div>
-          <div><Label>Purpose (optional)</Label><Input val={form.purpose} set={v => setForm({...form, purpose: v})} placeholder="e.g. Grab-and-go bag for evacuation" /></div>
-          <div>
-            <Label>Belongs to</Label>
-            <select aria-label="Kit belongs to" value={form.assignedTo} onChange={e => setForm({...form, assignedTo: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold text-slate-700">
+          <Field><Label>Name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Go-bag — Dad" /></Field>
+          <Field><Label>Purpose (optional)</Label><Input val={form.purpose} set={v => setForm({...form, purpose: v})} placeholder="e.g. Grab-and-go bag for evacuation" /></Field>
+          <Field>
+            <Label htmlFor="kit-assigned-to">Belongs to</Label>
+            <select id="kit-assigned-to" aria-label="Kit belongs to" value={form.assignedTo} onChange={e => setForm({...form, assignedTo: e.target.value})} className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold text-slate-700">
               <option value="">Shared (whole household)</option>
               {[...new Set([...memberNames, ...(form.assignedTo && !memberNames.includes(form.assignedTo) ? [form.assignedTo] : [])])].map(name => <option key={name} value={name}>{name}</option>)}
             </select>
-          </div>
-          <div>
-            <Label>Target contents</Label>
+          </Field>
+          <div role="group" aria-labelledby="kit-target-contents-label">
+            <span id="kit-target-contents-label" className="text-[10px] font-black uppercase text-slate-600 mb-1 block">Target contents</span>
             <div className="space-y-2">
               {form.targetContents.map((row, i) => (
                 <div key={i} className="flex gap-2 items-center">
-                  <div className="flex-1"><Input val={row.name} set={v => updateRow(i, {name: v})} placeholder="Item name" /></div>
-                  <div className="w-16"><Input val={row.quantity} set={v => updateRow(i, {quantity: v})} type="number" /></div>
-                  <div className="w-20"><Input val={row.unit} set={v => updateRow(i, {unit: v})} placeholder="unit" /></div>
+                  <div className="flex-1"><Input ariaLabel={`Target item ${i + 1} name`} val={row.name} set={v => updateRow(i, {name: v})} placeholder="Item name" /></div>
+                  <div className="w-16"><Input ariaLabel={`Target item ${i + 1} quantity`} val={row.quantity} set={v => updateRow(i, {quantity: v})} type="number" /></div>
+                  <div className="w-20"><Input ariaLabel={`Target item ${i + 1} unit`} val={row.unit} set={v => updateRow(i, {unit: v})} placeholder="unit" /></div>
                   <button type="button" aria-label={`Remove ${row.name || 'target item'}`} onClick={() => removeRow(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
                 </div>
               ))}
@@ -1189,7 +1245,7 @@ function KitsSection({ kits, inventory, family = [], onAdd, onUpdate, onDelete }
           const completeness = kitCompleteness(kit, inventory);
           const ready = completeness.percent >= 100;
           return (
-            <div key={kit.id} className="border border-slate-200 rounded-2xl p-4 cursor-pointer" onClick={() => handleEdit(kit)}>
+            <div key={kit.id} {...openOnKey(() => handleEdit(kit), `Edit kit ${kit.name}`)} className={`border border-slate-200 rounded-2xl p-4 cursor-pointer ${focusRing}`}>
               <div className="flex justify-between items-center gap-3">
                 <div className="min-w-0">
                   <div className="font-black text-slate-800 text-sm truncate">{kit.name}</div>
@@ -1236,11 +1292,11 @@ function FamilyMembersSection({ family, isEditing, onChange }) {
               <button type="button" aria-label={`Remove ${m.name || 'member'}`} onClick={() => removeMember(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <div><Label>Name</Label><Input val={m.name} set={v => updateMember(i, { name: v })} /></div>
-              <div><Label>Role</Label><Input val={m.role} set={v => updateMember(i, { role: v })} placeholder={m.kind === 'pet' ? 'Dog, Cat…' : 'Adult, Child…'} /></div>
-              <div className="col-span-2"><Label>{m.kind === 'pet' ? 'Date of birth (optional)' : 'Date of birth'}</Label><Input val={m.dob} set={v => updateMember(i, { dob: v })} type="date" /></div>
-              <div><Label>Calories per day</Label><Input val={m.caloriesPerDay ?? ''} set={v => updateMember(i, { caloriesPerDay: v })} type="number" placeholder={m.kind === 'pet' ? 'e.g. 700' : 'Household default'} /></div>
-              <div><Label>Water gal per day</Label><Input val={m.waterGallonsPerDay ?? ''} set={v => updateMember(i, { waterGallonsPerDay: v })} type="number" placeholder={m.kind === 'pet' ? 'e.g. 0.25' : 'Household default'} /></div>
+              <Field><Label>Name</Label><Input val={m.name} set={v => updateMember(i, { name: v })} /></Field>
+              <Field><Label>Role</Label><Input val={m.role} set={v => updateMember(i, { role: v })} placeholder={m.kind === 'pet' ? 'Dog, Cat…' : 'Adult, Child…'} /></Field>
+              <Field className="col-span-2"><Label>{m.kind === 'pet' ? 'Date of birth (optional)' : 'Date of birth'}</Label><Input val={m.dob} set={v => updateMember(i, { dob: v })} type="date" /></Field>
+              <Field><Label>Calories per day</Label><Input val={m.caloriesPerDay ?? ''} set={v => updateMember(i, { caloriesPerDay: v })} type="number" placeholder={m.kind === 'pet' ? 'e.g. 700' : 'Household default'} /></Field>
+              <Field><Label>Water gal per day</Label><Input val={m.waterGallonsPerDay ?? ''} set={v => updateMember(i, { waterGallonsPerDay: v })} type="number" placeholder={m.kind === 'pet' ? 'e.g. 0.25' : 'Household default'} /></Field>
             </div>
             <p className="text-[10px] text-slate-500 leading-relaxed">
               {m.kind === 'pet'
@@ -1268,8 +1324,8 @@ function MeetingPointsSection({ primary, secondary, isEditing, onPrimaryChange, 
       <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Meeting Points</h3>
       {isEditing ? (
         <div className="grid grid-cols-1 gap-4">
-          <div><Label>Primary</Label><Input val={primary} set={onPrimaryChange} placeholder="e.g. End of the driveway" /></div>
-          <div><Label>Secondary (out of neighborhood)</Label><Input val={secondary} set={onSecondaryChange} placeholder="e.g. Community center on Main St" /></div>
+          <Field><Label>Primary</Label><Input val={primary} set={onPrimaryChange} placeholder="e.g. End of the driveway" /></Field>
+          <Field><Label>Secondary (out of neighborhood)</Label><Input val={secondary} set={onSecondaryChange} placeholder="e.g. Community center on Main St" /></Field>
         </div>
       ) : (
         <div className="space-y-3">
@@ -1306,9 +1362,9 @@ function ContactsSection({ contacts, isEditing, onChange }) {
               <button type="button" aria-label={`Remove ${c.name || 'contact'}`} onClick={() => removeContact(i)} className="text-red-600 p-1"><Trash2 size={14}/></button>
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <div><Label>Name</Label><Input val={c.name} set={v => updateContact(i, { name: v })} /></div>
-              <div><Label>Phone</Label><Input val={c.phone} set={v => updateContact(i, { phone: v })} type="tel" /></div>
-              <div className="col-span-2"><Label>Type</Label><Input val={c.type} set={v => updateContact(i, { type: v })} placeholder="Out-of-area, Neighbor, Doctor…" /></div>
+              <Field><Label>Name</Label><Input val={c.name} set={v => updateContact(i, { name: v })} /></Field>
+              <Field><Label>Phone</Label><Input val={c.phone} set={v => updateContact(i, { phone: v })} type="tel" /></Field>
+              <Field className="col-span-2"><Label>Type</Label><Input val={c.type} set={v => updateContact(i, { type: v })} placeholder="Out-of-area, Neighbor, Doctor…" /></Field>
             </div>
           </div>
         ) : (
@@ -1505,13 +1561,13 @@ function RemindersSection({ reminders, onAdd, onUpdate, onDelete, onComplete, on
             <h4 className="text-[10px] font-black uppercase text-blue-600">{editingId ? 'Edit Reminder' : 'New Reminder'}</h4>
             {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
           </div>
-          <div><Label>Title</Label><Input val={form.title} set={v => setForm({...form, title: v})} placeholder="e.g. Rotate stored water" /></div>
+          <Field><Label>Title</Label><Input val={form.title} set={v => setForm({...form, title: v})} placeholder="e.g. Rotate stored water" /></Field>
           <div className="grid grid-cols-2 gap-3">
-            <div><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={reminderCategories} /></div>
-            <div><Label>Repeat every (days)</Label><Input val={form.recurringDays} set={v => setForm({...form, recurringDays: v})} type="number" /></div>
+            <Field><Label>Category</Label><Select val={form.category} set={v => setForm({...form, category: v})} opts={reminderCategories} /></Field>
+            <Field><Label>Repeat every (days)</Label><Input val={form.recurringDays} set={v => setForm({...form, recurringDays: v})} type="number" /></Field>
           </div>
-          <div><Label>Start date</Label><Input val={form.startDate} set={v => setForm({...form, startDate: v})} type="date" /></div>
-          <div><Label>Notes (optional)</Label><Input val={form.notes} set={v => setForm({...form, notes: v})} placeholder="Any details" /></div>
+          <Field><Label>Start date</Label><Input val={form.startDate} set={v => setForm({...form, startDate: v})} type="date" /></Field>
+          <Field><Label>Notes (optional)</Label><Input val={form.notes} set={v => setForm({...form, notes: v})} placeholder="Any details" /></Field>
           <button type="submit" className="w-full bg-blue-600 text-white py-3 rounded-xl font-black text-sm">{editingId ? 'Save Changes' : 'Add Reminder'}</button>
         </form>
       )}
@@ -1522,7 +1578,7 @@ function RemindersSection({ reminders, onAdd, onUpdate, onDelete, onComplete, on
           const overdue = isReminderOverdue(reminder);
           return (
             <div key={reminder.id} className={`border p-4 rounded-2xl ${overdue ? 'bg-red-50 border-red-200' : 'bg-white border-slate-200'}`}>
-              <div className="flex items-center gap-3 min-w-0 cursor-pointer" onClick={() => handleEdit(reminder)}>
+              <div {...openOnKey(() => handleEdit(reminder), `Edit reminder ${reminder.title}`)} className={`flex items-center gap-3 min-w-0 cursor-pointer rounded-lg ${focusRing}`}>
                 <div className={`p-2.5 rounded-xl shrink-0 ${overdue ? 'bg-red-100 text-red-600' : 'bg-slate-100 text-slate-600'}`}>{getReminderIcon(reminder.category)}</div>
                 <div className="min-w-0">
                   <div className="font-black text-slate-800 text-sm truncate">{reminder.title}</div>
@@ -1607,17 +1663,17 @@ function MedicationsSection({ medications, onAdd, onUpdate, onDelete }) {
             <h4 className="text-[10px] font-black uppercase text-blue-600">{editingId ? 'Edit Medication' : 'New Medication'}</h4>
             {editingId && <button type="button" onClick={async () => { if (await onDelete(editingId)) reset(); }} className="text-red-600 text-[10px] font-black uppercase flex items-center gap-1"><Trash2 size={12}/> Delete</button>}
           </div>
-          <div><Label>Medication name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Lisinopril" /></div>
+          <Field><Label>Medication name</Label><Input val={form.name} set={v => setForm({...form, name: v})} placeholder="e.g. Lisinopril" /></Field>
           <div className="grid grid-cols-2 gap-3">
-            <div><Label>Person</Label><Input val={form.person} set={v => setForm({...form, person: v})} placeholder="Who takes this" /></div>
-            <div><Label>Dose</Label><Input val={form.dose} set={v => setForm({...form, dose: v})} placeholder="e.g. 10mg daily" /></div>
+            <Field><Label>Person</Label><Input val={form.person} set={v => setForm({...form, person: v})} placeholder="Who takes this" /></Field>
+            <Field><Label>Dose</Label><Input val={form.dose} set={v => setForm({...form, dose: v})} placeholder="e.g. 10mg daily" /></Field>
           </div>
           <div className="grid grid-cols-2 gap-3">
-            <div><Label>Quantity on hand</Label><Input val={form.quantityOnHand} set={v => setForm({...form, quantityOnHand: v})} type="number" /></div>
-            <div><Label>Refill date</Label><Input val={form.refillDate} set={v => setForm({...form, refillDate: v})} type="date" /></div>
+            <Field><Label>Quantity on hand</Label><Input val={form.quantityOnHand} set={v => setForm({...form, quantityOnHand: v})} type="number" /></Field>
+            <Field><Label>Refill date</Label><Input val={form.refillDate} set={v => setForm({...form, refillDate: v})} type="date" /></Field>
           </div>
-          <div><Label>Prescriber (optional)</Label><Input val={form.prescriber} set={v => setForm({...form, prescriber: v})} placeholder="Doctor or pharmacy" /></div>
-          <div><Label>Notes (optional)</Label><Input val={form.notes} set={v => setForm({...form, notes: v})} placeholder="Any details" /></div>
+          <Field><Label>Prescriber (optional)</Label><Input val={form.prescriber} set={v => setForm({...form, prescriber: v})} placeholder="Doctor or pharmacy" /></Field>
+          <Field><Label>Notes (optional)</Label><Input val={form.notes} set={v => setForm({...form, notes: v})} placeholder="Any details" /></Field>
           <button type="submit" className="w-full bg-blue-600 text-white py-3 rounded-xl font-black text-sm">{editingId ? 'Save Changes' : 'Add Medication'}</button>
         </form>
       )}
@@ -1626,7 +1682,7 @@ function MedicationsSection({ medications, onAdd, onUpdate, onDelete }) {
         {sorted.map(medication => {
           const dueForRefill = isMedicationRefillDue(medication);
           return (
-            <div key={medication.id} className={`border p-4 rounded-2xl cursor-pointer ${dueForRefill ? 'bg-red-50 border-red-200' : 'bg-white border-slate-200'}`} onClick={() => handleEdit(medication)}>
+            <div key={medication.id} {...openOnKey(() => handleEdit(medication), `Edit medication ${medication.name}`)} className={`border p-4 rounded-2xl cursor-pointer ${focusRing} ${dueForRefill ? 'bg-red-50 border-red-200' : 'bg-white border-slate-200'}`}>
               <div className="flex items-center gap-3 min-w-0">
                 <div className={`p-2.5 rounded-xl shrink-0 ${dueForRefill ? 'bg-red-100 text-red-600' : 'bg-slate-100 text-slate-600'}`}><Shield size={20}/></div>
                 <div className="min-w-0">
@@ -1686,9 +1742,34 @@ function ChecklistsSection({ checklists, checklistChecks, onToggle }) {
 }
 
 // --- Helper Components ---
-const Label = ({ children }) => <label className="text-[10px] font-black uppercase text-slate-600 mb-1 block">{children}</label>;
-const Input = ({ val, set, type="text", placeholder }) => <input type={type} min={type === "number" ? 0 : undefined} step={type === "number" ? "any" : undefined} className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none focus:bg-white focus:border-blue-400 border border-transparent transition-all" value={val ?? ""} onChange={e => set(e.target.value)} placeholder={placeholder} />;
-const Select = ({ val, set, opts }) => <select className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none border border-transparent" value={val ?? ""} onChange={e => set(e.target.value)}>{opts.map(o => <option key={o} value={o}>{o}</option>)}</select>;
+// Props that make a clickable row a real control for keyboard and screen-reader users: it can be
+// tabbed to, announced as a button with a name, and opened with Enter or Space as well as a click.
+// (A bare `<div onClick>` is invisible to all three.) Only a key pressed on the row itself counts,
+// so a button or field nested inside it keeps its own Enter and Space.
+const openOnKey = (onOpen, label) => ({
+  role: 'button', tabIndex: 0, 'aria-label': label, onClick: onOpen,
+  onKeyDown: event => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); onOpen(); } },
+});
+const focusRing = 'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600';
+
+// A form field: the label and its control share an id through context, so the label is really
+// attached to the control (clicking it focuses the input, and a screen reader announces it). It
+// renders the same `<div>` the layout always had, so nothing about the form's look or structure
+// changes. Controls outside a Field (or one that needs a fixed id) pass `id`/`htmlFor` themselves.
+const FieldContext = createContext(undefined);
+const Field = ({ className, children }) => <FieldContext.Provider value={useId()}><div className={className}>{children}</div></FieldContext.Provider>;
+const Label = ({ children, htmlFor }) => {
+  const fieldId = useContext(FieldContext);
+  return <label htmlFor={htmlFor ?? fieldId} className="text-[10px] font-black uppercase text-slate-600 mb-1 block">{children}</label>;
+};
+const Input = ({ val, set, type="text", placeholder, id, ariaLabel }) => {
+  const fieldId = useContext(FieldContext);
+  return <input id={id ?? fieldId} aria-label={ariaLabel} type={type} min={type === "number" ? 0 : undefined} step={type === "number" ? "any" : undefined} className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none focus:bg-white focus:border-blue-400 border border-transparent transition-all" value={val ?? ""} onChange={e => set(e.target.value)} placeholder={placeholder} />;
+};
+const Select = ({ val, set, opts, id }) => {
+  const fieldId = useContext(FieldContext);
+  return <select id={id ?? fieldId} className="w-full bg-slate-50 rounded-2xl p-4 text-sm font-bold outline-none border border-transparent" value={val ?? ""} onChange={e => set(e.target.value)}>{opts.map(o => <option key={o} value={o}>{o}</option>)}</select>;
+};
 
 // Barcode scanning is progressive enhancement: browsers without BarcodeDetector (e.g. Safari)
 // just get the manual text input above, which is the required fallback.
@@ -1793,10 +1874,10 @@ function ConsumptionPanel({ item, events, onConsume, onDelete }) {
       )}
       <form onSubmit={submit} className="space-y-3">
         <div className="grid grid-cols-2 gap-3">
-          <div><Label>Usage date</Label><Input val={date} set={setDate} type="date" /></div>
-          <div><Label>Quantity used</Label><Input val={quantity} set={setQuantity} type="number" placeholder="e.g. 1" /></div>
+          <Field><Label>Usage date</Label><Input val={date} set={setDate} type="date" /></Field>
+          <Field><Label>Quantity used</Label><Input val={quantity} set={setQuantity} type="number" placeholder="e.g. 1" /></Field>
         </div>
-        <div><Label>Note (optional)</Label><Input val={note} set={setNote} placeholder="What was used?" /></div>
+        <Field><Label>Note (optional)</Label><Input val={note} set={setNote} placeholder="What was used?" /></Field>
         {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}
         <button type="submit" className="w-full rounded-xl bg-violet-600 text-white p-3 text-sm font-black">Log consumption</button>
       </form>
@@ -1851,7 +1932,8 @@ export function InventoryItem({ item, forecast, onClick, onBuy, selected, onSele
     }
   };
 
-  const isExpiringSoon = item.expiryDate && new Date(item.expiryDate) < new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  const daysLeft = daysUntilExpiry(item.expiryDate);
+  const isExpiringSoon = daysLeft !== null && daysLeft <= expiryTiers.soon; // includes already-expired, which the badge labels EXPIRED
   const expired = isExpired(item.expiryDate);
 
   return (
@@ -1878,7 +1960,7 @@ export function InventoryItem({ item, forecast, onClick, onBuy, selected, onSele
                  )}
                </div>
                <div className="flex gap-2 mt-1">
-                 {isExpiringSoon && <span className="text-[8px] font-bold bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
+                 {isExpiringSoon && <span title={expired ? undefined : `Expires within ${expiryTiers.soon} days`} className="text-[8px] font-bold bg-orange-100 text-orange-800 px-1.5 py-0.5 rounded flex items-center gap-1"><AlertTriangle size={8}/> {expired ? 'EXPIRED' : 'Expiring Soon'}</span>}
                  <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">
                   {item.quantity} {item.unit}
                  </p>
@@ -2096,6 +2178,36 @@ function NavButton({ active, onClick, icon, label }) {
   );
 }
 
+// Edits the server refused outright. They were applied on this device while queued, so the person
+// has seen them "save"; this is where they learn they did not, and choose what happens next.
+export function RejectedChanges({ items, onDiscard, onRetry }) {
+  if (!items.length) return null;
+  return (
+    <section role="alert" aria-labelledby="rejected-changes-heading" className="bg-amber-50 border-b border-amber-200 text-amber-950 px-4 py-3">
+      <div className="max-w-xl mx-auto space-y-2">
+        <h2 id="rejected-changes-heading" className="text-xs font-black uppercase tracking-widest">
+          {items.length === 1 ? '1 change could not be saved' : `${items.length} changes could not be saved`}
+        </h2>
+        <p className="text-xs">The server turned these down, so they are not in your household. Everything else has synced.</p>
+        <ul className="space-y-2">
+          {items.map(entry => (
+            <li key={entry.id} className="flex items-center justify-between gap-3 bg-white/70 rounded-xl px-3 py-2">
+              <div className="min-w-0">
+                <p className="text-sm font-bold truncate">{describeAction(entry.action)}</p>
+                <p className="text-xs text-amber-800">{entry.message}</p>
+              </div>
+              <div className="flex gap-2 shrink-0">
+                <button onClick={() => onRetry(entry.id)} aria-label={`Try again: ${describeAction(entry.action)}`} className="px-3 py-1.5 rounded-full bg-amber-600 text-white text-[10px] font-black uppercase tracking-widest">Try again</button>
+                <button onClick={() => onDiscard(entry.id)} aria-label={`Discard: ${describeAction(entry.action)}`} className="px-3 py-1.5 rounded-full bg-white border border-amber-300 text-amber-900 text-[10px] font-black uppercase tracking-widest">Discard</button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </section>
+  );
+}
+
 function NavBar({ activeTab, setActiveTab }) {
   return (
     <nav className="fixed bottom-6 left-4 right-4 max-w-xl mx-auto bg-white/90 backdrop-blur-md border border-slate-200 p-2.5 rounded-[2rem] shadow-2xl flex justify-around items-center z-50">
@@ -2183,14 +2295,14 @@ function SettingsForm({ settings, onSave }) {
     <form onSubmit={submit} className="space-y-3 border-t border-slate-100 pt-5">
       <h3 className="text-xs font-black uppercase text-slate-600 tracking-widest">Readiness assumptions</h3>
       <div className="grid grid-cols-2 gap-3">
-        <div><Label>Household size</Label><Input val={form.householdSize} set={v => setForm({...form, householdSize: v})} type="number" /></div>
-        <div><Label>Goal (days)</Label><Input val={form.survivalGoalDays} set={v => setForm({...form, survivalGoalDays: v})} type="number" /></div>
-        <div><Label>Calories/person/day</Label><Input val={form.caloriesPerPersonPerDay} set={v => setForm({...form, caloriesPerPersonPerDay: v})} type="number" /></div>
-        <div><Label>Water gal/person/day</Label><Input val={form.waterGallonsPerPersonPerDay} set={v => setForm({...form, waterGallonsPerPersonPerDay: v})} type="number" /></div>
-        <div><Label>Heat goal (hours)</Label><Input val={form.heatGoalHours} set={v => setForm({...form, heatGoalHours: v})} type="number" /></div>
-        <div><Label>Power goal (kWh)</Label><Input val={form.powerGoalKwh} set={v => setForm({...form, powerGoalKwh: v})} type="number" /></div>
-        <div><Label>Battery usable %</Label><Input val={form.batteryUsableFraction} set={v => setForm({...form, batteryUsableFraction: v})} type="number" /></div>
-        <div><Label>Inverter efficiency %</Label><Input val={form.inverterEfficiency} set={v => setForm({...form, inverterEfficiency: v})} type="number" /></div>
+        <Field><Label>Household size</Label><Input val={form.householdSize} set={v => setForm({...form, householdSize: v})} type="number" /></Field>
+        <Field><Label>Goal (days)</Label><Input val={form.survivalGoalDays} set={v => setForm({...form, survivalGoalDays: v})} type="number" /></Field>
+        <Field><Label>Calories/person/day</Label><Input val={form.caloriesPerPersonPerDay} set={v => setForm({...form, caloriesPerPersonPerDay: v})} type="number" /></Field>
+        <Field><Label>Water gal/person/day</Label><Input val={form.waterGallonsPerPersonPerDay} set={v => setForm({...form, waterGallonsPerPersonPerDay: v})} type="number" /></Field>
+        <Field><Label>Heat goal (hours)</Label><Input val={form.heatGoalHours} set={v => setForm({...form, heatGoalHours: v})} type="number" /></Field>
+        <Field><Label>Power goal (kWh)</Label><Input val={form.powerGoalKwh} set={v => setForm({...form, powerGoalKwh: v})} type="number" /></Field>
+        <Field><Label>Battery usable %</Label><Input val={form.batteryUsableFraction} set={v => setForm({...form, batteryUsableFraction: v})} type="number" /></Field>
+        <Field><Label>Inverter efficiency %</Label><Input val={form.inverterEfficiency} set={v => setForm({...form, inverterEfficiency: v})} type="number" /></Field>
       </div>
       <p className="text-xs text-slate-500">Battery usable % and inverter efficiency % account for depth-of-discharge limits and DC-to-AC conversion loss when estimating runtime from stored power.</p>
       {error && <p role="alert" className="text-xs font-bold text-red-600">{error}</p>}

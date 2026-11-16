@@ -59,7 +59,9 @@ export async function readState() {
           heat_goal_hours AS "heatGoalHours", power_goal_kwh AS "powerGoalKwh",
           battery_usable_fraction AS "batteryUsableFraction", inverter_efficiency AS "inverterEfficiency"
         FROM northstar_settings WHERE household_id = ${householdId}`,
-    tx`SELECT id, item_id AS "itemId", event_date AS date, quantity, note
+    // to_char, not the bare date column: the driver parses a `date` into a JS Date, which the
+    // state schema (an ISO date string) rejects, failing every read once any usage is recorded.
+    tx`SELECT id, item_id AS "itemId", to_char(event_date, 'YYYY-MM-DD') AS date, quantity, note
         FROM northstar_consumption_events WHERE household_id = ${householdId}
         ORDER BY event_date ASC, created_at ASC, id ASC`,
   ], {isolationLevel: 'RepeatableRead', readOnly: true});
@@ -256,7 +258,7 @@ export async function rateLimit(key) {
 // --- Accounts, membership, invitations and audit history (household 1 is the only household today). ---
 export async function findUserByEmail(email) {
   const sql = database();
-  const rows = await sql`SELECT id, email, password_hash FROM northstar_users WHERE email = ${email}`;
+  const rows = await sql`SELECT id, email, password_hash, session_version FROM northstar_users WHERE email = ${email}`;
   return rows[0];
 }
 export async function findUserById(userId) {
@@ -271,13 +273,23 @@ export async function findCredentialsById(userId) {
   const rows = await sql`SELECT id, email, password_hash FROM northstar_users WHERE id = ${userId}`;
   return rows[0];
 }
+// Bumping session_version signs out every device: cookies carry the version they were issued
+// at, and getMembership rejects one that no longer matches. Returns the new version so the
+// caller can issue the current device a fresh cookie.
 export async function setPassword(userId, passwordHash) {
   const sql = database();
-  await sql`UPDATE northstar_users SET password_hash = ${passwordHash} WHERE id = ${userId}`;
+  const rows = await sql`UPDATE northstar_users SET password_hash = ${passwordHash}, session_version = session_version + 1
+    WHERE id = ${userId} RETURNING session_version`;
+  return rows[0]?.session_version ?? 0;
 }
-export async function getMembership(userId, householdId = 1) {
+// `sessionVersion` is the version the caller's cookie carries; when given, a cookie issued
+// before the user's last password change or reset no longer counts as a member.
+export async function getMembership(userId, householdId = 1, sessionVersion = null) {
   const sql = database();
-  const rows = await sql`SELECT role FROM northstar_household_members WHERE household_id = ${householdId} AND user_id = ${userId}`;
+  const rows = await sql`SELECT m.role FROM northstar_household_members m
+    JOIN northstar_users u ON u.id = m.user_id
+    WHERE m.household_id = ${householdId} AND m.user_id = ${userId}
+      AND (${sessionVersion}::int IS NULL OR u.session_version = ${sessionVersion}::int)`;
   return rows[0];
 }
 export async function listMembers(householdId = 1) {
@@ -285,15 +297,6 @@ export async function listMembers(householdId = 1) {
   return sql`SELECT u.id AS user_id, u.email, m.role, m.added_at
     FROM northstar_household_members m JOIN northstar_users u ON u.id = m.user_id
     WHERE m.household_id = ${householdId} ORDER BY m.added_at ASC`;
-}
-export async function createUserWithMembership({email, passwordHash, householdId = 1, role}) {
-  const sql = database();
-  const userId = randomUUID();
-  await sql.transaction(tx => [
-    tx`INSERT INTO northstar_users (id, email, password_hash) VALUES (${userId}, ${email}, ${passwordHash})`,
-    tx`INSERT INTO northstar_household_members (household_id, user_id, role) VALUES (${householdId}, ${userId}, ${role})`,
-  ]);
-  return userId;
 }
 export async function removeMember(userId, householdId = 1) {
   const sql = database();
@@ -352,12 +355,26 @@ export async function findPasswordResetByTokenHash(tokenHash) {
 }
 // Sets the new password and consumes every pending reset for this user (not just the one used),
 // so a second, still-unexpired link generated earlier for the same person stops working too.
+// Like setPassword, bumps session_version (signing every device out) and returns the new one.
 export async function resetPassword({userId, passwordHash}) {
   const sql = database();
-  await sql.transaction(tx => [
-    tx`UPDATE northstar_users SET password_hash = ${passwordHash} WHERE id = ${userId}`,
+  const results = await sql.transaction(tx => [
+    tx`UPDATE northstar_users SET password_hash = ${passwordHash}, session_version = session_version + 1 WHERE id = ${userId} RETURNING session_version`,
     tx`UPDATE northstar_password_resets SET used_at = now() WHERE user_id = ${userId} AND used_at IS NULL`,
   ]);
+  return results[0][0]?.session_version ?? 0;
+}
+// Reset links and invitations that expired long ago can never be used again, and nothing refers to
+// them, so the daily cron removes them. They are kept for a while after expiry so an owner who
+// sees "expired" in the member list is not met with a link that has silently vanished. Accepted
+// invitations are history (who joined, invited by whom) and are never removed here.
+export async function pruneExpiredCredentials({resetDays = 7, invitationDays = 30} = {}) {
+  const sql = database();
+  const resets = await sql`DELETE FROM northstar_password_resets
+    WHERE expires_at < now() - make_interval(days => ${Math.round(resetDays)}) RETURNING 1 AS removed`;
+  const invitations = await sql`DELETE FROM northstar_invitations
+    WHERE accepted_at IS NULL AND expires_at < now() - make_interval(days => ${Math.round(invitationDays)}) RETURNING 1 AS removed`;
+  return {resets: resets.length, invitations: invitations.length};
 }
 export async function insertAuditLog({householdId = 1, userId, action, collection = null, itemId = null, itemName = null}) {
   const sql = database();

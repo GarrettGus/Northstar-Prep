@@ -31,6 +31,13 @@ async function query(url, text, values = []) {
   try { return (await client.query(text, values)).rows; } finally { await client.end(); }
 }
 
+// Creates a household member the way production does: an owner invites an email, and accepting
+// the invitation creates the user and their membership in one transaction.
+async function addMember(db, email, role, passwordHash = 'x') {
+  const invitationId = await db.createInvitation({email, role, invitedBy: null, tokenHash: `token-${email}`, expiresAt: new Date(Date.now() + 3600_000).toISOString()});
+  return db.acceptInvitation({invitationId, householdId: 1, role, email, passwordHash});
+}
+
 function disposableDatabase() {
   const state = {};
   before(async () => { Object.assign(state, await createDisposableDatabase()); });
@@ -216,8 +223,8 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
 
     it('stores push subscriptions per member, filters by member, and stops listing a removed member', async () => {
       const db = await loadDb(database.url);
-      const owner = await db.createUserWithMembership({email: 'push-owner@example.com', passwordHash: 'x', role: 'owner'});
-      const member = await db.createUserWithMembership({email: 'push-member@example.com', passwordHash: 'x', role: 'member'});
+      const owner = await addMember(db, 'push-owner@example.com', 'owner');
+      const member = await addMember(db, 'push-member@example.com', 'member');
       await db.savePushSubscription({id: 'sub-owner', userId: owner, endpoint: 'https://push.example/o', p256dh: 'k', auth: 'a'});
       await db.savePushSubscription({id: 'sub-member', userId: member, endpoint: 'https://push.example/m', p256dh: 'k', auth: 'a'});
       // Re-subscribing the same browser updates its row.
@@ -233,6 +240,84 @@ describe('database migration', {skip: available ? false : 'no Postgres reachable
       assert.deepEqual(ids(await db.listPushSubscriptions()), ['sub-owner']);
       await db.deletePushSubscription('sub-owner', owner);
       assert.deepEqual(await db.listPushSubscriptions(), []);
+    });
+
+    it('signs a user out everywhere when their password changes or is reset, and only then', async () => {
+      const db = await loadDb(database.url);
+      const userId = await addMember(db, 'sessions@example.com', 'member');
+      assert.equal((await db.findUserByEmail('sessions@example.com')).session_version, 0);
+      // No version supplied (a lookup that is not about a cookie), and the version every cookie starts at.
+      assert.deepEqual(await db.getMembership(userId), {role: 'member'});
+      assert.deepEqual(await db.getMembership(userId, 1, 0), {role: 'member'});
+      assert.equal(await db.getMembership(userId, 1, 1), undefined);
+
+      assert.equal(await db.setPassword(userId, 'new-hash'), 1);
+      assert.equal(await db.getMembership(userId, 1, 0), undefined, 'a cookie from before the change is rejected');
+      assert.deepEqual(await db.getMembership(userId, 1, 1), {role: 'member'}, 'the cookie issued by the change itself works');
+
+      await db.createPasswordReset({userId, tokenHash: 'reset-token-hash', expiresAt: new Date(Date.now() + 3600_000).toISOString()});
+      assert.equal(await db.resetPassword({userId, passwordHash: 'reset-hash'}), 2);
+      assert.equal(await db.getMembership(userId, 1, 1), undefined);
+      assert.deepEqual(await db.getMembership(userId, 1, 2), {role: 'member'});
+      assert.equal((await db.findUserByEmail('sessions@example.com')).session_version, 2);
+    });
+
+    it('reads usage events back as ISO date strings (a bare date column arrives as a JS Date and fails the state schema)', async () => {
+      const db = await loadDb(database.url);
+      const {stateSchema} = await import('../../shared/schema.js');
+      const {data, version} = await db.readState();
+      const withUsage = stateSchema.parse({...data, inventory: [{id: 'usage-rice', name: 'Rice', quantity: 4}],
+        consumption: [{id: 'use-a', itemId: 'usage-rice', date: '2026-09-10', quantity: 1, note: 'dinner'}]});
+      assert.ok(await db.compareAndSave(version, withUsage, data));
+      const read = await db.readState();
+      assert.deepEqual(read.data.consumption, [{id: 'use-a', itemId: 'usage-rice', date: '2026-09-10', quantity: 1, note: 'dinner'}]);
+      await query(database.url, 'DELETE FROM northstar_consumption_events');
+      await query(database.url, 'DELETE FROM northstar_inventory');
+    });
+
+    it('sweeps up usage history and kit assignments left behind by earlier deletes, once', async () => {
+      const db = await loadDb(database.url);
+      const item = id => ({id, name: id, quantity: 1, unit: 'units', category: 'Gear', calories: 0});
+      const kit = {id: 'kit-live', name: 'Live kit', purpose: '', targetContents: [], assignedTo: ''};
+      let {data, version} = await db.readState();
+      const next = {...data,
+        inventory: [{...data.inventory[0] ?? {}, ...item('alive'), kitId: 'kit-live'}, {...item('stray'), kitId: 'kit-gone'}],
+        shoppingList: [{...item('wish'), kitId: 'kit-gone'}],
+        kits: [kit],
+        consumption: [{id: 'use-ok', itemId: 'alive', date: '2026-09-10', quantity: 1, note: ''}, {id: 'use-orphan', itemId: 'deleted-long-ago', date: '2026-09-10', quantity: 1, note: ''}]};
+      assert.ok(await db.compareAndSave(version, (await import('../../shared/schema.js')).stateSchema.parse(next), data));
+      const before = (await db.readState()).version;
+
+      await migrate(database.url);
+      const after = await db.readState();
+      assert.deepEqual(after.data.consumption.map(event => event.id), ['use-ok']);
+      assert.deepEqual(Object.fromEntries([...after.data.inventory, ...after.data.shoppingList].map(row => [row.id, row.kitId])), {alive: 'kit-live', stray: '', wish: ''});
+      assert.equal(Number(after.version), Number(before) + 1, 'devices polling with the old version are told to refetch');
+
+      await migrate(database.url);
+      assert.equal(Number((await db.readState()).version), Number(after.version), 'a second run finds nothing and changes nothing');
+    });
+
+    it('prunes reset links and unaccepted invitations only once they expired long ago, and never accepted invitations', async () => {
+      const db = await loadDb(database.url);
+      const daysAgo = days => new Date(Date.now() - days * 86_400_000).toISOString();
+      const userId = await addMember(db, 'prune-user@example.com', 'member');
+      await db.createPasswordReset({userId, tokenHash: 'reset-old', expiresAt: daysAgo(10)});
+      await db.createPasswordReset({userId, tokenHash: 'reset-just-expired', expiresAt: daysAgo(1)});
+      await db.createPasswordReset({userId, tokenHash: 'reset-live', expiresAt: daysAgo(-1)});
+      await db.createInvitation({email: 'old-invite@example.com', role: 'member', invitedBy: userId, tokenHash: 'invite-old', expiresAt: daysAgo(45)});
+      await db.createInvitation({email: 'recent-invite@example.com', role: 'member', invitedBy: userId, tokenHash: 'invite-recent', expiresAt: daysAgo(5)});
+      await db.createInvitation({email: 'live-invite@example.com', role: 'member', invitedBy: userId, tokenHash: 'invite-live', expiresAt: daysAgo(-5)});
+      // addMember's own invitation was accepted; make it ancient to prove accepted ones are kept as history.
+      await query(database.url, `UPDATE northstar_invitations SET expires_at = now() - interval '400 days' WHERE token_hash = 'token-prune-user@example.com'`);
+
+      assert.deepEqual(await db.pruneExpiredCredentials(), {resets: 1, invitations: 1});
+      const resets = (await query(database.url, 'SELECT token_hash FROM northstar_password_resets ORDER BY token_hash')).map(row => row.token_hash);
+      assert.ok(resets.includes('reset-just-expired') && resets.includes('reset-live') && !resets.includes('reset-old'));
+      const invitations = (await query(database.url, 'SELECT token_hash FROM northstar_invitations')).map(row => row.token_hash);
+      assert.ok(invitations.includes('invite-recent') && invitations.includes('invite-live') && invitations.includes('token-prune-user@example.com'));
+      assert.ok(!invitations.includes('invite-old'));
+      assert.deepEqual(await db.pruneExpiredCredentials(), {resets: 0, invitations: 0}, 'a second run finds nothing');
     });
 
     it('the daily prune drops rate-limit windows that have lapsed and keeps live ones', async () => {

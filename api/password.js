@@ -1,5 +1,5 @@
 import { findCredentialsById, rateLimit, setPassword } from '../server/db.js';
-import { hashPassword, loginKey, sameOrigin, validSession, verifyPassword } from '../server/auth.js';
+import { cookie, hashPassword, loginKey, sameOrigin, token, validSession, verifyPassword } from '../server/auth.js';
 import { passwordSchema } from '../shared/schema.js';
 import { beginRequest, logFailure, observe } from '../server/observability.js';
 
@@ -21,7 +21,10 @@ export function createHandler(repository = {rateLimit, findCredentialsById, setP
       if (!await repository.rateLimit(loginKey(req))) return res.status(429).json({error: 'Too many attempts. Try again in 15 minutes.'});
       const user = await repository.findCredentialsById(session.userId);
       if (!user || !verifyPassword(currentPassword, user.password_hash)) return res.status(401).json({error: 'Current password is incorrect.'});
-      await repository.setPassword(session.userId, hashPassword(newPasswordResult.data));
+      // Bumps the user's session version, which signs out every other device; this one is kept
+      // signed in by replacing its cookie with one carrying the new version.
+      const version = await repository.setPassword(session.userId, hashPassword(newPasswordResult.data));
+      res.setHeader('Set-Cookie', cookie(token(session.userId, Date.now(), version ?? 0)));
       return res.status(200).json({ok: true});
     } catch (error) {
       logFailure(request, '/api/password', 503, error); return res.status(503).json({error: 'Changing your password failed. Try again.'});

@@ -66,7 +66,7 @@ export function createHandler(repository = {getMembership, readPlanLocation}, au
     if (req.method !== 'GET') return res.status(405).json({error: 'Method not allowed.'});
     let location;
     try {
-      if (!await repository.getMembership(session.userId)) return res.status(403).json({error: 'Not a member of this household.'});
+      if (!await repository.getMembership(session.userId, 1, session.version)) return res.status(403).json({error: 'Not a member of this household.'});
       location = await repository.readPlanLocation();
     } catch (error) { logFailure(request, '/api/alerts', 503, error); return res.status(503).json({error: 'Weather alerts are unavailable.'}); }
     if (!location) return res.status(200).json({configured: false, available: false, alerts: []});

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createHmac } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { applyAction, emptyState, normalizeBackup, stateSchema, settingsSchema, emailSchema, passwordSchema, roleSchema, itemSchema, reminderSchema, planSchema, kitSchema, medicationSchema } from '../shared/schema.js';
 import { nextReminderDueDate, effectiveReminderDueDate, isReminderOverdue, isMedicationRefillDue, addDaysISO } from '../shared/reminders.js';
@@ -12,9 +13,9 @@ import { createHandler as createMembersHandler } from '../api/members.js';
 import { createHandler as createInviteHandler } from '../api/invite.js';
 import { createHandler as createPasswordResetHandler } from '../api/password-reset.js';
 import { createHandler as createPasswordHandler } from '../api/password.js';
-import { createHandler as createReminderHistoryHandler } from '../api/reminder-history.js';
-import { createHandler as createReadinessHistoryHandler } from '../api/readiness-history.js';
-import { waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds, daysUntilExpiry, expirationQueue, expirationSummary, deriveBurnRate, consumptionForecast } from '../shared/readiness.js';
+import { createReminderHistoryHandler, createReadinessHistoryHandler } from '../api/_history.js';
+import { dailyDigest } from '../shared/digest.js';
+import { expiryTiers, rotationWindows, isExpiringWithin, waterGallons, isExpired, computeReadiness, computeReadinessGaps, isRecurringDue, nextRecurringDate, householdNeeds, daysUntilExpiry, expirationQueue, expirationSummary, deriveBurnRate, consumptionForecast } from '../shared/readiness.js';
 process.env.SESSION_SECRET='test-only-secret-with-more-than-32-characters';
 process.env.DATABASE_URL='postgres://test-only/db';
 const item={id:'rice',name:'Rice',quantity:2,category:'Food'};
@@ -199,13 +200,23 @@ test('invitation tokens are opaque, single-use secrets that hash deterministical
 test('sessions carry the signed-in user, reject tampering/expiry, and rotating SESSION_SECRET invalidates them',()=>{
   const now=Date.now();const value=token('user-1',now);
   const req={headers:{cookie:cookie(value)}};
-  assert.deepEqual(validSession(req,now),{userId:'user-1'});
+  assert.deepEqual(validSession(req,now),{userId:'user-1',version:0});
   assert.equal(validSession(req,now+8*86400000),false);
   assert.equal(validSession({headers:{cookie:cookie(value+'x')}},now),false);
   const previousSecret=process.env.SESSION_SECRET;
   process.env.SESSION_SECRET='a-different-secret-that-is-also-long-enough';
   assert.equal(validSession(req,now),false);
   process.env.SESSION_SECRET=previousSecret;
+});
+test('a session cookie carries the session version it was issued at, and legacy cookies count as version 0',()=>{
+  const now=Date.now();
+  assert.deepEqual(validSession({headers:{cookie:cookie(token('user-1',now,3))}},now),{userId:'user-1',version:3});
+  // A cookie signed before the version field existed has no `ver`, so every existing sign-in survives the upgrade.
+  const payload=Buffer.from(JSON.stringify({sub:'user-1',exp:Math.floor(now/1000)+3600})).toString('base64url');
+  const signature=createHmac('sha256',process.env.SESSION_SECRET).update(payload).digest('base64url');
+  assert.deepEqual(validSession({headers:{cookie:cookie(`${payload}.${signature}`)}},now),{userId:'user-1',version:0});
+  assert.equal(validSession({headers:{cookie:cookie(token('user-1',now,-1))}},now),false);
+  assert.equal(validSession({headers:{cookie:cookie(token('user-1',now,1.5))}},now),false);
 });
 test('mutations reject cross-site origins and non-JSON forms',()=>{
   assert.equal(sameOrigin({headers:{host:'example.com',origin:'https://evil.com','content-type':'application/json'}}),false);
@@ -423,7 +434,7 @@ test('password-reset API validates tokens, rejects expired/used links, and signs
       return undefined;
     },
     async getMembership(userId){return userId==='member-1' ? {role:'member'} : undefined;},
-    async resetPassword(entry){passwordSet=entry;},
+    async resetPassword(entry){passwordSet=entry;return 4;},
   };
   const handler=createPasswordResetHandler(repository);
 
@@ -451,6 +462,8 @@ test('password-reset API validates tokens, rejects expired/used links, and signs
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',password:'longenoughpw'}},success);
   assert.equal(success.code,200);assert.equal(success.data.user.id,'member-1');assert.match(success.headers['Set-Cookie'],/northstar=/);
   assert.equal(passwordSet.userId,'member-1');
+  // The reset bumps the account's session version; the cookie it hands back carries the new one.
+  assert.equal(validSession({headers:{cookie:success.headers['Set-Cookie'].split(';')[0]}})?.version,4);
 
   const limited=response();
   await createPasswordResetHandler({...repository,async rateLimit(){return false;}})({method:'POST',headers:{'content-type':'application/json'},body:{token:'good-token',password:'longenoughpw'}},limited);
@@ -462,7 +475,7 @@ test('password API lets a signed-in user change their own password after re-ente
   const repository={
     async rateLimit(){return true;},
     async findCredentialsById(userId){return userId==='user-1' ? {id:'user-1',email:'me@example.com',password_hash:hash} : undefined;},
-    async setPassword(userId,passwordHash){updated={userId,passwordHash};},
+    async setPassword(userId,passwordHash){updated={userId,passwordHash};return 2;},
   };
   const handler=createPasswordHandler(repository,()=>({userId:'user-1'}));
 
@@ -473,6 +486,8 @@ test('password API lets a signed-in user change their own password after re-ente
   const success=response();
   await handler({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},success);
   assert.equal(success.code,200);assert.equal(updated.userId,'user-1');assert.ok(verifyPassword('new-password-123',updated.passwordHash));
+  // Other devices are signed out by the version bump; this one is kept signed in with a fresh cookie.
+  assert.deepEqual(validSession({headers:{cookie:success.headers['Set-Cookie'].split(';')[0]}}),{userId:'user-1',version:2});
 
   const unauthenticated=response();
   await createPasswordHandler(repository,()=>false)({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},unauthenticated);
@@ -481,6 +496,25 @@ test('password API lets a signed-in user change their own password after re-ente
   const limited=response();
   await createPasswordHandler({...repository,async rateLimit(){return false;}},()=>({userId:'user-1'}))({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},limited);
   assert.equal(limited.code,429);
+});
+test('the household API passes the cookie\'s session version to the membership check and answers 403 when it no longer matches',async()=>{
+  const seen=[];
+  const repository={
+    async getMembership(userId,householdId,version){seen.push([userId,householdId,version]);return version===2?{role:'member'}:undefined;},
+    async readState(){return {data:emptyState(),version:1};},
+  };
+  const stale=response();
+  await createHandler(repository,()=>({userId:'user-1',version:1}))({method:'GET',headers:{}},stale);
+  assert.equal(stale.code,403);assert.equal(stale.data.data,undefined);
+  const current=response();
+  await createHandler(repository,()=>({userId:'user-1',version:2}))({method:'GET',headers:{}},current);
+  assert.equal(current.code,200);
+  assert.deepEqual(seen,[['user-1',1,1],['user-1',1,2]]);
+  // A removed member (no membership at all) is turned away on writes too, before anything is applied.
+  let saved=false;
+  const removed=response();
+  await createHandler({...repository,async getMembership(){return undefined;},async compareAndSave(){saved=true;}},()=>({userId:'user-1',version:2}))({method:'POST',headers:{'content-type':'application/json'},body:{type:'add',collection:'inventory',id:'x',item:{name:'X'}}},removed);
+  assert.equal(removed.code,403);assert.equal(saved,false);
 });
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{
   assert.equal(waterGallons({quantity:3.785411784,unit:'liters'}),1);
@@ -797,6 +831,35 @@ test('fuel hours are grouped by fuel type for explainability',()=>{
   assert.equal(stats.totalFuelHours,30);
   assert.deepEqual(stats.fuelByType,{Propane:20,Gasoline:6,Other:4});
 });
+test('deleting a supply removes its usage history, and only its own, in the same change',()=>{
+  let state=emptyState();
+  for(const id of ['rice','beans']) state=applyAction(state,{type:'add',collection:'inventory',id,item:{name:id,quantity:5}});
+  for(const [id,itemId] of [['use-1','rice'],['use-2','rice'],['use-3','beans']]) state=applyAction(state,{type:'consume',id,itemId,date:'2026-09-10',quantity:1});
+  const afterDelete=applyAction(state,{type:'delete',collection:'inventory',id:'rice'});
+  assert.deepEqual(afterDelete.consumption.map(event=>event.id),['use-3']);
+  assert.deepEqual(afterDelete.inventory.map(item=>item.id),['beans']);
+  // The same holds for a bulk delete, and for deleting something nothing refers to.
+  const afterBulk=applyAction(state,{type:'bulk_delete',collection:'inventory',ids:['rice','beans']});
+  assert.deepEqual(afterBulk.consumption,[]);
+  assert.equal(applyAction(state,{type:'delete',collection:'inventory',id:'never-existed'}).consumption.length,3);
+  // Deleting a shopping-list row never touches usage history (usage belongs to inventory).
+  const withShopping=applyAction(state,{type:'add',collection:'shopping_list',id:'rice',item:{name:'Rice'}});
+  assert.equal(applyAction(withShopping,{type:'delete',collection:'shopping_list',id:'rice'}).consumption.length,3);
+});
+test('deleting a kit detaches its items instead of leaving them assigned to a kit that is gone',()=>{
+  let state=emptyState();
+  for(const id of ['go-bag','car-kit']) state=applyAction(state,{type:'add',collection:'kits',id,item:{name:id}});
+  state=applyAction(state,{type:'add',collection:'inventory',id:'tarp',item:{name:'Tarp',kitId:'go-bag',location:'Garage'}});
+  state=applyAction(state,{type:'add',collection:'inventory',id:'jack',item:{name:'Jack',kitId:'car-kit'}});
+  state=applyAction(state,{type:'add',collection:'shopping_list',id:'rope',item:{name:'Rope',kitId:'go-bag'}});
+  const after=applyAction(state,{type:'delete',collection:'kits',id:'go-bag'});
+  assert.deepEqual(after.kits.map(kit=>kit.id),['car-kit']);
+  const byId=Object.fromEntries([...after.inventory,...after.shoppingList].map(row=>[row.id,row]));
+  assert.equal(byId.tarp.kitId,'');assert.equal(byId.tarp.location,'Garage','only the kit link is cleared');
+  assert.equal(byId.rope.kitId,'');
+  assert.equal(byId.jack.kitId,'car-kit','items in other kits are untouched');
+  assert.deepEqual(applyAction(state,{type:'bulk_delete',collection:'kits',ids:['go-bag','car-kit']}).inventory.map(row=>row.kitId),['','']);
+});
 test('consumption events validate, merge by ID and leave current stock unchanged',()=>{
   const stocked=applyAction(emptyState(),{type:'add',collection:'inventory',id:'rice',item:{name:'Rice',category:'Food',quantity:10,unit:'bags'}});
   const first=applyAction(stocked,{type:'consume',id:'use-1',itemId:'rice',event:{date:'2026-09-10',quantity:2,note:'Dinner'}});
@@ -981,4 +1044,25 @@ test('reminder history API enforces membership and returns entries',async()=>{
   const unauthed=response();
   await createReminderHistoryHandler(repository,()=>false)({method:'GET',headers:{}},unauthed);
   assert.equal(unauthed.code,401);
+});
+test('the three "expiring" windows come from one place, are nested, and agree on the same item',()=>{
+  assert.deepEqual(expiryTiers,{thisWeek:7,soon:30,quarter:90});
+  assert.deepEqual(rotationWindows,[30,60,90],'the rotation queue spans soon..quarter');
+  assert.ok(expiryTiers.thisWeek<expiryTiers.soon&&expiryTiers.soon<expiryTiers.quarter);
+  // Relative to today, since computeReadiness (the Dashboard's number) reads the real clock.
+  const now=new Date();
+  const inDays=days=>{const d=new Date(now.getFullYear(),now.getMonth(),now.getDate()+days);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;};
+  const item=days=>({id:`i${days}`,name:`in ${days}`,quantity:1,expiryDate:inDays(days)});
+  // [days left, expiring this week?, soon?, this quarter?]
+  for(const [days,week,soon,quarter] of [[-1,false,false,false],[0,true,true,true],[7,true,true,true],[8,false,true,true],[30,false,true,true],[31,false,false,true],[90,false,false,true],[91,false,false,false]]){
+    assert.equal(isExpiringWithin(item(days),expiryTiers.thisWeek,now),week,`${days}d this week`);
+    assert.equal(isExpiringWithin(item(days),expiryTiers.soon,now),soon,`${days}d soon`);
+    assert.equal(isExpiringWithin(item(days),expiryTiers.quarter,now),quarter,`${days}d quarter`);
+  }
+  assert.equal(isExpiringWithin({name:'no date'},expiryTiers.quarter,now),false);
+  // The Dashboard's number is the quarter window, the digest's is the week window.
+  const inventory=[-1,0,7,8,30,31,90,91].map(item);
+  assert.equal(computeReadiness({inventory,appliances:[],settings:settingsSchema.parse({})},settingsSchema.parse({})).expiringSoon,expirationSummary(inventory,now).total);
+  assert.equal(expirationSummary(inventory,now).total,6,'0,7,8,30,31 and 90 days; not the expired one or the one beyond 90');
+  assert.equal(dailyDigest({inventory},now).counts.expiringSoon,2,'only 0 and 7 days');
 });

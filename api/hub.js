@@ -103,9 +103,11 @@ export function createHandler(repository = {readState, readVersion, compareAndSa
     if (req.method === 'POST' && !sameOrigin(req)) return res.status(403).json({error:'Request origin rejected.'});
     try {
       // The cookie only proves who signed in. Membership is re-read on every request, so removing
-      // someone from the household cuts off their reads and writes immediately rather than
-      // whenever their seven-day session happens to expire.
-      if (!await repository.getMembership(session.userId)) return res.status(403).json({error:'Not a member of this household.'});
+      // someone from the household, or changing their password (which retires every cookie signed
+      // before it: see session_version), cuts off their reads and writes immediately rather than
+      // whenever their seven-day session happens to expire. The client confirms a 403 against
+      // /api/session before clearing the device.
+      if (!await repository.getMembership(session.userId, 1, session.version)) return res.status(403).json({error:'Not a member of this household.'});
       if (req.method === 'GET') {
         // A poll that sends the version it already holds gets a tiny "unchanged" reply instead of
         // the whole household whenever nothing has been saved since.

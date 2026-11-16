@@ -156,7 +156,7 @@ test('health reports database availability and latency to anyone, metrics only t
   assert.equal(anonymous.data.database, 'ok');
   assert.equal(anonymous.data.metrics, undefined);
   assert.equal(typeof anonymous.data.latencyMs, 'number');
-  assert.deepEqual(probes.map(p => [p.route, p.outcome]), [['database', 'ok']]);
+  assert.deepEqual(probes, [], 'an anonymous call writes nothing');
 
   const member = response();
   await createHealthHandler(repository, () => ({userId: 'user-1'}))({method: 'GET', headers: {}}, member);
@@ -170,6 +170,38 @@ test('health reports database availability and latency to anyone, metrics only t
   assert.equal(metrics.alerting.webhookConfigured, false);
   assert.equal(metrics.routes.length, 4);
   assert.ok(!JSON.stringify(metrics).toLowerCase().includes('rice'));
+  assert.deepEqual(probes.map(p => [p.route, p.outcome]), [['database', 'ok']], 'a member\'s call is recorded for Service health');
+});
+
+test('an unauthenticated health call performs no database writes at all, including the request metric observe() would record', async () => {
+  const writes = [];
+  const repository = {
+    async probeDatabase() {},
+    async getMembership() { throw new Error('no session, so there is nobody to look up'); },
+    async summarizeRequestMetrics() { throw new Error('should not be called'); },
+    async recordRequestMetric(metric) { writes.push(['probe', metric.route]); },
+  };
+  const telemetry = {
+    async record(metric) { writes.push(['request', metric.route]); },
+    async countRecentFailures() { return 0; }, async claimAlert() { return true; }, async sendAlert() {},
+  };
+  const handler = observe('/api/health', createHealthHandler(repository, () => false), telemetry);
+  const anonymous = response();
+  await quietly(() => handler({method: 'GET', headers: {}}, anonymous));
+  assert.equal(anonymous.code, 200);
+  assert.deepEqual(writes, []);
+
+  // A cookie whose owner is no longer a member is treated as anonymous too.
+  const revoked = response();
+  await quietly(() => observe('/api/health', createHealthHandler({...repository, async getMembership() { return undefined; }}, () => ({userId: 'gone', version: 0})), telemetry)({method: 'GET', headers: {}}, revoked));
+  assert.equal(revoked.code, 200);
+  assert.equal(revoked.data.metrics, undefined);
+  assert.deepEqual(writes, []);
+
+  // A signed-in member's call is still recorded, as before.
+  const signedIn = response();
+  await quietly(() => observe('/api/health', createHealthHandler({...repository, async getMembership() { return {role: 'member'}; }, async summarizeRequestMetrics() { return []; }}, () => ({userId: 'user-1'})), telemetry)({method: 'GET', headers: {}}, signedIn));
+  assert.deepEqual(writes, [['probe', 'database'], ['request', '/api/health']]);
 });
 
 test('health fails closed with a 503 when the database probe fails', async () => {

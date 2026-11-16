@@ -82,7 +82,20 @@ export function daysUntilExpiry(date,now=new Date()) {
   const today=new Date(now.getFullYear(),now.getMonth(),now.getDate());
   return Math.round((target-today)/86400000);
 }
-export const rotationWindows=[30,60,90];
+// "Expiring" is said in three places, and each answers a different question, so each has its own
+// named window. Every screen takes its number from here and says it in its label, so the same
+// word never silently means 7, 30 and 90 days:
+//   thisWeek -- the daily push digest: what needs action now
+//   soon     -- the Supply Hub's Expiring filter and "Expiring Soon" badge
+//   quarter  -- the Dashboard's count, and how far ahead the rotation queue looks
+export const expiryTiers=Object.freeze({thisWeek:7,soon:30,quarter:90});
+export const rotationWindows=[expiryTiers.soon,60,expiryTiers.quarter];
+// True when an item lapses within `days` from today (today included) but has not lapsed yet.
+// Items already past their date are "expired", a separate state, and are not "expiring".
+export function isExpiringWithin(item,days,now=new Date()) {
+  const left=daysUntilExpiry(item?.expiryDate,now);
+  return left!==null&&left>=0&&left<=days;
+}
 // The rotation queue: supplies that have not lapsed yet but will within the longest window,
 // soonest first, each tagged with the tightest window it falls inside. Expired items are left
 // out -- readiness already excludes them and they are reported separately as an expired count.

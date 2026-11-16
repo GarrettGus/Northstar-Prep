@@ -58,3 +58,32 @@ test('csvToBackupPreview produces a backup accepted by the existing import actio
   assert.equal(backup.appliances.length, 0);
   assert.equal(backup.plan, null);
 });
+
+const blankItem = {quantity: 1, unit: 'units', category: 'Gear', store: '', location: '', barcode: '', purchaseDate: '', expiryDate: '', recurringDays: 0, caloriesPerUnit: 0, hoursPerUnit: 0, capacityPerUnit: 0, gallonsPerUnit: 0, price: 0, target: 0, macroTag: '', fuelType: '', emoji: ''};
+
+test('backupToCsv neutralises text cells a spreadsheet would run as a formula, but leaves numbers alone', () => {
+  const names = ['=HYPERLINK("http://evil.example","x")', '+1+1', '-2+3', '@SUM(A1)', '\t=1+1', '\r=1+1'];
+  const inventory = names.map((name, index) => ({...blankItem, id: `i${index}`, name, store: '=cmd|\' /C calc\'!A0', quantity: 5, price: 0}));
+  const csv = backupToCsv(inventory, []);
+  const lines = parseCsvRows(csv).slice(1);
+  for (const [index, cells] of lines.entries()) {
+    assert.equal(cells[2], `'${names[index]}`, `name ${index} is prefixed`);
+    assert.equal(cells[6], `'=cmd|' /C calc'!A0`, 'every free-text column is covered, not just the name');
+    assert.equal(cells[3], '5', 'a real number is not prefixed');
+  }
+  // No cell in the file starts with a formula character once parsed.
+  for (const cells of parseCsvRows(csv)) for (const cell of cells) assert.doesNotMatch(cell, /^[=+\-@\t\r]/);
+});
+
+test('a file the app exported imports back to the original names, and ordinary text is untouched', () => {
+  const originals = ['=SUM(1)', '-Spare tire', 'Rice', "'quoted but harmless"];
+  const inventory = originals.map((name, index) => ({...blankItem, id: `i${index}`, name}));
+  const result = csvToBackup(backupToCsv(inventory, []), () => 'generated');
+  assert.equal(result.errors.length, 0);
+  assert.deepEqual(result.inventory.map(row => row.name), originals);
+});
+
+test('a hand-written CSV with an unguarded leading dash keeps its text on import', () => {
+  const result = csvToBackup('collection,name,quantity\ninventory,-Spare tire,1\n', () => 'generated');
+  assert.equal(result.inventory[0].name, '-Spare tire');
+});

@@ -61,8 +61,9 @@ export function createHandler(repository = {findPasswordResetByTokenHash, resetP
       if (!resetStillValid(reset)) return res.status(410).json({error: 'This reset link is no longer valid. Ask a household owner for a new one.'});
       const membership = await repository.getMembership(reset.user_id);
       if (!membership) return res.status(410).json({error: 'This account is no longer a household member.'});
-      await repository.resetPassword({userId: reset.user_id, passwordHash: hashPassword(passwordResult.data)});
-      res.setHeader('Set-Cookie', cookie(sessionToken(reset.user_id)));
+      // Also signs out every device that was signed in before the reset (see session_version).
+      const version = await repository.resetPassword({userId: reset.user_id, passwordHash: hashPassword(passwordResult.data)});
+      res.setHeader('Set-Cookie', cookie(sessionToken(reset.user_id, Date.now(), version ?? 0)));
       return res.status(200).json({authenticated: true, user: {id: reset.user_id, role: membership.role}});
     } catch (error) {
       logFailure(request, '/api/password-reset', 503, error); return res.status(503).json({error: 'Resetting the password failed. Try again.'});

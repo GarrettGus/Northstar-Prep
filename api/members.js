@@ -24,7 +24,7 @@ export function createHandler(repository = {getMembership, listMembers, listPend
     if (!['GET', 'POST'].includes(req.method)) return res.status(405).json({error: 'Method not allowed.'});
     if (req.method === 'POST' && !sameOrigin(req)) return res.status(403).json({error: 'Request origin rejected.'});
     try {
-      const membership = await repository.getMembership(session.userId);
+      const membership = await repository.getMembership(session.userId, 1, session.version);
       if (!membership) return res.status(403).json({error: 'Not a member of this household.'});
       if (req.method === 'GET') {
         const members = await repository.listMembers();

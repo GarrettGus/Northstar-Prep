@@ -59,13 +59,14 @@ test('encodeBackupRecord/decodeBackupRecord round-trips a backup record for off-
 
 test('backup API: a valid cron secret creates a backup and prunes old backups and request metrics', async () => {
   const state = { ...emptyState(), inventory: [{id:'rice',name:'Rice',quantity:2,unit:'units',category:'Food',caloriesPerUnit:0,hoursPerUnit:0,capacityPerUnit:0,price:0,gallonsPerUnit:0,target:0,store:'',emoji:'',image:'',macroTag:'',fuelType:'',purchaseDate:'',expiryDate:''}] };
-  let inserted = null, pruned = false, metricsRetention = null;
+  let inserted = null, pruned = false, metricsRetention = null, credentialsPruned = false;
   const repository = {
     async readState() { return {data: state, version: 1}; },
     async insertBackupRecord(entry) { inserted = entry; return 42; },
     async updateBackupOffSiteStatus() {},
     async pruneBackups() { pruned = true; return []; },
     async pruneRequestMetrics(days) { metricsRetention = days; },
+    async pruneExpiredCredentials() { credentialsPruned = true; },
   };
   const res = response();
   await createHandler(repository, undefined, noOffSite)({method:'GET', headers:{authorization:'Bearer test-only-cron-secret'}}, res);
@@ -76,7 +77,31 @@ test('backup API: a valid cron secret creates a backup and prunes old backups an
   assert.ok(pruned);
   assert.equal(metricsRetention, 14);
   assert.equal(res.data.metricsPruned, true);
+  assert.equal(credentialsPruned, true, 'the daily run clears expired reset links and invitations');
+  assert.equal(res.data.credentialsPruned, true);
   assert.equal(res.data.offSiteStatus, 'skipped');
+});
+
+test('a failure pruning expired credentials is reported but never fails the backup the cron exists for', async () => {
+  let inserted = null;
+  const repository = {
+    async readState() { return {data: emptyState(), version: 3}; },
+    async insertBackupRecord(entry) { inserted = entry; return 43; },
+    async updateBackupOffSiteStatus() {},
+    async pruneBackups() { return []; },
+    async pruneRequestMetrics() {},
+    async pruneExpiredCredentials() { throw new Error('credential tables unavailable'); },
+    async recordReadinessSnapshot() {},
+    async pruneReadinessHistory() {},
+  };
+  const res = response();
+  const originalError = console.error; console.error = () => {};
+  try { await createHandler(repository, undefined, noOffSite)({method: 'GET', headers: {authorization: 'Bearer test-only-cron-secret'}}, res); }
+  finally { console.error = originalError; }
+  assert.equal(res.code, 200);
+  assert.equal(res.data.status, 'success');
+  assert.equal(inserted.status, 'success');
+  assert.equal(res.data.credentialsPruned, false);
 });
 
 test('backup API: the same cron run records a readiness snapshot and prunes old ones', async () => {
@@ -94,6 +119,7 @@ test('backup API: the same cron run records a readiness snapshot and prunes old 
     async updateBackupOffSiteStatus() {},
     async pruneBackups() { return []; },
     async pruneRequestMetrics() {},
+    async pruneExpiredCredentials() {},
     async recordReadinessSnapshot(entry) { snapshot = entry; },
     async pruneReadinessHistory(days) { snapshotRetention = days; },
   };
@@ -119,6 +145,7 @@ test('backup API: a failed readiness snapshot is reported without failing the ba
     async updateBackupOffSiteStatus() {},
     async pruneBackups() { return []; },
     async pruneRequestMetrics() {},
+    async pruneExpiredCredentials() {},
     async recordReadinessSnapshot() { throw new Error('snapshot table missing'); },
     async pruneReadinessHistory() {},
   };
@@ -212,6 +239,7 @@ test('backup API: off-site upload success and failure are recorded without affec
     async updateBackupOffSiteStatus(id, {status, error}) { succeeding.recorded = {id, status, error}; },
     async pruneBackups() { return []; },
     async pruneRequestMetrics() {},
+    async pruneExpiredCredentials() {},
     async recordReadinessSnapshot() {},
     async pruneReadinessHistory() {},
   };
@@ -230,6 +258,7 @@ test('backup API: off-site upload success and failure are recorded without affec
     async updateBackupOffSiteStatus(id, {status, error}) { failing.recorded = {id, status, error}; },
     async pruneBackups() { return []; },
     async pruneRequestMetrics() {},
+    async pruneExpiredCredentials() {},
     async recordReadinessSnapshot() {},
     async pruneReadinessHistory() {},
   };
@@ -252,6 +281,7 @@ test('backup API: pruned backups also have their off-site copies removed', async
     async updateBackupOffSiteStatus() {},
     async pruneBackups() { return [1, 2, 3]; },
     async pruneRequestMetrics() {},
+    async pruneExpiredCredentials() {},
     async recordReadinessSnapshot() {},
     async pruneReadinessHistory() {},
   };

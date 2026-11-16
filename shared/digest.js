@@ -1,10 +1,10 @@
 // The daily push digest: what needs attention today, as counts only. A lock-screen notification
 // can be read by anyone holding the phone, so it never names items, medications or people --
 // "2 medications due for refill" is useful; "Insulin for Sam" is not something to show there.
-import { daysUntilExpiry, isExpired, isRecurringDue } from './readiness.js';
+import { expiryTiers, isExpired, isExpiringWithin, isRecurringDue } from './readiness.js';
 import { isMedicationRefillDue, isReminderOverdue } from './reminders.js';
 
-export const expiringWithinDays = 7;
+export const expiringWithinDays = expiryTiers.thisWeek;
 
 export function dailyDigest(state, now = new Date()) {
   const inventory = state.inventory ?? [];
@@ -12,7 +12,7 @@ export function dailyDigest(state, now = new Date()) {
     overdueReminders: (state.reminders ?? []).filter(reminder => isReminderOverdue(reminder, now)).length,
     refillsDue: (state.medications ?? []).filter(medication => isMedicationRefillDue(medication, now)).length,
     expired: inventory.filter(item => isExpired(item.expiryDate, now)).length,
-    expiringSoon: inventory.filter(item => { const days = daysUntilExpiry(item.expiryDate, now); return days !== null && days >= 0 && days <= expiringWithinDays; }).length,
+    expiringSoon: inventory.filter(item => isExpiringWithin(item, expiringWithinDays, now)).length,
     restockDue: inventory.filter(item => isRecurringDue(item, now)).length,
   };
   const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;

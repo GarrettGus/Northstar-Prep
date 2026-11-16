@@ -56,7 +56,7 @@ const iconOnlyPairs = [
   ['appliance edit chevron button', 'slate-500', 'white', 3],
   ['inactive sort-by-expiry icon', 'slate-500', 'slate-100', 3],
   ['buy/move-to-inventory icon', 'slate-500', 'slate-100', 3],
-  ['AI modal close icon', 'slate-500', 'slate-100', 3],
+  ['simulation modal close icon', 'slate-500', 'slate-100', 3],
 ];
 
 test('text on light backgrounds meets WCAG AA (4.5:1) for the audited pairs', () => {

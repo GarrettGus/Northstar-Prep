@@ -9,7 +9,7 @@ export function pushConfigured() {
 }
 export function vapidPublicKey() { return pushConfigured() ? process.env.VAPID_PUBLIC_KEY : null; }
 
-export function subscriptionId(endpoint) { return createHash('sha256').update(String(endpoint)).digest('hex').slice(0, 64); }
+export function subscriptionId(endpoint) { return createHash('sha256').update(String(endpoint)).digest('hex'); }
 
 // Sends one notification to one stored subscription. Resolves to 'sent', or 'gone' when the push
 // service says the subscription no longer exists (the caller deletes it); other errors throw.

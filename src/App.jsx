@@ -1,11 +1,11 @@
 import React, { createContext, useContext, useId, useState, useEffect, useMemo, useRef } from 'react';
 import {
-  Shield, Package, Map, Link as LinkIcon, AlertTriangle, CheckCircle, Plus, Trash2, Home,
-  Droplets, Thermometer, Wind, Phone, Navigation, RefreshCw, Settings, Link2, ChevronRight,
-  ClipboardList, Zap, BookOpen, X, Flame, Edit2, Save, History, Utensils,
-  Database, UploadCloud, Battery, AlertOctagon, Smartphone, FileJson, Download, Upload,
-  Plug, DollarSign, ShoppingCart, Store, ArrowRight, Layers,
-  Siren, SearchCheck, Power, Tag, Calendar, ArrowUpDown
+  Shield, Package, Map, AlertTriangle, CheckCircle, Plus, Trash2, Home,
+  Droplets, Phone, RefreshCw, ChevronRight,
+  ClipboardList, Zap, BookOpen, X, Flame, History, Utensils,
+  Battery, AlertOctagon, Download,
+  DollarSign, ShoppingCart, Store, Layers,
+  Siren, SearchCheck, Power, Tag, Calendar
 } from 'lucide-react';
 import { request } from './api.js';
 import { computeReadiness, computeReadinessGaps, consumptionForecast, daysUntilExpiry, expirationQueue, expiryTiers, isExpired, isExpiringWithin, isRecurringDue } from '../shared/readiness.js';
@@ -23,7 +23,6 @@ import { HazardProfileSection, WeatherAlerts } from './Hazards.jsx';
 import { actionBody, clearDeviceData, describeAction, discardRejectedAction, enqueueAction, isPermanentRejection, loadCachedState, loadPendingCheckin, loadQueuedActions, loadRejectedActions, peekQueuedAction, rejectQueuedAction, retryDelayMs, retryRejectedAction, savePendingCheckin, saveCachedState, shiftQueuedAction } from './offline.js';
 
 // --- Constants ---
-const SYSTEM_ID = 'Household';
 const progressPercent = (value, goal) => goal > 0 ? (value / goal) * 100 : 0;
 
 // --- Main App Component ---
@@ -67,7 +66,6 @@ export default function App() {
   const revision = useRef(-1);
   const busy = useRef(false);
   const epoch = useRef(0);
-  const hubId = SYSTEM_ID;
   const accept = ({data,version}, synced = true) => {
     if (version < revision.current) return;
     revision.current = version;
@@ -105,19 +103,29 @@ export default function App() {
     const refresh = async () => {
       if (running || busy.current) return;
       running = true;
+      const started = epoch.current;
+      const stale = () => cancelled || started !== epoch.current;
       try {
         const state = await request(revision.current >= 0 ? `hub?since=${revision.current}` : 'hub');
-        if (!cancelled) {
+        if (!stale()) {
           if (state.unchanged) setLastSyncedAt(Date.now()); else accept(state);
           setPendingSync(loadQueuedActions().length); setGlobalError(null);
         }
       }
       catch(error) {
-        if (!cancelled && !error.status) {
+        if (stale()) return;
+        if (!error.status) {
           const cached = loadCachedState();
           if (cached) { accept(cached, false); setLastSyncedAt(cached.savedAt ?? null); setGlobalError('Offline mode: showing the last saved copy. Changes will sync when you reconnect.'); }
           else setGlobalError('Offline and no saved copy is available. Download a backup after reconnecting.');
-        } else if (!cancelled) { setGlobalError(error.message); if(error.status===401) setUser(null); }
+        } else {
+          setGlobalError(error.message);
+          if (error.status === 401) setUser(null);
+          // 403 on a read means this account was removed from the household. The session
+          // endpoint is the authority on that; if it agrees, clear the device and drop to the
+          // sign-in screen rather than keep a copy of a household it can no longer read.
+          if (error.status === 403) request('session').then(value => { if (!stale() && !value.authenticated) return forgetHousehold(); }).catch(() => {});
+        }
       }
       finally {running=false;if(!cancelled) setLoading(false);}
     };
@@ -142,6 +150,7 @@ export default function App() {
     // A save is in flight (it reads the queue first), so look again in a moment.
     if (busy.current) { retryLater(1000); return () => { cancelled = true; clearTimeout(retryTimer); }; }
     const flush = async () => {
+      const started = epoch.current;
       busy.current = true; setIsSyncing(true);
       let setAside = false;
       try {
@@ -150,6 +159,9 @@ export default function App() {
         for (let entry = peekQueuedAction(); entry && !cancelled; entry = peekQueuedAction()) {
           try {
             const result = await request('hub', actionBody(entry));
+            // Signed out while this was in flight: sign-out already cleared this device, and
+            // nothing may be written back to it.
+            if (started !== epoch.current) return;
             accept(result); setPendingSync(shiftQueuedAction());
             flushAttempts.current = 0;
           } catch (error) {
@@ -166,7 +178,7 @@ export default function App() {
         }
         if (!loadQueuedActions().length) setGlobalError(null);
       } catch (error) {
-        if (cancelled) return;
+        if (cancelled || started !== epoch.current) return;
         if (error.status === 401) { setUser(null); return; }
         setGlobalError(error.status === 409
           ? 'Queued changes conflict with another device. We will keep retrying.'
@@ -252,11 +264,21 @@ export default function App() {
     }
     finally {busy.current=false;setIsSyncing(false);}
   };
+  // Leaves nothing of the household on this device or in memory: used on sign-out, and when the
+  // server reports this account is no longer a member. The epoch moves first so that a request
+  // still in flight cannot write its response back into the storage being cleared.
+  const forgetHousehold = async () => {
+    epoch.current++;
+    await clearDeviceData();
+    setPendingSync(0);setRejectedActions([]);setLastSyncedAt(null);setUser(null);setGo(null);setWeather(null);setOutage(null);setShowGo(false);setShowBinder(false);setPendingCheckin(null);
+    setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);
+    setSettings(settingsSchema.parse({}));setPendingImport(null);setPendingImportSource(null);revision.current=-1;setLoading(true);setShowSyncModal(false);
+  };
   const logout = async () => {
     const queued = loadQueuedActions().length + loadRejectedActions().length;
     if (queued && !window.confirm(`${queued} change${queued === 1 ? ' has' : 's have'} not synced yet and will be discarded from this device if you sign out. Sign out anyway?`)) return;
     await unsubscribePush();
-    try {await request('session',{},'DELETE');await clearDeviceData();setPendingSync(0);setRejectedActions([]);setLastSyncedAt(null);epoch.current++;setUser(null);setGo(null);setWeather(null);setShowGo(false);setPendingCheckin(null);setInventory([]);setShoppingList([]);setAppliances([]);setReminders([]);setChecklistChecks([]);setKits([]);setMedications([]);setPlan(null);setConsumption([]);setSettings(settingsSchema.parse({}));setPendingImport(null);revision.current=-1;setLoading(true);setShowSyncModal(false);}
+    try {await request('session',{},'DELETE');await forgetHousehold();}
     catch(error){setGlobalError(error.message);}
   };
   const downloadBackup = () => {
@@ -319,6 +341,7 @@ export default function App() {
     try {
       const result = await request('backup', {type:'restore', id});
       setPendingImport(result.backup);
+      setPendingImportSource({kind:'backup'});
       setGlobalError(null);
     } catch (error) { setGlobalError(`Restore failed: ${error.message}`); }
   };
@@ -392,7 +415,7 @@ export default function App() {
       <RejectedChanges items={rejectedActions}
         onDiscard={id => { discardRejectedAction(id); setRejectedActions(loadRejectedActions()); }}
         onRetry={id => { try { setPendingSync(retryRejectedAction(id)); setRejectedActions(loadRejectedActions()); kickFlush(0); } catch (error) { setGlobalError(error.message); } }} />
-      <Header hubId={hubId} isSyncing={isSyncing} online={online} pendingSync={pendingSync} lastSyncedAt={lastSyncedAt} onSyncClick={() => setShowSyncModal(true)} error={globalError} onDownload={downloadBackup} />
+      <Header isSyncing={isSyncing} online={online} pendingSync={pendingSync} lastSyncedAt={lastSyncedAt} onSyncClick={() => setShowSyncModal(true)} error={globalError} onDownload={downloadBackup} />
 
       {inventory.length === 0 && !loading && <div className="max-w-xl mx-auto p-5 text-center text-sm text-slate-600">Add supplies to get started, or import a JSON backup in Household settings.</div>}
       <main className="flex-1 max-w-xl mx-auto w-full p-4 pb-28">
@@ -772,10 +795,12 @@ function ApplianceManager({ appliances, stats, onAdd, onUpdate, onDelete }) {
 }
 
 // --- Inventory Manager (Reused for Shop) ---
+const emptyItemForm = () => ({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '', location: '', kitId: '' });
+
 function InventoryManager({ title, items, shoppingList = [], consumption = [], stats, settings, kits = [], onAdd, onUpdate, onDelete, onBulkDelete, onBulkUpdate, onRestock, onConsume, onDeleteConsumption, onBuy, isShoppingMode, onAddKit, onUpdateKit, onDeleteKit, family = [] }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
-  const [sortBy, setSortBy] = useState(''); // 'expiry', 'calories', 'date'
+  const [sortBy, setSortBy] = useState(''); // 'expiry', 'calories'
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [groupBy, setGroupBy] = useState('category'); // 'category', 'location', 'kit'
@@ -787,12 +812,10 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
   const [bulkQuantityMode, setBulkQuantityMode] = useState('set');
   const [bulkQuantityValue, setBulkQuantityValue] = useState('');
 
-  const [form, setForm] = useState({
-    name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '', location: '', kitId: ''
-  });
+  const [form, setForm] = useState(emptyItemForm);
 
   const reset = () => {
-    setForm({ name: '', quantity: '', unit: 'units', category: 'Food', caloriesPerUnit: '', hoursPerUnit: '', capacityPerUnit: '', gallonsPerUnit: '', price: '', store: '', emoji: '', image: '', macroTag: '', fuelType: '', purchaseDate: '', expiryDate: '', barcode: '', recurringDays: '', location: '', kitId: '' });
+    setForm(emptyItemForm());
     setEditingItem(null);
     setShowAdd(false);
     setFormError(null);
@@ -877,8 +900,6 @@ function InventoryManager({ title, items, shoppingList = [], consumption = [], s
       sorted.sort((a, b) => new Date(a.expiryDate || '2099-01-01') - new Date(b.expiryDate || '2099-01-01'));
     } else if (sortBy === 'calories') {
       sorted.sort((a, b) => (Number(b.quantity||0) * Number(b.caloriesPerUnit||0)) - (Number(a.quantity||0) * Number(a.caloriesPerUnit||0)));
-    } else if (sortBy === 'date') {
-      sorted.sort((a, b) => new Date(b.purchaseDate || '1970-01-01') - new Date(a.purchaseDate || '1970-01-01'));
     }
     return sorted;
   }, [filteredItems, sortBy]);
@@ -1807,17 +1828,13 @@ function BarcodeScanButton({ onDetected }) {
   );
 }
 
-function calendarDateToday() {
-  const date = new Date();
-  return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
-}
 function formatCalendarDate(value) {
   const date = new Date(value + 'T00:00:00');
   return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString(undefined, {month: 'short', day: 'numeric', year: 'numeric'});
 }
 
 function ConsumptionPanel({ item, events, onConsume, onDelete }) {
-  const [date, setDate] = useState(calendarDateToday);
+  const [date, setDate] = useState(() => todayLocal());
   const [quantity, setQuantity] = useState('');
   const [note, setNote] = useState('');
   const [error, setError] = useState(null);
@@ -2130,7 +2147,7 @@ export function EmergencyBinder({ plan, inventory = [], stats, settings, checkli
   );
 }
 
-export function Header({ hubId, isSyncing, online, pendingSync, lastSyncedAt, onSyncClick, error, onDownload }) {
+export function Header({ isSyncing, online, pendingSync, lastSyncedAt, onSyncClick, error, onDownload }) {
   return (
     <header className="bg-slate-900 text-white p-4 sticky top-0 z-50 shadow-xl border-b border-white/5">
       <div className="max-w-xl mx-auto flex justify-between items-center text-white">
@@ -2399,8 +2416,6 @@ function MembersPanel({ currentUserId }) {
   );
 }
 
-// Self-service password change for a signed-in user who still knows their current password.
-// A locked-out member instead needs a reset link from an owner (see MembersPanel).
 // Push notifications for this device: a daily digest of what needs attention, plus an alert when
 // the plan is activated or a member needs help. Per device, because each browser subscribes itself.
 function NotificationsPanel() {
@@ -2438,6 +2453,8 @@ function NotificationsPanel() {
   );
 }
 
+// Self-service password change for a signed-in user who still knows their current password.
+// A locked-out member instead needs a reset link from an owner (see MembersPanel).
 function ChangePasswordPanel() {
   const [form, setForm] = useState({ currentPassword: '', newPassword: '' });
   const [message, setMessage] = useState(null);

@@ -35,6 +35,42 @@ test('an owner\'s invitation is emailed, and the emailed link lets the new membe
   expect(await query(`SELECT m.role FROM northstar_household_members m JOIN northstar_users u ON u.id = m.user_id WHERE u.email = 'casey@example.test'`)).toEqual([{role: 'member'}]);
 });
 
+test('removing a member cuts off their signed-in device at once and clears the household from it', async ({page, browser}) => {
+  await page.goto('/');
+  await page.getByRole('button', {name: 'Open household settings'}).click();
+  await page.getByPlaceholder('Invite by email').fill('riley@example.test');
+  await page.getByRole('button', {name: 'Send invitation'}).click();
+  await expect(page.getByRole('status').filter({hasText: 'Invitation emailed to riley@example.test'})).toBeVisible();
+  const link = linkIn((await sentEmails())[0].text);
+
+  const guest = await browser.newContext({storageState: {cookies: [], origins: []}});
+  try {
+    const member = await guest.newPage();
+    await member.goto(link);
+    await member.getByLabel('Choose a password').fill('riley-password-123');
+    await member.getByRole('button', {name: 'Join household'}).click();
+    await expect(member.getByRole('button', {name: 'Open household settings'})).toBeVisible();
+    await expect.poll(() => member.evaluate(() => localStorage.getItem('northstar-state-cache-v1'))).not.toBeNull();
+
+    // The member list was loaded before the invitation was accepted; reopen settings to reload it.
+    await page.getByRole('button', {name: 'Close', exact: true}).click();
+    await page.getByRole('button', {name: 'Open household settings'}).click();
+    page.once('dialog', dialog => dialog.accept());
+    await page.getByRole('listitem').filter({hasText: 'riley@example.test'}).getByRole('button', {name: 'Remove'}).click();
+    await expect(page.getByRole('listitem').filter({hasText: 'riley@example.test'})).toHaveCount(0);
+
+    // Their session cookie is still validly signed; membership is what the server checks.
+    expect(await member.evaluate(async () => (await fetch('/api/hub')).status)).toBe(403);
+    expect(await member.evaluate(async () => (await fetch('/api/hub', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({type: 'add', collection: 'inventory', id: 'sneaky', item: {name: 'Sneaky'}})})).status)).toBe(403);
+
+    // The app's next poll (on focus here, rather than waiting out the 15-second timer).
+    await member.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await expect(member.getByRole('button', {name: 'Sign in'})).toBeVisible();
+    expect(await member.evaluate(() => localStorage.getItem('northstar-state-cache-v1'))).toBeNull();
+  } finally { await guest.close(); }
+  expect(await query(`SELECT name FROM northstar_inventory`)).toEqual([]);
+});
+
 test.describe('signed out', () => {
   test.use({storageState: {cookies: [], origins: []}});
 

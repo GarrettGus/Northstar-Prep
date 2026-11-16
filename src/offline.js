@@ -56,10 +56,6 @@ export function enqueueAction(action) {
   return queue.length;
 }
 
-export function clearQueuedActions() {
-  saveQueuedActions([]);
-}
-
 // --- Retrying and rejecting queued edits. ---
 // A queued edit fails for one of two very different reasons. The connection or the server was
 // unavailable (no status, a 5xx, a timeout, a rate limit, or a conflict the server already

@@ -497,7 +497,7 @@ test('password API lets a signed-in user change their own password after re-ente
   await createPasswordHandler({...repository,async rateLimit(){return false;}},()=>({userId:'user-1'}))({method:'POST',headers:{'content-type':'application/json'},body:{currentPassword:'old-password',newPassword:'new-password-123'}},limited);
   assert.equal(limited.code,429);
 });
-test('the household API passes the cookie\'s session version to the membership check and answers 401 when it no longer matches',async()=>{
+test('the household API passes the cookie\'s session version to the membership check and answers 403 when it no longer matches',async()=>{
   const seen=[];
   const repository={
     async getMembership(userId,householdId,version){seen.push([userId,householdId,version]);return version===2?{role:'member'}:undefined;},
@@ -505,7 +505,7 @@ test('the household API passes the cookie\'s session version to the membership c
   };
   const stale=response();
   await createHandler(repository,()=>({userId:'user-1',version:1}))({method:'GET',headers:{}},stale);
-  assert.equal(stale.code,401);assert.equal(stale.data.data,undefined);
+  assert.equal(stale.code,403);assert.equal(stale.data.data,undefined);
   const current=response();
   await createHandler(repository,()=>({userId:'user-1',version:2}))({method:'GET',headers:{}},current);
   assert.equal(current.code,200);
@@ -514,7 +514,7 @@ test('the household API passes the cookie\'s session version to the membership c
   let saved=false;
   const removed=response();
   await createHandler({...repository,async getMembership(){return undefined;},async compareAndSave(){saved=true;}},()=>({userId:'user-1',version:2}))({method:'POST',headers:{'content-type':'application/json'},body:{type:'add',collection:'inventory',id:'x',item:{name:'X'}}},removed);
-  assert.equal(removed.code,401);assert.equal(saved,false);
+  assert.equal(removed.code,403);assert.equal(saved,false);
 });
 test('water converts liters and explicit bottle sizes without counting unknown units',()=>{
   assert.equal(waterGallons({quantity:3.785411784,unit:'liters'}),1);

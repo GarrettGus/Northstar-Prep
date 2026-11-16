@@ -7,8 +7,7 @@ export function waterGallons(item) {
 }
 export function isExpired(date,now=new Date()) {
   if(!date)return false;
-  const local=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
-  return date<local;
+  return date<calendarDateKey(now);
 }
 function parseCalendarDate(value) {
   if(typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
@@ -44,7 +43,6 @@ export function deriveBurnRate(events = []) {
   const ratePerDay = totalQuantity / daysOfHistory;
   return {
     ratePerDay,
-    burnRate: ratePerDay,
     totalQuantity,
     daysOfHistory,
     eventCount: ordered.length,
@@ -60,7 +58,6 @@ export function consumptionForecast(item, events = [], now = new Date()) {
   const result = {
     eventCount: itemEvents.length,
     ratePerDay: rate?.ratePerDay ?? null,
-    burnRate: rate?.burnRate ?? null,
     totalConsumed: rate?.totalQuantity ?? itemEvents.reduce((sum, event) => sum + (Number(event.quantity) || 0), 0),
     daysOfHistory: rate?.daysOfHistory ?? 0,
     firstDate: rate?.firstDate ?? null,
@@ -75,8 +72,6 @@ export function consumptionForecast(item, events = [], now = new Date()) {
   return result;
 }
 
-export const calculateBurnRate = deriveBurnRate;
-export const calculateConsumptionForecast = consumptionForecast;
 // Whole days from today until an expiry date, in local calendar terms: 0 means it lapses today
 // and a negative number means it already has. Returns null for an item with no expiry date.
 export function daysUntilExpiry(date,now=new Date()) {
@@ -124,14 +119,12 @@ export function nextRecurringDate(item) {
   if(!item.recurringDays||!item.purchaseDate)return null;
   const [y,m,d]=item.purchaseDate.split('-').map(Number);
   if(!y||!m||!d)return null;
-  const next=new Date(y,m-1,d+Number(item.recurringDays));
-  return `${next.getFullYear()}-${String(next.getMonth()+1).padStart(2,'0')}-${String(next.getDate()).padStart(2,'0')}`;
+  return calendarDateKey(new Date(y,m-1,d+Number(item.recurringDays)));
 }
 export function isRecurringDue(item,now=new Date()) {
   const next=nextRecurringDate(item);
   if(!next)return false;
-  const local=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
-  return next<=local;
+  return next<=calendarDateKey(now);
 }
 // A household opts into per-member readiness by giving at least one member an explicit calorie or
 // water figure, or by adding a pet. Until then the flat householdSize x per-person defaults are
